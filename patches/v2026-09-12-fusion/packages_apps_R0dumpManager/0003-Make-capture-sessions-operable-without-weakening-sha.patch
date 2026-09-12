@@ -1,0 +1,1826 @@
+From 47a1b755d3f87699a1080d58049839434593a95a Mon Sep 17 00:00:00 2001
+From: Ivory <contact@ivory.cafe>
+Date: Mon, 31 Aug 2026 12:26:48 +0800
+Subject: [PATCH 03/32] Make capture sessions operable without weakening
+ shared-storage safety
+
+Document and package the synchronous file helper while keeping Manager labels, deployment tooling, and source contracts aligned with the runtime implementation.
+
+Constraint: User and userdebug builds must share the same ext_data_rw directory contract without world-writable modes or debug-only runtime dependencies
+Rejected: Post-write chmod/chown watcher | canonical files would have an unreadable interval and weak failure semantics
+Confidence: high
+Scope-risk: moderate
+Directive: Keep helper requests path-free and preserve 02770 directories plus 0660 files
+Tested: source-contract validator; helper host tests 5/5; bash deployment syntax; OnePlus 9 non-root read/write M9
+Not-tested: full user image build is outside the agreed acceptance scope
+---
+ DESIGN.md                                     |   1 +
+ IMPLEMENTATION.md                             | 395 ++++++++++++++++--
+ helper/Android.bp                             |  30 ++
+ helper/r0dump_file_helper.cpp                 | 154 +++++++
+ helper/r0dump_file_helper.rc                  |   6 +
+ helper/r0dump_file_helper_core.cpp            | 371 ++++++++++++++++
+ helper/r0dump_file_helper_core.h              |  31 ++
+ helper/r0dump_file_helper_protocol.h          |  55 +++
+ helper/r0dump_file_helper_test.cpp            | 145 +++++++
+ res/values-zh-rCN/strings.xml                 |   2 +-
+ res/values/strings.xml                        |   2 +-
+ .../domain/CapturePointRegistry.kt            |  70 +++-
+ .../r0dumpmanager/ui/R0dumpManagerScreen.kt   |  17 +-
+ .../domain/FusionConfigContractTest.kt        |   1 +
+ tools/deploy_userdebug.sh                     |  41 +-
+ tools/validate_source_contracts.sh            |   7 +-
+ 16 files changed, 1268 insertions(+), 60 deletions(-)
+ create mode 100644 helper/Android.bp
+ create mode 100644 helper/r0dump_file_helper.cpp
+ create mode 100644 helper/r0dump_file_helper.rc
+ create mode 100644 helper/r0dump_file_helper_core.cpp
+ create mode 100644 helper/r0dump_file_helper_core.h
+ create mode 100644 helper/r0dump_file_helper_protocol.h
+ create mode 100644 helper/r0dump_file_helper_test.cpp
+
+diff --git a/DESIGN.md b/DESIGN.md
+index 0a58b3e..cbe798f 100644
+--- a/DESIGN.md
++++ b/DESIGN.md
+@@ -51,6 +51,7 @@ Android 16 system configuration tool using Jetpack Compose, Material 3 Expressiv
+ - Manager-owned fields such as run ID are repaired or generated automatically and never presented as user-fixable validation errors.
+ - Booleans use switches, capture points use checkboxes inside expandable category headers, enums use segmented controls or chips, and numeric values use text fields with units.
+ - Capture point category headers show selected and total counts. All groups start collapsed on first use, then restore the user's latest expanded/collapsed choices.
++- Capture point rows lead with the actual ART or libcore source function. The stable runtime point ID remains visible as secondary text so operators can correlate the selection with logs and artifacts.
+ - Budgets use two expandable groups, capacity limits and records/flushing, with the same header, summary, chevron, and motion vocabulary as advanced settings. Reset is an icon action beside the page title rather than a full-width trailing button.
+ - Notification permission is explained only when the user starts a capture without notifications enabled; it does not occupy persistent page space.
+ - Advanced settings use three expandable headers for Manifest, Walk, and Force/ANR; headers summarize enabled state and validation errors reveal hidden fields. ANR protection is the first control inside Force/ANR so its independent session policy is visible before force-invoke selectors.
+diff --git a/IMPLEMENTATION.md b/IMPLEMENTATION.md
+index e3a980b..e5a476e 100644
+--- a/IMPLEMENTATION.md
++++ b/IMPLEMENTATION.md
+@@ -5,14 +5,14 @@
+ | 项目 | 值 |
+ |---|---|
+ | 目标分支 | `r0dump-fusion` |
+-| 发布平台 | LineageOS 23.2 / Android 16 / `userdebug` |
++| 发布平台 | LineageOS 23.2 / Android 16 / `user`、`userdebug` |
+ | 构建与验收 | 源码展开 `-j2`，实际编译 `-j8`；定向 userdebug 构建和真机矩阵即为最终验收 |
+ | 应用模块 | `packages/apps/R0dumpManager` |
+ | 包名 | `com.android.r0dumpmanager` |
+ | 配置前缀 | `persist.sys.r0dump.fusion.*` |
+-| 发布形态 | userdebug 版本预装的系统应用 |
++| 发布形态 | 平台系统应用 + init root 文件准备 helper；开发验收仍以 userdebug 真机为准 |
+ | UI 技术 | Jetpack Compose + Material 3 Expressive |
+-| 文档状态 | Manager 已完成，最终验收通过（2026-08-30） |
++| 文档状态 | Manager 已完成；方案一已完成源码、构建、SELinux 与 userdebug 真机 M9 闭环（2026-08-31） |
+ | 主要用户 | ROM、ART、逆向与脱壳实验人员 |
+ 
+ 本文中的属性前缀是 `persist.sys.r0dump.fusion.*`。`system.persist` 不是 Android property 的合法命名顺序。
+@@ -20,6 +20,21 @@
+ Manager 完成证据和范围边界见 [STATUS.md](STATUS.md)。该状态只标记 Manager、其 Framework 管理入口与专用 SELinux
+ 合同完成，不代替 ART 数据面或后续脱壳实验主线的独立进度。
+ 
++### 0.1 方案一当前完成度
++
++“方案一”在本文中专指**同步 root helper 预创建目录 + 目录 FD 逐层交接**，不是后台 watcher 或事后修权限：
++
++| 层级 | 当前状态 | 完成判据 |
++|---|---|---|
++| 协议与 root helper | 已实现 | 固定二进制协议、身份复核、安全目录遍历、`SCM_RIGHTS` 返回 FD 和 native tests 已落地 |
++| system_server | 已实现 | Binder UID/PID、`ProcessRecord`、PackageManager 和稳定配置快照四重校验已落地 |
++| Framework / ART | 已实现 | `ParcelFileDescriptor` 到 native owned FD 的交接、固定子目录验证和 `0660` 原子发布已落地 |
++| 产品与 SELinux | 已实现并通过策略构建 | helper 进入 lemonade/lemonadep 产品配置，独立 enforcing domain 和 neverallow/兼容性检查通过 |
++| 真机实时读写 | 已验收 | 同一 revision 增量替换并重启后，普通非 root `adb shell` 已对 canonical 文件完成 stat/read/create/append/delete |
++
++这里的“实时”以 canonical 文件的发布边界为准：隐藏临时文件写入期间不承诺可读；原子 rename 成功后不允许再有
++异步 `chown`/`chmod` 窗口。M9 已使用 `com.coolapk.market` 完成真机闭环，具体证据见 12.0.1。
++
+ ## 1. 现状与实施结论
+ 
+ ### 1.1 当前运行时合同
+@@ -48,7 +63,9 @@ Broker。该实现由 tag `r0dump-too-complex-wip` 保留，不作为新实现
+ - 保留 Compose、平台签名、priv-app 模块和可复用的包选择基础；
+ - 点位表切换为当前 42-bit registry；
+ - 只解决配置编辑、校验、事务发布、会话启动和会话结束；
+-- 不恢复服务端 Broker，不增加数据库、守护服务、共享存储或新的 dump reader。
++- 不恢复承载产物内容的服务端 Broker，不增加数据库、产物 reader、导出或删除能力；
++- 为 `user`/`userdebug` 共用的实时权限准备新增一个极窄 init root helper。helper 只预建目录、设置 owner/group/mode
++  并返回目录 FD，不接收、缓存、解析或转发任何 dump payload。
+ 
+ ### 1.3 核心架构决定
+ 
+@@ -56,7 +73,37 @@ Manager 不自行复制 Framework 的最终校验和发布算法。`r0dump_Fusio
+ 序列化为完整 JSON 后交给 Framework 解析并发布。调用仍在 Manager 进程内执行，property service 根据调用进程的
+ SELinux domain 决定是否允许写入。
+ 
+-这不是 Binder Broker。它不引入 system_server 服务、AIDL、线程、队列或跨进程状态。
++配置发布入口不是 Binder Broker，不引入配置数据库或跨进程配置副本。实时权限准备另设一条独立、极窄的同步路径：
++目标进程通过 Framework 隐藏入口请求 system_server 校验调用身份，system_server 再调用 init root helper 预建输出树并取得
++目录 FD。该路径不承载配置写入或产物字节，不能浏览、导出、删除或修改既有运行。
++
++### 1.4 实时可读输出合同
++
++目标应用进程没有 `CAP_CHOWN`，也不是 `AID_EXT_DATA_RW` 成员。在目标 ART 进程内直接执行
++`fchown(fd, -1, AID_EXT_DATA_RW)` 必然返回 `EPERM`，因此禁止加入“忽略失败后继续”的伪实现。
++
++采用方案一的同步 root 文件准备路径：
++
++1. `r0dump_configureForApp()` 已取得应用 external-files parent 后，先请求 system_server 准备本次运行目录；
++2. system_server 使用 Binder 调用 UID/PID、当前 `ProcessRecord` 和稳定配置快照校验 package、process、run ID、generation；
++3. system_server 通过只允许自身连接的私有 Unix socket 请求 init root helper；
++4. helper 从固定 system-user 路径和已校验组件派生目录，不接受任意绝对路径；
++5. helper 使用 `openat`/`mkdirat`、`O_NOFOLLOW` 和目录 FD 逐级创建或验证目录；
++6. helper 将共享祖先和 run 目录设为 root、`AID_EXT_DATA_RW`、`02770`，将 process/PID 目录及四个固定子目录设为
++   目标应用 UID、`AID_EXT_DATA_RW`、`02770`；
++7. helper 通过 `SCM_RIGHTS` 将只用于定位的 `O_PATH` process-run 目录 FD 返回 system_server；
++8. system_server 将该 FD 排入一对临时 `SOCK_SEQPACKET` 的发送端，Binder 只向目标进程传递可序列化的
++   接收端 `ParcelFileDescriptor`，目标进程再通过一次性 `SCM_RIGHTS` 取出原始目录 FD；
++9. ART native 先验证 `O_PATH` FD 的 owner/group/mode，再以 `openat(fd, ".", O_RDONLY|O_DIRECTORY|...)`
++   重新打开同一 inode，只有 device/inode 与权限合同二次验证一致才持有该普通目录 FD；
++10. ART 只在收到成功 ACK 和可信目录 FD 后发布 native immutable config；失败则 fail closed，不影响目标应用正常启动；
++11. ART 在带 setgid 的预建目录中创建临时文件，文件自然继承 `ext_data_rw`，随后显式设为 `0660`；
++12. 文件完成 write/fsync 后再原子 rename，并对重新打开的普通目录 FD 执行 fsync。canonical 文件首次可见时
++   已经完整、属于 `ext_data_rw` 且为 `0660`。
++
++目录对 `stat(2)` 的普通权限位仍是 `0770`；额外的 setgid 位是保证后续文件继承 `ext_data_rw` 的必要合同，完整 mode 为
++`02770`。普通 `adb shell` 属于 `ext_data_rw`，因此在 canonical rename 完成后立即具备读写权限。隐藏临时文件不构成
++发布完成标志，消费者不得读取 `.r0dump-*.tmp`。
+ 
+ ## 2. 目标与非目标
+ 
+@@ -71,18 +118,21 @@ SELinux domain 决定是否允许写入。
+ 7. 支持“发布并启动目标”“只发布”“结束会话”和“奇数 generation 恢复”；
+ 8. 明确展示配置持久化、进程快照和重启语义；
+ 9. 默认关闭危险能力，不提供一键全开；
+-10. 在 userdebug 版本中作为正式系统应用预装；
++10. 在 user 和 userdebug 产品配置中作为正式系统应用预装；
+ 11. 对修改操作增加主用户、设备凭据和活动会话提醒三层保护；
+ 12. 完整支持 Android 16 edge-to-edge、预测返回、大屏自适应和 Material 3 Expressive。
+ 13. 所有用户可见文案支持简体中文和英文，并提供应用内语言切换。
++14. 新运行产物在原子发布后立即可由普通 `adb shell` 读写，且同一机制在 `user` 与 `userdebug` 构建中生效。
+ 
+ ### 2.2 非目标
+ 
+ - 不浏览、修复、导出或删除 dump 产物；
+ - 不读取目标应用私有目录；
+-- 不实现 r0dump Binder service 或 cmd service；
++- 不实现可浏览、传输或修改产物内容的 r0dump Binder/cmd service；
+ - 不在 Manager 内解析 DEX；
+ - 不执行 adb、shell、su 或外部命令；
++- 不给目标应用追加 `ext_data_rw` 补充组，不扩大其读取其它应用 external data 的能力；
++- 不使用 inotify 事后补权限作为实时可读保证；
+ - 不支持任意 property key；
+ - 不允许用户输入输出目录；
+ - 不热更新已运行目标进程中的 immutable config；
+@@ -110,7 +160,18 @@ R0dumpManagerViewModel
+              v
+ persist.sys.r0dump.fusion.*
+              |
+-             +--> target app bind -> immutable native snapshot
++             +--> target app bind -> Framework identity check
++             |                         |
++             |                         v
++             |                  system_server preparation bridge
++             |                         |
++             |                         v
++             |                  init root file helper
++             |                         |
++             |                         v
++             |                  prepared process directory FD
++             |                         |
++             +--> immutable native snapshot -> atomic output
+              +--> system_server ANR gate -> current persisted snapshot
+ ```
+ 
+@@ -123,8 +184,11 @@ persist.sys.r0dump.fusion.*
+ - Framework 是最终校验器；
+ - SELinux 是最终写权限边界；
+ - 所有发布操作在单进程 `Mutex` 内串行执行。
++- root helper 只准备当前 enabled snapshot 的新运行目录，不接触 payload；
++- ART 没有可信 prepared FD 时不得回退到应用自行创建的 `u0_aNNN:u0_aNNN` 输出树；
++- Manager 不直接连接 helper，也不获得 root、shell 或共享存储权限。
+ 
+-## 4. 工程归属与文件计划
++## 4. 工程归属与落地文件
+ 
+ ### 4.1 Manager 应用
+ 
+@@ -207,12 +271,154 @@ public static long r0dump_recoverDisabledPersistedForManager();
+ - 对应 Framework 和 services source contract 覆盖 uid 传递；
+ - 首版不新增可配置 `target_user_id`，固定只服务 owner/system user，避免全局 property 误命中其它用户的同名包。
+ 
+-### 4.3 SELinux
++实时文件准备追加以下 Framework 边界：
++
++```text
++frameworks/base/core/java/android/app/r0dump_FusionConfig.java
++frameworks/base/core/java/android/app/IActivityManager.aidl
++frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
++frameworks/base/services/core/java/com/android/server/am/r0dump_FilePreparationBridge.java
++```
++
++隐藏调用形状：
++
++```java
++/** @hide */
++ParcelFileDescriptor r0dump_prepareOutput(
++        String packageName,
++        String processName,
++        String runId,
++        long generation);
++```
++
++所有字符串都视为不可信提示。system_server 必须以 `Binder.getCallingUid()`、`Binder.getCallingPid()`、AMS 当前
++`ProcessRecord`、PackageManager UID 映射和重新读取的稳定 enabled snapshot 为权威；任一值不一致均拒绝。方法必须在
++AMS 全局锁外执行有界 helper I/O，并设置短超时，不能因外置存储或 helper 故障阻塞系统启动。
++
++成功返回的 `ParcelFileDescriptor` 指向一个一次性 `SOCK_SEQPACKET` 接收端，不直接指向外置存储目录。
++这一封装是必要的：Binder 驱动会拒绝直接携带 `O_PATH` FD 的 transaction，而 Unix domain socket 的
++`SCM_RIGHTS` 能保留该 FD 的原始 open mode。system_server 在 helper ACK 后创建 socket pair，将 `O_PATH`
++目录 FD 排入发送端，只把普通 socket PFD 经 Binder 交给目标进程。Framework 读取单字节 ACK，要求恰好一个
++ancillary FD，dup 后才交给 `dalvik_system_r0dump_Runtime`。native config 持有自己的 dup，Java PFD 随后关闭。
++native 文件模块不直接将 `O_PATH` FD 用于持久化，因为对 `O_PATH` FD 执行目录 fsync 会返回
++`EBADF`。它先以 `openat(fd, ".", ...)` 重新打开目录，对原 FD 和新 FD 执行 device/inode 一致性以及
++owner/group/mode 二次验证，之后只从该普通目录 FD 继续打开固定子目录，不再从字符串
++output parent 重新遍历并创建运行树。
++
++### 4.3 Root 文件准备 helper
++
++新增系统原生模块：
++
++```text
++packages/apps/R0dumpManager/helper/Android.bp
++packages/apps/R0dumpManager/helper/r0dump_file_helper.cpp
++packages/apps/R0dumpManager/helper/r0dump_file_helper.rc
++packages/apps/R0dumpManager/helper/r0dump_file_helper_core.cpp
++packages/apps/R0dumpManager/helper/r0dump_file_helper_core.h
++packages/apps/R0dumpManager/helper/r0dump_file_helper_protocol.h
++packages/apps/R0dumpManager/helper/r0dump_file_helper_test.cpp
++```
++
++模块名固定为 `r0dump_file_helper`，安装到 `/system/bin`，init service 运行于独立
++`u:r:r0dump_file_helper:s0` domain：
++
++```rc
++service r0dump_file_helper /system/bin/r0dump_file_helper
++    class core
++    user root
++    group ext_data_rw media_rw everybody
++    capabilities CHOWN FOWNER FSETID SETUID
++    socket r0dump_file_helper seqpacket 0660 system system
++```
++
++helper 随 `class core` 常驻但空闲时只阻塞在 socket accept；不能标记 `disabled` 后依赖 `ctl.start`，也不能用属性触发拼接
++请求参数。`ext_data_rw` 负责最终 adb shell 共享读写合同；`media_rw` 与 `everybody` 是 init/global mount namespace
++穿越 owner-user emulated storage 必需的平台组，不改变产物最终 group。显式 capability 集只允许变更
++owner/group/mode、保留 setgid，以及在一个受限的旧目录迁移分支中临时切换 fsuid；不授予
++`DAC_OVERRIDE`、`DAC_READ_SEARCH` 或其它 root capability，避免触发平台禁止 coredomain 使用 DAC override 的
++neverallow。
++`user` 构建中的 init 同样按 rc 以 root 启动该服务；此能力不依赖 `ro.debuggable`、`adb root`、overlayfs、su 或 Manager
++shared UID。开发期 adb 仅用于替换和验收。
++
++#### 4.3.1 请求与响应
++
++协议使用固定大小、显式 version 的 `SOCK_SEQPACKET` 消息，不使用 JSON、shell command 或任意路径：
++
++```text
++PrepareRequestV1 (285 bytes, little-endian) {
++  magic, version, size, generation, user_id, target_uid, target_pid,
++  package_name, process_name, run_id
++}
++
++PrepareResponseV1 (12 bytes, little-endian) {
++  magic, version, size, status
++} + exactly one SCM_RIGHTS directory FD on success
++```
++
++- socket peer 必须是 `uid=1000` 的 system_server，且 SELinux 只允许 system_server connect；
++- helper 自行再次执行 generation sandwich，要求 stable even、enabled=1，并逐项匹配 request；
++- 首版只接受 `user_id=0`，target UID 必须是 system-user application UID；
++- package、process、run ID 必须通过与 Framework/ART 相同的长度和 component 校验；
++- helper 以 `MSG_TRUNC` 接收请求并要求包长精确等于 285 bytes；未知 magic/version/size、短包和长包全部拒绝；
++- system_server 使用 2 秒 socket read timeout，要求响应头精确为 12 bytes，且成功响应必须恰有一个 FD；非成功响应或
++  FD 缺失/数量异常统一 fail closed；
++- helper 不返回路径，不接受“修复任意目录”或递归 chown 请求。
++
++稳定 status 至少区分 `OK`、`INVALID_CALLER`、`DISABLED`、`CONFIG_MISMATCH`、`STORAGE_UNAVAILABLE`、`EXISTS`、
++`PERMISSION_DENIED`、`TIMEOUT`、`PROTOCOL_ERROR` 和 `INTERNAL_ERROR`。V1 响应不携带 errno、路径或诊断字符串；
++system_server 当前只把失败收敛为 null PFD 和稳定日志，不向目标应用泄露内部绝对路径或其它包信息。
++
++#### 4.3.2 目录与所有权
++
++helper 在 init/global mount namespace 中使用 `/mnt/user/0/emulated/0` 作为权威根；目标应用和用户看到的
++`/storage/emulated/0` 是同一 owner-user FUSE view。禁止 helper 依赖调用进程的 `/storage` namespace 或直接操作
++`/data/media/0` backing tree。允许操作的唯一逻辑树为：
++
++```text
++/mnt/user/0/emulated/0/Android/data/<target_package>/files/
++  r0dump-fusion/                         root:ext_data_rw       02770
++    runs/                                root:ext_data_rw       02770
++      <run_id>/                          root:ext_data_rw       02770
++        process-<pid>/                   target_uid:ext_data_rw 02770
++          metadata/                      target_uid:ext_data_rw 02770
++          artifacts/                     target_uid:ext_data_rw 02770
++          records/                       target_uid:ext_data_rw 02770
++          methods/                       target_uid:ext_data_rw 02770
++```
++
++helper 必须先打开并验证既有 external-files parent，不负责创建或修复包级 `Android/data/<package>/files`。对应用户可见路径
++仍为 `/storage/emulated/0/Android/data/<target_package>/files/r0dump-fusion/...`。每一级使用可信
++父目录 FD、`mkdirat`/`openat`、`O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC`；拒绝 symlink、非目录、跨设备替换和不安全 component。
++
++共享祖先 `r0dump-fusion`、`runs` 若已存在，可以在验证路径和类型后修复为 root、`AID_EXT_DATA_RW`、`02770`。
++历史 path-only 实现可能已将这两级目录创建为 `target_uid:target_uid 0770`，root helper 在无 DAC override 时不能
++直接 open。对这两个固定 component，helper 仅在 root open 返回 `EACCES`/`EPERM` 时临时将 fsuid 切换为已经
++由 system_server、PackageManager 和稳定快照验证的 target UID，只打开目录并立即恢复 root fsuid；后续 inode 验证、
++`fchown`/`fchmod` 在 root fsuid 下完成。该分支不接受任意路径或任意 UID，不用于处理 run/process 目录。
++
++run 目录
++由 helper 创建为 root、`AID_EXT_DATA_RW`、`02770`：首个进程创建它；同一 stable generation/run ID 的后续进程只有在该
++目录仍为 root-owned、group/mode 正确时才可复用。目标应用无法伪造 root-owned run 目录。process/PID 目录必须不存在，
++一旦存在一律返回 `EEXIST`，禁止复用或覆盖证据。helper 不递归迁移旧 run；旧产物权限修复是独立、显式的维护操作，
++不能阻塞目标启动。
++
++ART 对 prepared tree 的合同：
++
++- 目录必须 `uid == geteuid()`、`gid == AID_EXT_DATA_RW`、`mode & 02777 == 02770`；
++- Framework 交付的 `O_PATH` FD 只用于定位；native 重新打开 `.` 后必须验证两个 FD 指向同一 device/inode；
++- 固定子目录只能 open/verify，ART 不再对它们执行会清除 setgid 的 `fchmod(0770)`；
++- 临时文件创建后立即验证继承的 GID，再 `fchmod(0660)`，任何 ownership/mode 偏差都在写 payload 前 fail closed；
++- canonical rename 后再次保持 `0660`，目录保持 `02770`；
++- 不能取得 prepared FD 时不得回退到旧的 path-only 创建逻辑。
++
++### 4.4 SELinux
+ 
+ 新增：
+ 
+ ```text
+ system/sepolicy/private/r0dump_manager_app.te
++system/sepolicy/private/r0dump_file_helper.te
++system/sepolicy/private/file_contexts
+ system/sepolicy/private/property.te
+ system/sepolicy/private/property_contexts
+ system/sepolicy/private/seapp_contexts
+@@ -225,12 +431,27 @@ type r0dump_manager_app, domain;
+ typeattribute r0dump_manager_app coredomain;
+ app_domain(r0dump_manager_app)
+ 
++type r0dump_file_helper, domain;
++type r0dump_file_helper_exec, system_file_type, exec_type, file_type;
++init_daemon_domain(r0dump_file_helper)
++
+ system_restricted_prop(r0dump_fusion_prop)
+ 
+ set_prop(r0dump_manager_app, r0dump_fusion_prop)
+ get_prop({ appdomain system_server }, r0dump_fusion_prop)
+ ```
+ 
++helper policy 只允许读取 `r0dump_fusion_prop`、接受 system_server 私有 socket、穿越 `mnt_user_file`，并对
++owner-user backing `media_rw_data_file` 中由固定协议和 descriptor-relative 校验限定的 r0dump 目录执行
++`create/open/search/getattr/setattr`。禁止网络、Binder service 注册、执行 shell、访问 Manager 私有数据或打开 dump
++regular file 读取 payload。rc 与 policy 只授予 `CHOWN`、`FOWNER`、`FSETID`、`SETUID`；不能增加
++`DAC_OVERRIDE`、`DAC_READ_SEARCH` 或 permissive 掩盖路径错误。
++
++FD 交接只增加两条最小边：`system_server` 可使用 helper 发来的 FD，`appdomain` 可使用 helper 标记的 FD。
++`O_PATH` 外置目录 FD 在 system_server 接收端被 SELinux 映射为 `fuse:dir ioctl`，因此只允许该单一权限；
++system_server 仍然没有对外置存储的 `open/read/write/create` 权限，相关 neverallow 仍在完整 policy 构建中生效。
++SELinux 规则、固定协议和 descriptor-relative 路径校验共同构成边界，并必须通过 neverallow。
++
+ `property_contexts` 使用唯一前缀：
+ 
+ ```text
+@@ -246,18 +467,20 @@ user=_app seinfo=platform isPrivApp=true name=com.android.r0dumpmanager \
+ 
+ 不得直接给 `platform_app` 或 `priv_app` 整个 domain 增加 set permission，否则其它平台应用也能修改 r0dump 配置。
+ 
+-### 4.4 产品打包
++### 4.5 产品打包
+ 
+ 在 OnePlus 9 产品配置中加入：
+ 
+ ```make
+ PRODUCT_PACKAGES += \
+-    R0dumpManager
++    R0dumpManager \
++    r0dump_file_helper
+ ```
+ 
+ 建议放在 `device/oneplus/lemonade/lineage_lemonade.mk`。确认需要推广到更多设备后再上移到 Lineage common 配置。
+-同一产品配置可被 `userdebug`、`eng` 继承，但发布包、权限检查、SELinux enforcing、hidden API enforcement 和真机验收
+-一律以 `lineage_lemonadep-bp4a-userdebug` 为准；本项目不把额外 user 变体或整包镜像作为 Manager 收口前置条件。
++同一产品配置必须被 `user`、`userdebug`、`eng` 继承。发布包、权限检查、SELinux enforcing、hidden API enforcement 和日常
++真机验收仍以 `lineage_lemonadep-bp4a-userdebug` 为准；本项目不把额外 user 变体或整包镜像作为当前收口前置条件，但
++helper 的实现不得依赖任何 userdebug-only 能力，并需要以构建规则/source contract 证明 user 变体可包含同一模块。
+ 
+ 应用保持：
+ 
+@@ -293,8 +516,9 @@ Manifest 只声明：
+ 
+ 不声明网络、共享存储、READ_LOGS、MANAGE_EXTERNAL_STORAGE、shell 或安装包权限。
+ 旧实现的 `android.permission.MANAGE_R0DUMP` 同时从 Manifest、privapp allowlist、source contract 和设备验证脚本中删除；
+-新架构没有接收该权限的 Binder service，保留它只会制造不存在的授权边界。privapp allowlist 最终只保留实际需要 allowlist 的
+-`FORCE_STOP_PACKAGES`。
++新的 Framework 文件准备入口不依赖该权限，而是以 Binder calling UID/PID、AMS `ProcessRecord` 和 stable enabled snapshot
++做动态授权。它只返回本次运行的目录 FD，不接受配置 JSON、任意路径或文件操作。privapp allowlist 最终只保留实际需要
++allowlist 的 `FORCE_STOP_PACKAGES`。
+ 
+ ### 5.1 系统预装版本访问门禁
+ 
+@@ -342,6 +566,11 @@ secondary user 和 managed profile 只显示“配置仅可由设备主用户管
+ 9. 非 system user 在 Framework 层也不能激活 capture；
+ 10. 每次 mutation 都写入 Manager 私有的有界审计记录，只保存时间、调用动作、target、generation 和结果，不保存
+     force selector 或 property 全量值。
++11. root helper socket 只允许 system_server 连接，Manager 和目标应用均不能直接连接；
++12. helper 请求只为当前 stable enabled snapshot 准备一个全新 run/process 目录，不能复用旧目录；
++13. helper 返回的 FD 只能指向经过 owner/group/mode 和固定路径验证的 process-run 目录；
++14. helper 失败时 capture fail closed，禁止回退到 `0777/0666`、应用 GID 或 path-only 输出；
++15. 不给目标进程追加 `AID_EXT_DATA_RW` supplementary group。
+ 
+ ## 6. 配置数据模型
+ 
+@@ -896,6 +1125,21 @@ mark draft clean
+ 
+ 旧进程不会热更新，所以不能省略第 3 步后声称新配置已经生效。
+ 
++目标进程 bind 内部的顺序固定为：
++
++1. Framework 读取 stable enabled snapshot 并确认 package/process 命中；
++2. `getExternalFilesDir(null)` 返回并验证固定 external-files parent；
++3. 目标进程同步调用 `r0dump_prepareOutput()`；
++4. system_server 校验 Binder identity、ProcessRecord、generation 和配置字段；
++5. root helper 预建 `02770`/`ext_data_rw` 目录树并返回 process-run FD；
++6. Framework 验证 PFD 后才调用 native publish；
++7. ART dup 并持有 FD，写入 `session.json` 后配置才视为 capture-ready；
++8. 任一步失败都记录稳定错误码、关闭全部 FD，并让目标应用继续启动，但本进程不启用 capture。
++
++Manager 不把 launcher 成功等同于 capture-ready。本期没有从 helper 回传到 Manager 的第二状态源；失败通过 Framework/ART
++稳定日志分类诊断，不能自动放宽权限、重新使用旧 run ID 或在后台无限重试。helper 请求每个目标进程至多一次；多进程配置的
++每个精确 process/PID 使用独立目录和 FD。
++
+ ### 9.4 结束会话
+ 
+ 正常结束顺序：
+@@ -952,12 +1196,56 @@ read back even generation and enabled=0
+ - 42 个 bit/name；
+ - force bit 固定为 41；
+ - mask 序列化格式；
+-- Manager production source 不出现任意 property key 输入、adb、su、Broker/AIDL 或私有存储 reader。
++- Manager production source 不出现任意 property key 输入、adb、su、产物 Broker 或私有存储 reader；
++- helper 协议没有任意路径、任意 uid/gid、递归操作或 payload 字段；
++- 目录 group 固定使用平台 `AID_EXT_DATA_RW` 定义，不复制裸数字 `1078`；
++- Framework 必须在 native publish 前取得 prepared FD，ART 不保留 path-only fallback；
++- helper 模块及 init rc 同时进入 user/userdebug 产品包定义，且无 `ro.debuggable` 条件。
+ 
+ Framework 校验失败返回稳定字段 code，Manager 将其映射到对应页面和控件。
+ 
+ ## 12. 测试规格
+ 
++### 12.0 当前验证基线（2026-08-31）
++
++以下结果用于区分“源码已落地”和“真机已验收”，后续改动必须重新执行受影响项：
++
++| 验证项 | 当前结果 | 证据/说明 |
++|---|---|---|
++| helper 定向构建 | 通过 | `m -j8 r0dump_file_helper r0dump_file_helper_tests` |
++| helper host native tests | 5/5 通过 | 目录 owner/group/mode、`O_PATH` 交接 FD、重复 process 目录、symlink 和非法 run ID |
++| ART 文件层定向测试 | 25/25 通过 | `r0dump_FileTest.*`，含 `O_PATH` 同 inode 重开、目录 fsync、GID 继承、固定目录和原子发布 |
++| ART runtime tests 构建 | 通过 | `m -j8 art_runtime_tests` |
++| Framework 生产目标 | 通过 | `framework-minus-apex`、`services.core` 与 API 检查已完成 |
++| SELinux policy | 通过 | `m -j8 selinux_policy`，含 neverallow、Treble compatibility、freeze/context tests |
++| Framework 测试全集 | 基线阻塞 | 现有 `LockPatternUtils.byteArrayToPattern` / `LockPatternView.Cell.of` 测试签名漂移；本特性测试源未出现编译错误 |
++| userdebug 真机 M9 | 通过 | OnePlus 9 `f5e3adbc`；成套替换并重启后以酷安完成产物发布和非 root shell 实时读写 |
++
++Framework 测试全集的基线阻塞不得被写成“本特性测试已通过”；在其修复前，以生产目标编译、helper/ART 定向测试、
++SELinux 全策略构建和真机 M9 共同形成当前验证链。Framework 测试全集的既有基线阻塞不影响已独立
++通过的生产目标编译、本特性定向测试、完整 SELinux policy 和真机证据，但不应被误写为“Framework 全集已通过”。
++
++#### 12.0.1 M9 真机证据
++
++验收设备为 OnePlus 9，serial `f5e3adbc`，构建基线为 `lineage_lemonadep-bp4a-userdebug`。终端解锁后使用同一
++revision 的 Framework、ART CAPEX、helper/rc 和 SELinux policy，以 `com.coolapk.market` / UID `10198` 执行冷启动。
++
++首次完整交接运行 `20260831T035916Z-market-trace` 通过 strace 暴露了一个确定的持久化问题：文件已成功
++rename，但 `fsync(O_PATH directory fd)` 返回 `EBADF`，从而误报 `run_degraded/write_failed`。修复为在目标进程内重新
++打开并验证同一 inode 后，最终运行 `20260831T041320Z-market-final` 得到：
++
++- run 目录为 `root:ext_data_rw 02770`，`process-4928` 及 `metadata/artifacts/records/methods` 为
++  `u0_a198:ext_data_rw 02770`；
++- `session.json`、`metadata/manifest.json`、`methods/methods.jsonl`、50 个 record 与 11 个 artifact 均为
++  `u0_a198:ext_data_rw 0660`；
++- 日志包含两次 `event=capture_flushed status=ok site=file.flush`，不包含 `run_degraded`、Binder invalid FD、
++  system_server/zygote crash 或特性相关 AVC；
++- `adb unroot` 后确认 shell 为 `uid=2000` 且包含 `ext_data_rw(1078)`，能在目标进程仍运行时直接
++  stat/read session、manifest、methods、record 和 artifact；
++- 普通 shell 在 `artifacts` 中成功 create、append、read 和 delete `adb-shell-rw-final.txt`，新文件为
++  `shell:ext_data_rw 0660`；
++- 验收结束后恢复 `enabled=0`、`anr_protection_enabled=0`、`generation=318`（稳定偶数），并停止酷安进程。
++
+ ### T1: Schema 单元测试
+ 
+ - 34 字段完整 JSON round-trip；
+@@ -1035,6 +1323,12 @@ Framework 校验失败返回稳定字段 code，Manager 将其映射到对应页
+ - secondary user 启动 Manager 时保持只读；
+ - secondary user 中同名 target package 不激活 Framework capture 或 ANR protection；
+ - 未认证、认证超时和 screen-off 后 mutation 全部拒绝。
++- `r0dump_file_helper` 运行于独立 enforcing domain，只有 system_server 可连接其 socket；
++- helper 可以对固定 r0dump 目录执行最小 mkdir/chown/chmod，但不能访问网络、shell、其它应用目录或任意路径；
++- 普通应用、Manager、shell 直接连接 helper 均被 SELinux 拒绝；
++- 非目标 UID/PID、stale generation、disabled snapshot、secondary user、symlink、伪造 run owner 和既有 process/PID 目录
++  均 fail closed；
++- policy 在 `user` 和 `userdebug` 编译条件下保持相同，不存在 userdebug-only allow。
+ 
+ ### T9: 构建
+ 
+@@ -1044,13 +1338,14 @@ Framework 校验失败返回稳定字段 code，Manager 将其映射到对应页
+ ```bash
+ source build/envsetup.sh
+ lunch lineage_lemonadep-bp4a-userdebug
+-m R0dumpManager R0dumpManagerTests framework-minus-apex \
++m R0dumpManager R0dumpManagerTests r0dump_file_helper r0dump_file_helper_tests \
++  framework-minus-apex art_runtime_tests com.android.art \
+   plat_sepolicy.cil plat_seapp_contexts plat_property_contexts \
+   plat_sepolicy_and_mapping.sha256 sepolicy_tests -j8
+ ```
+ 
+-若本轮仅修改 Manager，构建命令收窄为 `m R0dumpManager -j8`。只有 Framework 或 SELinux 源码实际变化时，才追加对应
+-目标。不得把 `m systemimage`、`m droid` 或全量 `adb sync system` 作为日常部署步骤。
++若本轮仅修改 Manager，构建命令收窄为 `m R0dumpManager -j8`。只有 Framework、ART、helper 或 SELinux 源码实际变化时，
++才追加对应目标。不得把 `m systemimage`、`m droid` 或全量 `adb sync system` 作为日常部署步骤。
+ 
+ 最终收口不要求另行构建 `lineage_lemonade-bp4a-user` 或 `system.img`；同一 revision 的 Manager、Framework 与 SELinux
+ 定向产物在 `lineage_lemonadep-bp4a-userdebug` 真机上通过事务矩阵即构成最终验收证据。
+@@ -1061,6 +1356,8 @@ m R0dumpManager R0dumpManagerTests framework-minus-apex \
+ - `git diff --check`；
+ - Manager source contract；
+ - `r0dump_FusionConfigTest`；
++- helper protocol/path/ownership native tests；
++- `r0dump_FileTest` prepared-FD、GID 继承、atomic rename tests；
+ - `treble_sepolicy_tests`；
+ - APK privapp permission allowlist 检查。
+ - userdebug hidden API/privapp enforcement；
+@@ -1073,9 +1370,11 @@ m R0dumpManager R0dumpManagerTests framework-minus-apex \
+ 应用身份固定为 `com.android.r0dumpmanager`，不得用新包名并行安装第二个 Manager。设备曾安装过同包名的 `/data/app`
+ 更新包时，该更新包会覆盖 `/system/priv-app/R0dumpManager`，因此部署必须按以下顺序执行：
+ 
+-1. 构建同一源码 revision 的 `R0dumpManager`、Framework、privapp allowlist 和 SELinux policy；
++1. 构建同一源码 revision 的 `R0dumpManager`、Framework、ART、`r0dump_file_helper`、init rc、privapp allowlist 和
++   SELinux policy；
+ 2. `am force-stop com.android.r0dumpmanager` 后执行 `adb uninstall com.android.r0dumpmanager`，清除旧 `/data/app` 更新包及旧数据；
+-3. 将 Framework、系统 APK、allowlist 和 SELinux policy 成套刷入或同步，禁止只执行 `adb install`；
++3. 将 Framework、ART APEX、helper、init rc、系统 APK、allowlist 和 SELinux policy 成套刷入或同步，禁止只执行
++   `adb install`；
+ 4. 重启设备，使 boot classpath 和 SELinux policy 从同一 revision 加载；
+ 5. `pm path com.android.r0dumpmanager` 必须只返回
+    `/system/priv-app/R0dumpManager/R0dumpManager.apk`；任何 `/data/app` 路径均判定替换失败；
+@@ -1100,11 +1399,13 @@ packages/apps/R0dumpManager/tools/deploy_userdebug.sh --with-framework
+ # 同时修改了 SELinux 类型、规则或 contexts。
+ packages/apps/R0dumpManager/tools/deploy_userdebug.sh --with-sepolicy
+ 
+-# 当前联合开发阶段需要三者使用同一 revision。
+-packages/apps/R0dumpManager/tools/deploy_userdebug.sh --with-framework --with-sepolicy
++# 实时输出权限链路需要 Framework、ART、helper 与 policy 使用同一 revision。
++packages/apps/R0dumpManager/tools/deploy_userdebug.sh \
++  --with-framework --with-art --with-file-helper --with-sepolicy
+ ```
+ 
+-脚本执行 `adb root`、`adb remount`、逐文件 `adb push`、权限/标签修复、`sync` 和 reboot。它只允许在
++脚本执行 `adb root`、`adb remount`、逐文件 `adb push`、权限/标签修复、`sync` 和 reboot。ART 使用设备匹配的
++`com.android.art.capex` 整体替换，禁止直接写只读 `/apex/com.android.art` 挂载点。脚本只允许在
+ `ro.build.type=userdebug|eng` 且 `ro.debuggable=1` 的设备运行，避免把开发替换流程误用于发布设备。
+ 
+ SELinux 增量替换是不可拆分事务，必须同时包含：
+@@ -1140,6 +1441,16 @@ ADB="$ADB" ADB_SERIAL="$ADB_SERIAL" OUT_DIR=out/target/product/lemonadep \
+ 11. 设备凭据认证成功、取消、失败、超时和 screen-off 路径符合门禁；
+ 12. predictive back 在 search、sheet、dirty draft 和 Activity exit 中无误提交；
+ 13. 三键、手势导航、横屏、分屏和桌面自由窗口无遮挡。
++14. helper 运行于 root UID 和独立 enforcing domain，socket peer 只有 system_server；
++15. 新 run 全部目录完整 mode 为 `02770`、group 为 `ext_data_rw`；共享/run 祖先 owner 为 root，process/PID 和固定子目录
++    owner 为目标 UID；
++16. `session.json`、manifest、artifact、record、methods 和 summary 文件均为目标 UID、`ext_data_rw`、`0660`；
++17. `adb unroot` 后普通 `adb shell` 能在 canonical rename 后立即 stat/read/create/delete 测试文件；
++18. 在 helper ACK 前暂停 native publish，故障注入时不产生应用 GID 或 world-writable fallback；
++19. stale generation、错误 UID/PID、symlink、伪造 run owner、既有 process/PID、socket timeout、helper crash 和 FD 缺失
++    均不影响目标正常启动；
++20. userdebug 真机验收后检查模块和 rc 没有依赖 `ro.debuggable`；user 构建可用性由同源构建规则和 policy 测试覆盖，当前收口
++    不额外要求完整 user 镜像编译。
+ 
+ ### T11: 酷安回归
+ 
+@@ -1149,6 +1460,8 @@ ADB="$ADB" ADB_SERIAL="$ADB_SERIAL" OUT_DIR=out/target/product/lemonadep \
+ - disabled 三轮不新增 run；
+ - 五组 enabled/disabled 交错冷启动中位数变化仍小于 1%；
+ - ANR protection 独立开启时按现有三轮合同验证；
++- 每轮新产物在捕获进行中由非 root `adb shell` 轮询，canonical 文件出现后首次访问即成功；
++- 全部新目录保持 `ext_data_rw`/`02770`，全部新文件保持 `ext_data_rw`/`0660`；
+ - 最终状态必须为 enabled=0、ANR protection=0、generation 为偶数。
+ 
+ ## 13. 实施阶段
+@@ -1163,9 +1476,11 @@ ADB="$ADB" ADB_SERIAL="$ADB_SERIAL" OUT_DIR=out/target/product/lemonadep \
+ | M5 | 系统预装认证、通知与 owner-only gate | 凭据、multi-user 和 active reminder 验证通过 |
+ | M6 | 联合构建、部署和 transaction smoke | APK、Framework、policy 同 revision 生效 |
+ | M7 | CoolApk bit 39、ANR 和性能回归 | T11 完成，最终 disabled |
++| M8 | root helper、Framework preparation bridge、prepared FD ART 写入 | helper/Framework/ART 单测和 policy 全通过 |
++| M9 | 实时非 root shell 真机矩阵 | canonical 文件首次可见即读写成功，最终 disabled |
+ 
+-依赖顺序固定为 M1 -> M2 -> M3 -> M4 -> M5 -> M6 -> M7。M1/M2 未完成前，Manager 不得通过扩大通用
+-`system_prop` 权限临时获得写能力。
++原 Manager 路径依赖顺序为 M1 -> M2 -> M3 -> M4 -> M5 -> M6 -> M7；实时权限扩展在该基线上按 M8 -> M9
++实施。M8 未完成时不得用 inotify、world-writable mode、目标进程 supplementary group 或忽略 `fchown` 失败临时代替。
+ 
+ ## 14. 验收定义
+ 
+@@ -1174,7 +1489,7 @@ R0dump Manager 合格必须同时满足：
+ - 当前 42-bit 和 34-field schema 完整可编辑；
+ - Framework 是最终校验和事务发布权威；
+ - Manager 拥有专用 SELinux domain，其他 platform app 无写权限；
+-- userdebug 系统镜像默认预装，且 mutation 受 owner user、设备凭据和前台状态约束；
++- user/userdebug 产品配置默认预装 Manager 与 root helper，且 mutation 受 owner user、设备凭据和前台状态约束；
+ - generation 冲突、中断和恢复有明确状态；
+ - 发布成功必须经过 read-back verification；
+ - 新配置只在目标重启后宣称生效；
+@@ -1182,7 +1497,12 @@ R0dump Manager 合格必须同时满足：
+ - force-invoke、all-process 和 ANR protection 默认关闭并有精确确认；
+ - Android 16 edge-to-edge、predictive back、IME、large screen 和 freeform window 验收通过；
+ - Material 3 Expressive API 集中封装，动态色、深色、高对比度和 reduced motion 完整；
+-- 无 Broker、数据库、私有产物 reader、共享存储或新服务；
++- 无承载 payload 的 Broker、数据库、私有产物 reader 或任意路径 root 服务；
++- root helper 只接受 system_server 的固定协议，为当前 stable enabled snapshot 创建全新目录并返回 FD；
++- 新目录均为 `ext_data_rw`、`02770`，共享/run 祖先 owner 为 root、process/PID 子树 owner 为目标 UID；新文件为目标
++  UID、`ext_data_rw`、`0660`；
++- canonical 文件首次可见时普通非 root `adb shell` 已可读写；
++- helper/Framework/ART 任一环节失败都 fail closed，目标应用继续启动且不产生权限降级输出；
+ - Host、Framework、SELinux、UI 和真机矩阵全部通过；
+ - 最终设备状态为稳定偶数 generation 且 enabled=0。
+ 
+@@ -1194,6 +1514,23 @@ property service 不提供跨进程 CAS。Manager 通过 expected generation、
+ 仍可与 Manager 交错写入。设备实验约定同一时刻只有一个 writer。检测到冲突或 odd generation 后进入恢复流程，
+ 不自动重试覆盖。
+ 
++### Root helper 攻击面
++
++helper 是唯一新增 root 执行面。它不得接收路径、命令、任意 uid/gid、递归范围或 payload；socket 只允许 system_server，且
++请求必须再次匹配 stable enabled snapshot。所有路径以固定 parent FD 和安全 component 构造。任何扩大为通用 chown/chmod、
++允许 Manager/目标应用直连、使用 shell 拼接或忽略 symlink/既有 run 的实现都阻断评审。
++
++### External storage 与启动时序
++
++external-files parent 可能因主用户尚未解锁、存储未挂载或包目录尚未准备而不可用。Framework 在取得
++`getExternalFilesDir(null)` 后才请求 helper；helper 不创建包级 parent。超时或不可用时本进程 capture fail closed，目标应用
++继续启动，不在 AMS 全局锁内重试。新的进程冷启动可以再次尝试，但同一 PID 不循环请求。
++
++### Prepared FD 生命周期
++
++helper、system_server、Java PFD 和 ART native 各自只保留必要的 dup，并在失败路径显式关闭。native 全局 run FD 在进程退出时
++由内核回收；初始化失败、配置拒绝和测试 reset 必须主动关闭。不得缓存 FD 跨 run ID、generation 或 PID 使用。
++
+ ### 配置持久化导致意外捕获
+ 
+ enabled 配置跨重启保留。UI 必须突出活动状态，发布 enabled 时生成新 run ID，并在验收结束时强制检查 disabled。
+diff --git a/helper/Android.bp b/helper/Android.bp
+new file mode 100644
+index 0000000..3a091c8
+--- /dev/null
++++ b/helper/Android.bp
+@@ -0,0 +1,30 @@
++package {
++    default_applicable_licenses: ["Android-Apache-2.0"],
++}
++
++cc_library_static {
++    name: "libr0dump_file_helper_core",
++    host_supported: true,
++    srcs: ["r0dump_file_helper_core.cpp"],
++    export_include_dirs: ["."],
++    cflags: ["-Wall", "-Wextra", "-Werror"],
++}
++
++cc_binary {
++    name: "r0dump_file_helper",
++    srcs: ["r0dump_file_helper.cpp"],
++    static_libs: ["libr0dump_file_helper_core"],
++    shared_libs: ["libbase", "libcutils", "liblog"],
++    header_libs: ["libcutils_headers"],
++    init_rc: ["r0dump_file_helper.rc"],
++    cflags: ["-Wall", "-Wextra", "-Werror"],
++}
++
++cc_test {
++    name: "r0dump_file_helper_tests",
++    host_supported: true,
++    srcs: ["r0dump_file_helper_test.cpp"],
++    static_libs: ["libr0dump_file_helper_core"],
++    cflags: ["-Wall", "-Wextra", "-Werror"],
++    test_suites: ["general-tests"],
++}
+diff --git a/helper/r0dump_file_helper.cpp b/helper/r0dump_file_helper.cpp
+new file mode 100644
+index 0000000..4b4f2b2
+--- /dev/null
++++ b/helper/r0dump_file_helper.cpp
+@@ -0,0 +1,154 @@
++#include <android-base/parseint.h>
++#include <android-base/properties.h>
++#include <cutils/sockets.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <inttypes.h>
++#include <log/log.h>
++#include <sys/socket.h>
++#include <sys/types.h>
++#include <unistd.h>
++
++#include <private/android_filesystem_config.h>
++
++#include <cstring>
++#include <string>
++#include <string_view>
++
++#include "r0dump_file_helper_core.h"
++
++namespace r0dump::file_helper {
++namespace {
++
++constexpr char kStorageRoot[] = "/mnt/user/0/emulated/0";
++constexpr char kPropertyPrefix[] = "persist.sys.r0dump.fusion.";
++
++std::string Property(std::string_view suffix) {
++  return android::base::GetProperty(
++      std::string(kPropertyPrefix) + std::string(suffix), "");
++}
++
++Status ValidateStableConfig(const Request &request) {
++  if ((request.generation & 1u) != 0u || Property("enabled") != "1")
++    return Status::kDisabled;
++  uint64_t generation_before = 0u;
++  if (!android::base::ParseUint(Property("generation"), &generation_before) ||
++      generation_before != request.generation) {
++    return Status::kConfigMismatch;
++  }
++  std::string_view package_name;
++  std::string_view process_name;
++  std::string_view run_id;
++  if (!ReadFixedString(request.package_name, sizeof(request.package_name),
++                       &package_name) ||
++      !ReadFixedString(request.process_name, sizeof(request.process_name),
++                       &process_name) ||
++      !ReadFixedString(request.run_id, sizeof(request.run_id), &run_id)) {
++    return Status::kProtocolError;
++  }
++  const std::string configured_process = Property("target_process");
++  if (Property("target_package") != package_name ||
++      Property("run_id") != run_id ||
++      (!configured_process.empty() && configured_process != process_name)) {
++    return Status::kConfigMismatch;
++  }
++  uint64_t generation_after = 0u;
++  if (!android::base::ParseUint(Property("generation"), &generation_after) ||
++      generation_after != generation_before || (generation_after & 1u) != 0u) {
++    return Status::kConfigMismatch;
++  }
++  return Status::kOk;
++}
++
++bool SendResponse(int client_fd, Status status, int process_fd) {
++  const Response response = {
++      .magic = kProtocolMagic,
++      .version = kProtocolVersion,
++      .size = static_cast<uint16_t>(sizeof(Response)),
++      .status = static_cast<int32_t>(status),
++  };
++  iovec io = {.iov_base = const_cast<Response *>(&response),
++              .iov_len = sizeof(response)};
++  msghdr message = {};
++  message.msg_iov = &io;
++  message.msg_iovlen = 1;
++  alignas(cmsghdr) char control[CMSG_SPACE(sizeof(int))] = {};
++  if (status == Status::kOk && process_fd >= 0) {
++    message.msg_control = control;
++    message.msg_controllen = sizeof(control);
++    cmsghdr *header = CMSG_FIRSTHDR(&message);
++    header->cmsg_level = SOL_SOCKET;
++    header->cmsg_type = SCM_RIGHTS;
++    header->cmsg_len = CMSG_LEN(sizeof(int));
++    memcpy(CMSG_DATA(header), &process_fd, sizeof(process_fd));
++  }
++  return TEMP_FAILURE_RETRY(sendmsg(client_fd, &message, MSG_NOSIGNAL)) ==
++         static_cast<ssize_t>(sizeof(response));
++}
++
++void HandleClient(int client_fd) {
++  ucred peer = {};
++  socklen_t peer_size = sizeof(peer);
++  if (getsockopt(client_fd, SOL_SOCKET, SO_PEERCRED, &peer, &peer_size) != 0 ||
++      peer_size != sizeof(peer) || peer.uid != AID_SYSTEM) {
++    SendResponse(client_fd, Status::kInvalidCaller, -1);
++    return;
++  }
++  Request request = {};
++  const ssize_t received =
++      TEMP_FAILURE_RETRY(recv(client_fd, &request, sizeof(request), MSG_TRUNC));
++  if (received != static_cast<ssize_t>(sizeof(request)) ||
++      request.magic != kProtocolMagic || request.version != kProtocolVersion ||
++      request.size != sizeof(Request)) {
++    SendResponse(client_fd, Status::kProtocolError, -1);
++    return;
++  }
++  Status status = ValidateStableConfig(request);
++  int process_fd = -1;
++  if (status == Status::kOk) {
++    const int root_fd =
++        open(kStorageRoot, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
++    if (root_fd < 0) {
++      ALOGW("r0dump helper could not open storage root %s: %s",
++            kStorageRoot, strerror(errno));
++      status = Status::kStorageUnavailable;
++    } else {
++      status = PrepareDirectoryTreeAt(
++          root_fd, request, {AID_ROOT, request.target_uid, AID_EXT_DATA_RW},
++          &process_fd);
++      close(root_fd);
++    }
++  }
++  if (status != Status::kOk) {
++    ALOGW("r0dump helper rejected request: status=%d package=%s process=%s "
++          "run_id=%s uid=%u pid=%u generation=%" PRIu64,
++          static_cast<int>(status), request.package_name, request.process_name,
++          request.run_id, request.target_uid, request.target_pid,
++          request.generation);
++  }
++  SendResponse(client_fd, status, process_fd);
++  if (process_fd >= 0)
++    close(process_fd);
++}
++
++} // namespace
++} // namespace r0dump::file_helper
++
++int main() {
++  using namespace r0dump::file_helper;
++  const int server_fd = android_get_control_socket("r0dump_file_helper");
++  if (server_fd < 0 || listen(server_fd, 8) != 0) {
++    ALOGE("r0dump helper failed to acquire init socket: %s", strerror(errno));
++    return 1;
++  }
++  for (;;) {
++    const int client_fd =
++        TEMP_FAILURE_RETRY(accept4(server_fd, nullptr, nullptr, SOCK_CLOEXEC));
++    if (client_fd < 0) {
++      ALOGE("r0dump helper accept failed: %s", strerror(errno));
++      continue;
++    }
++    HandleClient(client_fd);
++    close(client_fd);
++  }
++}
+diff --git a/helper/r0dump_file_helper.rc b/helper/r0dump_file_helper.rc
+new file mode 100644
+index 0000000..1d91b63
+--- /dev/null
++++ b/helper/r0dump_file_helper.rc
+@@ -0,0 +1,6 @@
++service r0dump_file_helper /system/bin/r0dump_file_helper
++    class core
++    user root
++    group ext_data_rw media_rw everybody
++    capabilities CHOWN FOWNER FSETID SETUID
++    socket r0dump_file_helper seqpacket 0660 system system
+diff --git a/helper/r0dump_file_helper_core.cpp b/helper/r0dump_file_helper_core.cpp
+new file mode 100644
+index 0000000..1cd300d
+--- /dev/null
++++ b/helper/r0dump_file_helper_core.cpp
+@@ -0,0 +1,371 @@
++#include "r0dump_file_helper_core.h"
++
++#include <errno.h>
++#include <fcntl.h>
++#include <stdio.h>
++#include <sys/fsuid.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++#include <array>
++#include <string>
++
++namespace r0dump::file_helper {
++namespace {
++
++constexpr mode_t kDirectoryMode = 02770;
++
++class ScopedFd final {
++public:
++  explicit ScopedFd(int fd = -1) : fd_(fd) {}
++  ~ScopedFd() {
++    if (fd_ >= 0)
++      close(fd_);
++  }
++  ScopedFd(const ScopedFd &) = delete;
++  ScopedFd &operator=(const ScopedFd &) = delete;
++  ScopedFd(ScopedFd &&other) noexcept : fd_(other.release()) {}
++  ScopedFd &operator=(ScopedFd &&other) noexcept {
++    if (this != &other) {
++      if (fd_ >= 0)
++        close(fd_);
++      fd_ = other.release();
++    }
++    return *this;
++  }
++  int get() const { return fd_; }
++  int release() {
++    int result = fd_;
++    fd_ = -1;
++    return result;
++  }
++
++private:
++  int fd_;
++};
++
++bool IsAsciiAlpha(char c) {
++  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
++}
++
++bool IsAsciiDigit(char c) { return c >= '0' && c <= '9'; }
++
++Status StatusForErrno(int error) {
++  if (error == EACCES || error == EPERM)
++    return Status::kPermissionDenied;
++  if (error == ENOENT || error == ENOTDIR || error == ENODEV) {
++    return Status::kStorageUnavailable;
++  }
++  if (error == EEXIST)
++    return Status::kExists;
++  return Status::kInternalError;
++}
++
++ScopedFd OpenDirectoryAt(int parent_fd, std::string_view name) {
++  std::string owned(name);
++  return ScopedFd(openat(parent_fd, owned.c_str(),
++                         O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
++}
++
++ScopedFd OpenDirectoryPathAt(int parent_fd, std::string_view name) {
++  std::string owned(name);
++  return ScopedFd(openat(parent_fd, owned.c_str(),
++                         O_PATH | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
++}
++
++ScopedFd OpenDirectoryAtAsUid(int parent_fd, std::string_view name,
++                              uid_t access_uid) {
++  ScopedFd opened = OpenDirectoryAt(parent_fd, name);
++  if (opened.get() >= 0 || (errno != EACCES && errno != EPERM) ||
++      access_uid == geteuid()) {
++    return opened;
++  }
++
++  const uid_t original_fsuid = static_cast<uid_t>(setfsuid(access_uid));
++  if (static_cast<uid_t>(setfsuid(static_cast<uid_t>(-1))) != access_uid) {
++    setfsuid(original_fsuid);
++    errno = EACCES;
++    return ScopedFd();
++  }
++  opened = OpenDirectoryAt(parent_fd, name);
++  const int saved_errno = errno;
++  setfsuid(original_fsuid);
++  if (static_cast<uid_t>(setfsuid(static_cast<uid_t>(-1))) !=
++      original_fsuid) {
++    errno = EPERM;
++    return ScopedFd();
++  }
++  errno = saved_errno;
++  return opened;
++}
++
++Status OpenExistingAt(int parent_fd, std::string_view name, ScopedFd *out) {
++  ScopedFd opened = OpenDirectoryAt(parent_fd, name);
++  if (opened.get() < 0)
++    return StatusForErrno(errno);
++  *out = std::move(opened);
++  return Status::kOk;
++}
++
++Status EnsureDirectoryAt(int parent_fd, std::string_view name, uid_t uid,
++                         gid_t gid, uid_t access_uid, ScopedFd *out) {
++  std::string owned(name);
++  if (mkdirat(parent_fd, owned.c_str(), kDirectoryMode) != 0 &&
++      errno != EEXIST) {
++    return StatusForErrno(errno);
++  }
++  ScopedFd opened = OpenDirectoryAtAsUid(parent_fd, name, access_uid);
++  if (opened.get() < 0)
++    return StatusForErrno(errno);
++  if (fchown(opened.get(), uid, gid) != 0 ||
++      fchmod(opened.get(), kDirectoryMode) != 0) {
++    return StatusForErrno(errno);
++  }
++  struct stat st{};
++  if (fstat(opened.get(), &st) != 0 || !S_ISDIR(st.st_mode) ||
++      st.st_uid != uid || st.st_gid != gid ||
++      (st.st_mode & 02777) != kDirectoryMode) {
++    return Status::kPermissionDenied;
++  }
++  *out = std::move(opened);
++  return Status::kOk;
++}
++
++Status CreateOrVerifyTrustedDirectoryAt(int parent_fd, std::string_view name,
++                                        uid_t uid, gid_t gid, ScopedFd *out) {
++  std::string owned(name);
++  bool created = false;
++  if (mkdirat(parent_fd, owned.c_str(), kDirectoryMode) == 0) {
++    created = true;
++  } else if (errno != EEXIST) {
++    return StatusForErrno(errno);
++  }
++
++  ScopedFd opened = OpenDirectoryAt(parent_fd, name);
++  if (opened.get() < 0) {
++    return StatusForErrno(errno);
++  }
++  if (created && (fchown(opened.get(), uid, gid) != 0 ||
++                  fchmod(opened.get(), kDirectoryMode) != 0)) {
++    const int saved_errno = errno;
++    opened = ScopedFd();
++    unlinkat(parent_fd, owned.c_str(), AT_REMOVEDIR);
++    return StatusForErrno(saved_errno);
++  }
++
++  struct stat st{};
++  if (fstat(opened.get(), &st) != 0 || !S_ISDIR(st.st_mode) ||
++      st.st_uid != uid || st.st_gid != gid ||
++      (st.st_mode & 02777) != kDirectoryMode) {
++    if (created) {
++      opened = ScopedFd();
++      unlinkat(parent_fd, owned.c_str(), AT_REMOVEDIR);
++    }
++    return Status::kPermissionDenied;
++  }
++  *out = std::move(opened);
++  return Status::kOk;
++}
++
++Status CreateExclusiveDirectoryAt(int parent_fd, std::string_view name,
++                                  uid_t uid, gid_t gid, ScopedFd *out) {
++  std::string owned(name);
++  if (mkdirat(parent_fd, owned.c_str(), kDirectoryMode) != 0)
++    return StatusForErrno(errno);
++  ScopedFd opened = OpenDirectoryAt(parent_fd, name);
++  if (opened.get() < 0) {
++    unlinkat(parent_fd, owned.c_str(), AT_REMOVEDIR);
++    return StatusForErrno(errno);
++  }
++  if (fchown(opened.get(), uid, gid) != 0 ||
++      fchmod(opened.get(), kDirectoryMode) != 0) {
++    const int saved_errno = errno;
++    opened = ScopedFd();
++    unlinkat(parent_fd, owned.c_str(), AT_REMOVEDIR);
++    return StatusForErrno(saved_errno);
++  }
++  struct stat st{};
++  if (fstat(opened.get(), &st) != 0 || !S_ISDIR(st.st_mode) ||
++      st.st_uid != uid || st.st_gid != gid ||
++      (st.st_mode & 02777) != kDirectoryMode) {
++    opened = ScopedFd();
++    unlinkat(parent_fd, owned.c_str(), AT_REMOVEDIR);
++    return Status::kPermissionDenied;
++  }
++  *out = std::move(opened);
++  return Status::kOk;
++}
++
++void RemovePreparedBranch(int process_fd, int run_fd,
++                          std::string_view process_name) {
++  static constexpr std::array<std::string_view, 4> kFixedDirectories = {
++      "metadata", "artifacts", "records", "methods"};
++  for (std::string_view directory : kFixedDirectories) {
++    std::string owned(directory);
++    unlinkat(process_fd, owned.c_str(), AT_REMOVEDIR);
++  }
++  std::string owned(process_name);
++  unlinkat(run_fd, owned.c_str(), AT_REMOVEDIR);
++}
++
++} // namespace
++
++bool IsValidPackageName(std::string_view value) {
++  if (value.empty() || value.size() >= kPackageBytes || value.front() == '.' ||
++      value.back() == '.') {
++    return false;
++  }
++  bool has_dot = false;
++  for (char c : value) {
++    if (c == '.') {
++      has_dot = true;
++    } else if (!IsAsciiAlpha(c) && !IsAsciiDigit(c) && c != '_') {
++      return false;
++    }
++  }
++  return has_dot;
++}
++
++bool IsValidProcessName(std::string_view value) {
++  if (value.empty() || value.size() >= kProcessBytes)
++    return false;
++  for (char c : value) {
++    if (!IsAsciiAlpha(c) && !IsAsciiDigit(c) && c != '_' && c != '.' &&
++        c != ':')
++      return false;
++  }
++  return true;
++}
++
++bool IsValidRunId(std::string_view value) {
++  if (value.empty() || value.size() >= kRunIdBytes || value == "." ||
++      value == "..")
++    return false;
++  for (char c : value) {
++    if (!IsAsciiAlpha(c) && !IsAsciiDigit(c) && c != '_' && c != '.' &&
++        c != '-')
++      return false;
++  }
++  return true;
++}
++
++bool ReadFixedString(const char *value, size_t capacity,
++                     std::string_view *out) {
++  if (value == nullptr || out == nullptr || capacity == 0u)
++    return false;
++  size_t length = 0u;
++  while (length < capacity && value[length] != '\0')
++    ++length;
++  if (length == 0u || length == capacity)
++    return false;
++  for (size_t i = length + 1u; i < capacity; ++i) {
++    if (value[i] != '\0')
++      return false;
++  }
++  *out = std::string_view(value, length);
++  return true;
++}
++
++Status PrepareDirectoryTreeAt(int root_fd, const Request &request,
++                              const Ownership &ownership, int *out_process_fd) {
++  if (root_fd < 0 || out_process_fd == nullptr || request.user_id != 0u ||
++      request.target_uid < 10000u || request.target_pid == 0u) {
++    return Status::kProtocolError;
++  }
++  *out_process_fd = -1;
++  std::string_view package_name;
++  std::string_view process_name;
++  std::string_view run_id;
++  if (!ReadFixedString(request.package_name, sizeof(request.package_name),
++                       &package_name) ||
++      !ReadFixedString(request.process_name, sizeof(request.process_name),
++                       &process_name) ||
++      !ReadFixedString(request.run_id, sizeof(request.run_id), &run_id) ||
++      !IsValidPackageName(package_name) || !IsValidProcessName(process_name) ||
++      !IsValidRunId(run_id)) {
++    return Status::kProtocolError;
++  }
++
++  ScopedFd android_directory;
++  ScopedFd data_directory;
++  ScopedFd package_directory;
++  ScopedFd files_directory;
++  Status status = OpenExistingAt(root_fd, "Android", &android_directory);
++  if (status != Status::kOk)
++    return status;
++  status = OpenExistingAt(android_directory.get(), "data", &data_directory);
++  if (status != Status::kOk)
++    return status;
++  status =
++      OpenExistingAt(data_directory.get(), package_name, &package_directory);
++  if (status != Status::kOk)
++    return status;
++  status = OpenExistingAt(package_directory.get(), "files", &files_directory);
++  if (status != Status::kOk)
++    return status;
++
++  ScopedFd fusion_directory;
++  ScopedFd runs_directory;
++  ScopedFd run_directory;
++  status =
++      EnsureDirectoryAt(files_directory.get(), "r0dump-fusion",
++                        ownership.shared_uid, ownership.gid,
++                        ownership.process_uid, &fusion_directory);
++  if (status != Status::kOk)
++    return status;
++  status =
++      EnsureDirectoryAt(fusion_directory.get(), "runs", ownership.shared_uid,
++                        ownership.gid, ownership.process_uid, &runs_directory);
++  if (status != Status::kOk)
++    return status;
++  status = CreateOrVerifyTrustedDirectoryAt(
++      runs_directory.get(), run_id, ownership.shared_uid, ownership.gid,
++      &run_directory);
++  if (status != Status::kOk)
++    return status;
++
++  char process_directory_name[32];
++  const int length =
++      snprintf(process_directory_name, sizeof(process_directory_name),
++               "process-%u", request.target_pid);
++  if (length <= 0 ||
++      static_cast<size_t>(length) >= sizeof(process_directory_name)) {
++    return Status::kProtocolError;
++  }
++  ScopedFd process_directory;
++  status = CreateExclusiveDirectoryAt(
++      run_directory.get(), process_directory_name, ownership.process_uid,
++      ownership.gid, &process_directory);
++  if (status != Status::kOk)
++    return status;
++
++  static constexpr std::array<std::string_view, 4> kFixedDirectories = {
++      "metadata", "artifacts", "records", "methods"};
++  for (std::string_view directory : kFixedDirectories) {
++    ScopedFd ignored;
++    status = CreateExclusiveDirectoryAt(process_directory.get(), directory,
++                                        ownership.process_uid, ownership.gid,
++                                        &ignored);
++    if (status != Status::kOk) {
++      RemovePreparedBranch(process_directory.get(), run_directory.get(),
++                           process_directory_name);
++      return status;
++    }
++  }
++  ScopedFd transfer_directory =
++      OpenDirectoryPathAt(run_directory.get(), process_directory_name);
++  if (transfer_directory.get() < 0)
++    return StatusForErrno(errno);
++  struct stat writable_stat{};
++  struct stat transfer_stat{};
++  if (fstat(process_directory.get(), &writable_stat) != 0 ||
++      fstat(transfer_directory.get(), &transfer_stat) != 0 ||
++      writable_stat.st_dev != transfer_stat.st_dev ||
++      writable_stat.st_ino != transfer_stat.st_ino) {
++    return Status::kPermissionDenied;
++  }
++  *out_process_fd = transfer_directory.release();
++  return Status::kOk;
++}
++
++} // namespace r0dump::file_helper
+diff --git a/helper/r0dump_file_helper_core.h b/helper/r0dump_file_helper_core.h
+new file mode 100644
+index 0000000..64ccd53
+--- /dev/null
++++ b/helper/r0dump_file_helper_core.h
+@@ -0,0 +1,31 @@
++#ifndef R0DUMP_FILE_HELPER_CORE_H_
++#define R0DUMP_FILE_HELPER_CORE_H_
++
++#include <sys/types.h>
++
++#include <string_view>
++
++#include "r0dump_file_helper_protocol.h"
++
++namespace r0dump::file_helper {
++
++struct Ownership {
++  uid_t shared_uid;
++  uid_t process_uid;
++  gid_t gid;
++};
++
++bool IsValidPackageName(std::string_view value);
++bool IsValidProcessName(std::string_view value);
++bool IsValidRunId(std::string_view value);
++bool ReadFixedString(const char *value, size_t capacity, std::string_view *out);
++
++// root_fd must refer to /mnt/user/0/emulated/0 in production. On success,
++// returns an O_PATH|O_DIRECTORY|O_CLOEXEC descriptor for the new
++// process-<pid> directory in out_process_fd.
++Status PrepareDirectoryTreeAt(int root_fd, const Request &request,
++                              const Ownership &ownership, int *out_process_fd);
++
++} // namespace r0dump::file_helper
++
++#endif // R0DUMP_FILE_HELPER_CORE_H_
+diff --git a/helper/r0dump_file_helper_protocol.h b/helper/r0dump_file_helper_protocol.h
+new file mode 100644
+index 0000000..1bb3bf3
+--- /dev/null
++++ b/helper/r0dump_file_helper_protocol.h
+@@ -0,0 +1,55 @@
++#ifndef R0DUMP_FILE_HELPER_PROTOCOL_H_
++#define R0DUMP_FILE_HELPER_PROTOCOL_H_
++
++#include <stddef.h>
++#include <stdint.h>
++
++namespace r0dump::file_helper {
++
++inline constexpr uint32_t kProtocolMagic = 0x52304648u; // R0FH
++inline constexpr uint16_t kProtocolVersion = 1u;
++inline constexpr size_t kPackageBytes = 96u;
++inline constexpr size_t kProcessBytes = 96u;
++inline constexpr size_t kRunIdBytes = 65u;
++
++enum class Status : int32_t {
++  kOk = 0,
++  kInvalidCaller = 1,
++  kDisabled = 2,
++  kConfigMismatch = 3,
++  kStorageUnavailable = 4,
++  kExists = 5,
++  kPermissionDenied = 6,
++  kTimeout = 7,
++  kProtocolError = 8,
++  kInternalError = 9,
++};
++
++#pragma pack(push, 1)
++struct Request {
++  uint32_t magic;
++  uint16_t version;
++  uint16_t size;
++  uint64_t generation;
++  uint32_t user_id;
++  uint32_t target_uid;
++  uint32_t target_pid;
++  char package_name[kPackageBytes];
++  char process_name[kProcessBytes];
++  char run_id[kRunIdBytes];
++};
++
++struct Response {
++  uint32_t magic;
++  uint16_t version;
++  uint16_t size;
++  int32_t status;
++};
++#pragma pack(pop)
++
++static_assert(sizeof(Request) == 285u);
++static_assert(sizeof(Response) == 12u);
++
++} // namespace r0dump::file_helper
++
++#endif // R0DUMP_FILE_HELPER_PROTOCOL_H_
+diff --git a/helper/r0dump_file_helper_test.cpp b/helper/r0dump_file_helper_test.cpp
+new file mode 100644
+index 0000000..e298523
+--- /dev/null
++++ b/helper/r0dump_file_helper_test.cpp
+@@ -0,0 +1,145 @@
++#include "r0dump_file_helper_core.h"
++
++#include <fcntl.h>
++#include <gtest/gtest.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++#include <cstring>
++#include <filesystem>
++#include <string>
++
++namespace r0dump::file_helper {
++namespace {
++
++class HelperTest : public testing::Test {
++protected:
++  void SetUp() override {
++    char templ[] = "/tmp/r0dump-helper-XXXXXX";
++    root_ = mkdtemp(templ);
++    ASSERT_FALSE(root_.empty());
++    std::filesystem::create_directories(
++        root_ + "/Android/data/com.example.target/files");
++    root_fd_ = open(root_.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
++    ASSERT_GE(root_fd_, 0);
++  }
++
++  void TearDown() override {
++    if (root_fd_ >= 0)
++      close(root_fd_);
++    std::filesystem::remove_all(root_);
++  }
++
++  Request RequestFor(uint32_t pid = 1234u) {
++    Request request = {};
++    request.magic = kProtocolMagic;
++    request.version = kProtocolVersion;
++    request.size = static_cast<uint16_t>(sizeof(Request));
++    request.generation = 2u;
++    request.user_id = 0u;
++    request.target_uid = 10001u;
++    request.target_pid = pid;
++    strcpy(request.package_name, "com.example.target");
++    strcpy(request.process_name, "com.example.target:worker");
++    strcpy(request.run_id, "run-1");
++    return request;
++  }
++
++  std::string root_;
++  int root_fd_ = -1;
++};
++
++mode_t Mode(const std::string &path) {
++  struct stat st{};
++  EXPECT_EQ(stat(path.c_str(), &st), 0);
++  return st.st_mode & 02777;
++}
++
++TEST_F(HelperTest, CreatesSetgidTreeAndReturnsProcessDirectory) {
++  int process_fd = -1;
++  EXPECT_EQ(PrepareDirectoryTreeAt(root_fd_, RequestFor(),
++                                   {geteuid(), geteuid(), getegid()},
++                                   &process_fd),
++            Status::kOk);
++  ASSERT_GE(process_fd, 0);
++  struct stat st{};
++  ASSERT_EQ(fstat(process_fd, &st), 0);
++  EXPECT_TRUE(S_ISDIR(st.st_mode));
++  EXPECT_EQ(fcntl(process_fd, F_GETFL) & O_PATH, O_PATH);
++  EXPECT_EQ(st.st_gid, getegid());
++  EXPECT_EQ(st.st_mode & 02777, static_cast<mode_t>(02770));
++  close(process_fd);
++
++  const std::string run =
++      root_ + "/Android/data/com.example.target/files/r0dump-fusion/runs/run-1";
++  EXPECT_EQ(Mode(run), static_cast<mode_t>(02770));
++  const std::string process = run + "/process-1234";
++  EXPECT_EQ(Mode(process), static_cast<mode_t>(02770));
++  for (const char *name : {"metadata", "artifacts", "records", "methods"}) {
++    EXPECT_EQ(Mode(process + "/" + name), static_cast<mode_t>(02770));
++  }
++}
++
++TEST_F(HelperTest, RejectsDuplicateProcessDirectoryWithoutReusingIt) {
++  int process_fd = -1;
++  Request request = RequestFor();
++  ASSERT_EQ(PrepareDirectoryTreeAt(root_fd_, request,
++                                   {geteuid(), geteuid(), getegid()},
++                                   &process_fd),
++            Status::kOk);
++  close(process_fd);
++  process_fd = -1;
++  EXPECT_EQ(PrepareDirectoryTreeAt(root_fd_, request,
++                                   {geteuid(), geteuid(), getegid()},
++                                   &process_fd),
++            Status::kExists);
++  EXPECT_EQ(process_fd, -1);
++}
++
++TEST_F(HelperTest, RejectsExistingRunWithUntrustedOwnershipWithoutRepairingIt) {
++  const std::string run =
++      root_ + "/Android/data/com.example.target/files/r0dump-fusion/runs/run-1";
++  std::filesystem::create_directories(run);
++  ASSERT_EQ(chmod(run.c_str(), 0755), 0);
++
++  struct stat before{};
++  ASSERT_EQ(stat(run.c_str(), &before), 0);
++  int process_fd = -1;
++  EXPECT_EQ(PrepareDirectoryTreeAt(root_fd_, RequestFor(),
++                                   {geteuid(), geteuid(), getegid()},
++                                   &process_fd),
++            Status::kPermissionDenied);
++  EXPECT_EQ(process_fd, -1);
++
++  struct stat after{};
++  ASSERT_EQ(stat(run.c_str(), &after), 0);
++  EXPECT_EQ(after.st_uid, before.st_uid);
++  EXPECT_EQ(after.st_gid, before.st_gid);
++  EXPECT_EQ(after.st_mode & 02777, before.st_mode & 02777);
++  EXPECT_FALSE(std::filesystem::exists(run + "/process-1234"));
++}
++
++TEST_F(HelperTest, RejectsSymlinkInTrustedPath) {
++  std::filesystem::remove_all(root_ + "/Android/data/com.example.target");
++  ASSERT_EQ(
++      symlink("/tmp", (root_ + "/Android/data/com.example.target").c_str()), 0);
++  int process_fd = -1;
++  EXPECT_NE(PrepareDirectoryTreeAt(root_fd_, RequestFor(),
++                                   {geteuid(), geteuid(), getegid()},
++                                   &process_fd),
++            Status::kOk);
++  EXPECT_EQ(process_fd, -1);
++}
++
++TEST_F(HelperTest, RejectsPathLikeRunId) {
++  Request request = RequestFor();
++  strcpy(request.run_id, "../escape");
++  int process_fd = -1;
++  EXPECT_EQ(PrepareDirectoryTreeAt(root_fd_, request,
++                                   {geteuid(), geteuid(), getegid()},
++                                   &process_fd),
++            Status::kProtocolError);
++}
++
++} // namespace
++} // namespace r0dump::file_helper
+diff --git a/res/values-zh-rCN/strings.xml b/res/values-zh-rCN/strings.xml
+index 6f80a9c..b0e1299 100644
+--- a/res/values-zh-rCN/strings.xml
++++ b/res/values-zh-rCN/strings.xml
+@@ -83,7 +83,7 @@
+     <string name="capture_group_selected_count">已选择 %1$d / %2$d</string>
+     <string name="expand_capture_group">展开%1$s</string>
+     <string name="collapse_capture_group">收起%1$s</string>
+-    <string name="capture_point_description">位 %1$d，%2$s</string>
++    <string name="capture_point_description">位 %1$d，源码位置 %2$s，点位 ID %3$s</string>
+     <string name="active">主动</string>
+     <string name="high_cost_capture_point">高成本快照</string>
+     <string name="high_cost_capture_point_detail">该点位可能复制完整 DEX 快照，并增加启动耗时、内存占用和产物体积。</string>
+diff --git a/res/values/strings.xml b/res/values/strings.xml
+index 043011a..c769e79 100644
+--- a/res/values/strings.xml
++++ b/res/values/strings.xml
+@@ -83,7 +83,7 @@
+     <string name="capture_group_selected_count">%1$d of %2$d selected</string>
+     <string name="expand_capture_group">Expand %1$s</string>
+     <string name="collapse_capture_group">Collapse %1$s</string>
+-    <string name="capture_point_description">Bit %1$d, %2$s</string>
++    <string name="capture_point_description">Bit %1$d, source %2$s, point ID %3$s</string>
+     <string name="active">Active</string>
+     <string name="high_cost_capture_point">High-cost snapshot</string>
+     <string name="high_cost_capture_point_detail">This point can copy a complete DEX snapshot and increase startup time, memory use, and output volume.</string>
+diff --git a/src/com/android/r0dumpmanager/domain/CapturePointRegistry.kt b/src/com/android/r0dumpmanager/domain/CapturePointRegistry.kt
+index 07af4cf..e616790 100644
+--- a/src/com/android/r0dumpmanager/domain/CapturePointRegistry.kt
++++ b/src/com/android/r0dumpmanager/domain/CapturePointRegistry.kt
+@@ -1,6 +1,11 @@
+ package com.android.r0dumpmanager.domain
+ 
+-data class CapturePoint(val bit: Int, val name: String, val kind: String)
++data class CapturePoint(
++    val bit: Int,
++    val name: String,
++    val sourceLocation: String,
++    val kind: String,
++)
+ 
+ object CapturePointRegistry {
+     const val pointCount = 42
+@@ -8,27 +13,48 @@ object CapturePointRegistry {
+     val undefinedMask: ULong = definedMask.inv()
+     val forceNoExecuteMask: ULong = 1uL shl 41
+     val points = listOf(
+-        CapturePoint(0, "Cookie.result.dex", "DEX snapshot"), CapturePoint(1, "InMemory.buffer.copied", "raw buffer"),
+-        CapturePoint(2, "InMemory.dex.parsed", "DEX snapshot"), CapturePoint(3, "OpenCommon.return", "DEX snapshot"),
+-        CapturePoint(4, "DefineClassNative.match", "DEX snapshot"), CapturePoint(5, "RegisterDexFile.return", "DEX snapshot"),
+-        CapturePoint(6, "DefineClass.entry", "class/Dex evidence"), CapturePoint(7, "DefineClass.success", "metadata"),
+-        CapturePoint(8, "LoadMethod.ready", "CodeItem"), CapturePoint(9, "LoadClass.entry", "metadata"),
+-        CapturePoint(10, "LoadClass.success", "metadata"), CapturePoint(11, "ResolveMethod.cache_hit", "method evidence"),
+-        CapturePoint(12, "ResolveMethod.lookup_success", "method evidence"), CapturePoint(13, "VerifyClass.complete", "metadata"),
+-        CapturePoint(14, "ClassInit.before_clinit", "CodeItem/metadata"), CapturePoint(15, "ClassInit.success", "metadata"),
+-        CapturePoint(16, "OatDexFile.open.success", "DEX snapshot"), CapturePoint(17, "Vdex.load.complete", "DEX snapshot"),
+-        CapturePoint(18, "OatManager.file.complete", "DEX snapshot"), CapturePoint(19, "OatManager.memory.complete", "DEX/reference"),
+-        CapturePoint(20, "OatManager.register.before_lock", "metadata"), CapturePoint(21, "ImageSpace.dex.tracked", "DEX/reference"),
+-        CapturePoint(22, "ArtMethod.invoke.dispatch", "method evidence"), CapturePoint(23, "Interpreter.execute.entry", "method evidence"),
+-        CapturePoint(24, "Jit.method_entered", "method evidence"), CapturePoint(25, "Jit.compile.begin", "CodeItem/metadata"),
+-        CapturePoint(26, "Jit.compile.end", "metadata"), CapturePoint(27, "ReflectMethod.before_invoke", "method evidence"),
+-        CapturePoint(28, "ReflectCtor.before_invoke", "method evidence"), CapturePoint(29, "Instrumentation.enter", "method evidence"),
+-        CapturePoint(30, "Instrumentation.exit.value", "method evidence"), CapturePoint(31, "Instrumentation.exit.object", "method evidence"),
+-        CapturePoint(32, "BDCL.path.constructor", "DEX route"), CapturePoint(33, "BDCL.memory.constructor", "buffer route"),
+-        CapturePoint(34, "BDCL.findClass.success", "DEX route"), CapturePoint(35, "BDCL.addDexPath.return", "DEX route"),
+-        CapturePoint(36, "DexFile.open.file.return", "DEX route"), CapturePoint(37, "DexFile.open.memory.return", "buffer route"),
+-        CapturePoint(38, "DexFile.before_define", "DEX route"), CapturePoint(39, "Walk.cookie.dex", "active DEX snapshot"),
+-        CapturePoint(40, "Walk.executable.method", "active method evidence"), CapturePoint(41, "ForceInvoke.no_execute", "active CodeItem"),
++        CapturePoint(0, "Cookie.result.dex", "CreateCookieFromOatFileManagerResult", "DEX snapshot"),
++        CapturePoint(1, "InMemory.buffer.copied", "DexFile_openInMemoryDexFilesNative", "raw buffer"),
++        CapturePoint(2, "InMemory.dex.parsed", "DexFile_openInMemoryDexFilesNative", "DEX snapshot"),
++        CapturePoint(3, "OpenCommon.return", "DexFileLoader::OpenCommon", "DEX snapshot"),
++        CapturePoint(4, "DefineClassNative.match", "DexFile_defineClassNative", "DEX snapshot"),
++        CapturePoint(5, "RegisterDexFile.return", "ClassLinker::RegisterDexFile", "DEX snapshot"),
++        CapturePoint(6, "DefineClass.entry", "ClassLinker::DefineClass", "class/Dex evidence"),
++        CapturePoint(7, "DefineClass.success", "ClassLinker::DefineClass", "metadata"),
++        CapturePoint(8, "LoadMethod.ready", "ClassLinker::LoadClassHelper::FillMethods", "CodeItem"),
++        CapturePoint(9, "LoadClass.entry", "ClassLinker::LoadClass", "metadata"),
++        CapturePoint(10, "LoadClass.success", "ClassLinker::LoadClass", "metadata"),
++        CapturePoint(11, "ResolveMethod.cache_hit", "ClassLinker::ResolveMethodId", "method evidence"),
++        CapturePoint(12, "ResolveMethod.lookup_success", "ClassLinker::ResolveMethodId", "method evidence"),
++        CapturePoint(13, "VerifyClass.complete", "ClassLinker::VerifyClass", "metadata"),
++        CapturePoint(14, "ClassInit.before_clinit", "ClassLinker::InitializeClass", "CodeItem/metadata"),
++        CapturePoint(15, "ClassInit.success", "ClassLinker::InitializeClass", "metadata"),
++        CapturePoint(16, "OatDexFile.open.success", "OatDexFile::OpenDexFile", "DEX snapshot"),
++        CapturePoint(17, "Vdex.load.complete", "OatFileAssistant::LoadDexFiles", "DEX snapshot"),
++        CapturePoint(18, "OatManager.file.complete", "OatFileManager::OpenDexFilesFromOat(path)", "DEX snapshot"),
++        CapturePoint(19, "OatManager.memory.complete", "OatFileManager::OpenDexFilesFromOat(memory)", "DEX/reference"),
++        CapturePoint(20, "OatManager.register.before_lock", "OatFileManager::RegisterOatFile", "metadata"),
++        CapturePoint(21, "ImageSpace.dex.tracked", "OatFileManager::OpenDexFilesFromOat(path)", "DEX/reference"),
++        CapturePoint(22, "ArtMethod.invoke.dispatch", "ArtMethod::Invoke", "method evidence"),
++        CapturePoint(23, "Interpreter.execute.entry", "interpreter::Execute", "method evidence"),
++        CapturePoint(24, "Jit.method_entered", "Jit::MethodEntered", "method evidence"),
++        CapturePoint(25, "Jit.compile.begin", "Jit::CompileMethodInternal", "CodeItem/metadata"),
++        CapturePoint(26, "Jit.compile.end", "Jit::CompileMethodInternal", "metadata"),
++        CapturePoint(27, "Reflect.method.before_invoke", "Method_invoke", "method evidence"),
++        CapturePoint(28, "Reflect.ctor.before_invoke", "Constructor_newInstance0", "method evidence"),
++        CapturePoint(29, "Instrumentation.enter", "Instrumentation::MethodEnterEventImpl", "method evidence"),
++        CapturePoint(30, "Instrumentation.exit.value", "Instrumentation::MethodExitEventImpl", "method evidence"),
++        CapturePoint(31, "Instrumentation.exit.object", "Instrumentation::MethodExitEventImpl", "method evidence"),
++        CapturePoint(32, "BDCL.path.constructor", "BaseDexClassLoader::<init>(path)", "DEX route"),
++        CapturePoint(33, "BDCL.memory.constructor", "BaseDexClassLoader::<init>(memory)", "buffer route"),
++        CapturePoint(34, "BDCL.findClass.success", "BaseDexClassLoader::findClass", "DEX route"),
++        CapturePoint(35, "BDCL.addDexPath.return", "BaseDexClassLoader::addDexPath", "DEX route"),
++        CapturePoint(36, "DexFile.open_file.return", "DexFile::openDexFile", "DEX route"),
++        CapturePoint(37, "DexFile.open_memory.return", "DexFile::openInMemoryDexFiles", "buffer route"),
++        CapturePoint(38, "DexFile.before_define", "DexFile::loadClassBinaryName", "DEX route"),
++        CapturePoint(39, "Walk.cookie.dex", "r0dump_Runtime_r0dump_CaptureCookie", "active DEX snapshot"),
++        CapturePoint(40, "Walk.executable.method", "r0dump_Runtime_r0dump_CaptureExecutable", "active method evidence"),
++        CapturePoint(41, "ForceInvoke.no_execute", "ArtMethod::Invoke", "active CodeItem"),
+     )
+     init { check(points.map { it.bit } == (0 until pointCount).toList()) }
+     fun contains(mask: ULong, bit: Int) = bit in 0 until pointCount && (mask and (1uL shl bit)) != 0uL
+diff --git a/src/com/android/r0dumpmanager/ui/R0dumpManagerScreen.kt b/src/com/android/r0dumpmanager/ui/R0dumpManagerScreen.kt
+index e914807..8f09f57 100644
+--- a/src/com/android/r0dumpmanager/ui/R0dumpManagerScreen.kt
++++ b/src/com/android/r0dumpmanager/ui/R0dumpManagerScreen.kt
+@@ -960,13 +960,24 @@ fun CapturePointGroupHeader(
+ 
+ @Composable private fun CapturePointRow(point: CapturePoint, state: R0dumpUiState, viewModel: R0dumpManagerViewModel) {
+     val checked = CapturePointRegistry.contains(state.draft.capturePointMask, point.bit)
+-    val description = stringResource(R.string.capture_point_description, point.bit, point.name)
++    val description = stringResource(
++        R.string.capture_point_description,
++        point.bit,
++        point.sourceLocation,
++        point.name,
++    )
+     val highCost = point.kind.contains("snapshot", ignoreCase = true)
+     Row(Modifier.fillMaxWidth().heightIn(min = 56.dp).clickable(enabled = state.canEdit, onClick = { viewModel.toggleCapturePoint(point.bit) }).semantics { contentDescription = description }, verticalAlignment = Alignment.CenterVertically) {
+         Checkbox(checked = checked, enabled = state.canEdit, onCheckedChange = { viewModel.toggleCapturePoint(point.bit) })
+         Column(Modifier.weight(1f)) {
+-            Text("${point.bit.toString().padStart(2, '0')}  ${point.name}", maxLines = 2, overflow = TextOverflow.Ellipsis)
+-            Text(captureKind(point.kind), style = MaterialTheme.typography.bodySmall)
++            Text("${point.bit.toString().padStart(2, '0')}  ${point.sourceLocation}", maxLines = 2, overflow = TextOverflow.Ellipsis)
++            Text(
++                "${point.name} · ${captureKind(point.kind)}",
++                style = MaterialTheme.typography.bodySmall,
++                color = MaterialTheme.colorScheme.onSurfaceVariant,
++                maxLines = 2,
++                overflow = TextOverflow.Ellipsis,
++            )
+             if (highCost) {
+                 Row(horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically) {
+                     Icon(
+diff --git a/tests/src/com/android/r0dumpmanager/domain/FusionConfigContractTest.kt b/tests/src/com/android/r0dumpmanager/domain/FusionConfigContractTest.kt
+index 7d97078..536ba4d 100644
+--- a/tests/src/com/android/r0dumpmanager/domain/FusionConfigContractTest.kt
++++ b/tests/src/com/android/r0dumpmanager/domain/FusionConfigContractTest.kt
+@@ -26,6 +26,7 @@ class FusionConfigContractTest {
+     @Test fun captureRegistryIsTheFortyTwoBitArtContract() {
+         assertEquals(42, CapturePointRegistry.points.size)
+         assertEquals((0..41).toList(), CapturePointRegistry.points.map { it.bit })
++        assertEquals("DexFileLoader::OpenCommon", CapturePointRegistry.points[3].sourceLocation)
+         assertEquals("ForceInvoke.no_execute", CapturePointRegistry.points.last().name)
+         assertTrue(FusionConfigValidator.validate(FusionConfigSchema.defaults().copy(enabled = true, runId = "x", targetPackage = "com.example.app", targetProcess = "com.example.app", capturePointMask = 1uL shl 42)).errors.containsKey("capture_point_mask"))
+     }
+diff --git a/tools/deploy_userdebug.sh b/tools/deploy_userdebug.sh
+index e7dfbe7..2df7127 100755
+--- a/tools/deploy_userdebug.sh
++++ b/tools/deploy_userdebug.sh
+@@ -9,12 +9,15 @@ ADB_SERIAL="${ADB_SERIAL:-f5e3adbc}"
+ ROOT_DIR="${ROOT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)}"
+ OUT_DIR="${OUT_DIR:-$ROOT_DIR/out/target/product/lemonadep}"
+ WITH_FRAMEWORK=0
++WITH_ART=0
++WITH_FILE_HELPER=0
+ WITH_SEPOLICY=0
+ NO_REBOOT=0
+ 
+ usage() {
+   cat <<'EOF'
+-Usage: deploy_userdebug.sh [--with-framework] [--with-sepolicy] [--no-reboot]
++Usage: deploy_userdebug.sh [--with-framework] [--with-art]
++                           [--with-file-helper] [--with-sepolicy] [--no-reboot]
+ 
+ By default, deploys only R0dumpManager.apk and its privapp allowlist.
+ The caller must build the selected artifacts first using the userdebug lunch target.
+@@ -24,6 +27,8 @@ EOF
+ while [[ $# -gt 0 ]]; do
+   case "$1" in
+     --with-framework) WITH_FRAMEWORK=1 ;;
++    --with-art) WITH_ART=1 ;;
++    --with-file-helper) WITH_FILE_HELPER=1 ;;
+     --with-sepolicy) WITH_SEPOLICY=1 ;;
+     --no-reboot) NO_REBOOT=1 ;;
+     -h|--help) usage; exit 0 ;;
+@@ -40,17 +45,23 @@ require_file() { [[ -f "$1" ]] || fail "missing artifact: $1"; }
+ push_system_file() {
+   local source="$1"
+   local destination="$2"
++  local mode="${3:-0644}"
+   echo "push: $source -> $destination"
+   adb_device push "$source" "$destination" >/dev/null
+-  adb_device shell "chown root:root '$destination' && chmod 0644 '$destination'"
++  adb_device shell "chown root:root '$destination' && chmod '$mode' '$destination'"
+ }
+ 
+ apk="$OUT_DIR/system/priv-app/R0dumpManager/R0dumpManager.apk"
+ privapp="$OUT_DIR/system/etc/permissions/privapp-permissions-com.android.r0dumpmanager.xml"
+ framework="$OUT_DIR/system/framework/framework.jar"
++services="$OUT_DIR/system/framework/services.jar"
++art_apex="$OUT_DIR/system/apex/com.android.art.capex"
++file_helper="$OUT_DIR/system/bin/r0dump_file_helper"
++file_helper_rc="$OUT_DIR/system/etc/init/r0dump_file_helper.rc"
+ policy="$OUT_DIR/system/etc/selinux/plat_sepolicy.cil"
+ seapp="$OUT_DIR/system/etc/selinux/plat_seapp_contexts"
+ property_contexts="$OUT_DIR/system/etc/selinux/plat_property_contexts"
++file_contexts="$OUT_DIR/system/etc/selinux/plat_file_contexts"
+ policy_hash="$OUT_DIR/system/etc/selinux/plat_sepolicy_and_mapping.sha256"
+ 
+ # Split-policy devices compile platform, system_ext, and product policy
+@@ -83,11 +94,20 @@ require_file "$apk"
+ require_file "$privapp"
+ if [[ "$WITH_FRAMEWORK" -eq 1 ]]; then
+   require_file "$framework"
++  require_file "$services"
++fi
++if [[ "$WITH_ART" -eq 1 ]]; then
++  require_file "$art_apex"
++fi
++if [[ "$WITH_FILE_HELPER" -eq 1 ]]; then
++  require_file "$file_helper"
++  require_file "$file_helper_rc"
+ fi
+ if [[ "$WITH_SEPOLICY" -eq 1 ]]; then
+   require_file "$policy"
+   require_file "$seapp"
+   require_file "$property_contexts"
++  require_file "$file_contexts"
+   require_file "$policy_hash"
+   require_file "$plat_mapping"
+   require_file "$system_ext_policy"
+@@ -119,6 +139,7 @@ adb_device shell am force-stop com.android.r0dumpmanager || true
+ 
+ adb_device shell mkdir -p \
+   /system/priv-app/R0dumpManager /system/etc/permissions /system/framework \
++  /system/apex /system/bin /system/etc/init \
+   /system/etc/selinux /system/etc/selinux/mapping \
+   /system_ext/etc/selinux /system_ext/etc/selinux/mapping \
+   /product/etc/selinux /product/etc/selinux/mapping
+@@ -127,6 +148,16 @@ push_system_file "$privapp" /system/etc/permissions/privapp-permissions-com.andr
+ 
+ if [[ "$WITH_FRAMEWORK" -eq 1 ]]; then
+   push_system_file "$framework" /system/framework/framework.jar
++  push_system_file "$services" /system/framework/services.jar
++fi
++
++if [[ "$WITH_ART" -eq 1 ]]; then
++  push_system_file "$art_apex" /system/apex/com.android.art.capex
++fi
++
++if [[ "$WITH_FILE_HELPER" -eq 1 ]]; then
++  push_system_file "$file_helper" /system/bin/r0dump_file_helper 0755
++  push_system_file "$file_helper_rc" /system/etc/init/r0dump_file_helper.rc
+ fi
+ 
+ if [[ "$WITH_SEPOLICY" -eq 1 ]]; then
+@@ -135,6 +166,7 @@ if [[ "$WITH_SEPOLICY" -eq 1 ]]; then
+   push_system_file "$policy" /system/etc/selinux/plat_sepolicy.cil
+   push_system_file "$seapp" /system/etc/selinux/plat_seapp_contexts
+   push_system_file "$property_contexts" /system/etc/selinux/plat_property_contexts
++  push_system_file "$file_contexts" /system/etc/selinux/plat_file_contexts
+   push_system_file "$plat_mapping" "/system/etc/selinux/mapping/$(basename "$plat_mapping")"
+   push_system_file "$system_ext_policy" /system_ext/etc/selinux/system_ext_sepolicy.cil
+   push_system_file "$system_ext_mapping" "/system_ext/etc/selinux/mapping/$(basename "$system_ext_mapping")"
+@@ -149,7 +181,10 @@ fi
+ 
+ adb_device shell restorecon \
+   /system/priv-app/R0dumpManager/R0dumpManager.apk \
+-  /system/etc/permissions/privapp-permissions-com.android.r0dumpmanager.xml || true
++  /system/etc/permissions/privapp-permissions-com.android.r0dumpmanager.xml \
++  /system/bin/r0dump_file_helper \
++  /system/etc/init/r0dump_file_helper.rc \
++  /system/apex/com.android.art.capex || true
+ adb_device shell sync
+ 
+ echo "deployed R0dumpManager artifacts successfully"
+diff --git a/tools/validate_source_contracts.sh b/tools/validate_source_contracts.sh
+index 3cb7e7e..2e96b72 100755
+--- a/tools/validate_source_contracts.sh
++++ b/tools/validate_source_contracts.sh
+@@ -22,6 +22,7 @@ def read(path: Path) -> str:
+ 
+ framework = read(root / "frameworks/base/core/java/android/app/r0dump_FusionConfig.java")
+ points = read(root / "art/runtime/r0dump/r0dump_hook_point.h")
++point_descriptors = read(root / "art/runtime/r0dump/r0dump_hook_point.cc")
+ draft = read(app / "src/com/android/r0dumpmanager/domain/FusionConfigDraft.kt")
+ registry = read(app / "src/com/android/r0dumpmanager/domain/CapturePointRegistry.kt")
+ repository = read(app / "src/com/android/r0dumpmanager/data/property/FusionPropertyRepository.kt")
+@@ -36,7 +37,7 @@ strings_zh_text = read(app / "res/values-zh-rCN/strings.xml")
+ privapp = read(app / "privapp-permissions-com.android.r0dumpmanager.xml")
+ bp = read(app / "Android.bp")
+ device_mk = read(root / "device/oneplus/lemonadep/device.mk")
+-property_te = read(root / "system/sepolicy/public/property.te")
++property_te = read(root / "system/sepolicy/private/property.te")
+ property_contexts = read(root / "system/sepolicy/private/property_contexts")
+ seapp_contexts = read(root / "system/sepolicy/private/seapp_contexts")
+ manager_te = read(root / "system/sepolicy/private/r0dump_manager_app.te")
+@@ -51,10 +52,14 @@ if len(draft_fields) != 34:
+ 
+ point_entries = re.findall(r"\bk[A-Za-z0-9]+\s*=\s*(\d+),", points)
+ manager_points = re.findall(r"CapturePoint\((\d+),", registry)
++art_point_names = re.findall(r'\{r0dump_Point::k[A-Za-z0-9]+, "([^"]+)"\}', point_descriptors)
++manager_point_names = re.findall(r'CapturePoint\(\d+, "([^"]+)"', registry)
+ if point_entries != [str(i) for i in range(42)]:
+     errors.append("ART capture points must remain contiguous bits 0..41")
+ if manager_points != [str(i) for i in range(42)]:
+     errors.append("Manager capture points must exactly cover bits 0..41")
++if manager_point_names != art_point_names:
++    errors.append("Manager capture point IDs must exactly match ART descriptors")
+ if "kForceInvokeNoExecute = 41" not in points or "forceNoExecuteMask: ULong = 1uL shl 41" not in registry:
+     errors.append("force no-execute bit must remain 41")
+ 
+-- 
+2.43.0
+

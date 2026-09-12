@@ -1,0 +1,99 @@
+From ee81612a2dfac3386b9eb12983570430398012e6 Mon Sep 17 00:00:00 2001
+From: Ivory <contact@ivory.cafe>
+Date: Thu, 10 Sep 2026 22:15:20 +0800
+Subject: [PATCH 24/32] manager: unpack dense declarations for readability
+
+Break the semicolon-packed MutationOperation, R0dumpUiState, and the
+validator range() checks into one declaration per line, and document why
+validateForUi drops the run_id error. No behavior change.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ .../app/R0dumpManagerViewModel.kt             | 26 +++++++++++++-----
+ .../domain/FusionConfigValidator.kt           | 27 ++++++++++++-------
+ 2 files changed, 38 insertions(+), 15 deletions(-)
+
+diff --git a/src/com/android/r0dumpmanager/app/R0dumpManagerViewModel.kt b/src/com/android/r0dumpmanager/app/R0dumpManagerViewModel.kt
+index ca231f6..7d90443 100644
+--- a/src/com/android/r0dumpmanager/app/R0dumpManagerViewModel.kt
++++ b/src/com/android/r0dumpmanager/app/R0dumpManagerViewModel.kt
+@@ -37,18 +37,32 @@ import java.time.Instant
+ import java.time.ZoneOffset
+ import java.time.format.DateTimeFormatter
+ 
+-sealed interface MutationOperation { data object Idle : MutationOperation; data object Publishing : MutationOperation; data object Exporting : MutationOperation; data class Failed(val reason: String) : MutationOperation }
++sealed interface MutationOperation {
++    data object Idle : MutationOperation
++    data object Publishing : MutationOperation
++    data object Exporting : MutationOperation
++    data class Failed(val reason: String) : MutationOperation
++}
++
++// run_id is validated on publish, not while editing: an empty/partial run_id is
++// normal in a draft, so drop that error from the UI-facing validation result.
+ private fun validateForUi(draft: FusionConfigDraft): FusionValidationResult = FusionValidationResult(
+     FusionConfigValidator.validate(draft, true).errors - "run_id",
+ )
++
+ data class R0dumpUiState(
+-    val draft: FusionConfigDraft = FusionConfigSchema.defaults(), val deviceSnapshot: FusionDeviceSnapshot = FusionDeviceSnapshot.Unconfigured,
+-    val applications: List<TargetApplication> = emptyList(), val selectedProfile: ProfileId = ProfileId.DEFAULTS,
++    val draft: FusionConfigDraft = FusionConfigSchema.defaults(),
++    val deviceSnapshot: FusionDeviceSnapshot = FusionDeviceSnapshot.Unconfigured,
++    val applications: List<TargetApplication> = emptyList(),
++    val selectedProfile: ProfileId = ProfileId.DEFAULTS,
+     val validation: FusionValidationResult = validateForUi(FusionConfigSchema.defaults()),
+     val isOwnerUser: Boolean = UserHandle.myUserId() == UserHandle.USER_SYSTEM,
+-    val isForeground: Boolean = false, val operation: MutationOperation = MutationOperation.Idle,
+-    val message: String? = null, val messageSerial: Long = 0,
+-    val draftNoticeSerial: Long = 0, val draftNoticeShown: Boolean = false,
++    val isForeground: Boolean = false,
++    val operation: MutationOperation = MutationOperation.Idle,
++    val message: String? = null,
++    val messageSerial: Long = 0,
++    val draftNoticeSerial: Long = 0,
++    val draftNoticeShown: Boolean = false,
+     val lastExport: ArtifactExportResult? = null,
+ ) {
+     val isInterrupted get() = deviceSnapshot is FusionDeviceSnapshot.Interrupted
+diff --git a/src/com/android/r0dumpmanager/domain/FusionConfigValidator.kt b/src/com/android/r0dumpmanager/domain/FusionConfigValidator.kt
+index ae7c704..c2adf5c 100644
+--- a/src/com/android/r0dumpmanager/domain/FusionConfigValidator.kt
++++ b/src/com/android/r0dumpmanager/domain/FusionConfigValidator.kt
+@@ -66,15 +66,24 @@ object FusionConfigValidator {
+         }
+         if (requireEnabled && draft.capturePointMask == 0uL) error("capture_point_mask", FusionValidationErrorCode.CAPTURE_POINT_REQUIRED)
+         if ((draft.capturePointMask and CapturePointRegistry.undefinedMask) != 0uL) error("capture_point_mask", FusionValidationErrorCode.UNDEFINED_CAPTURE_POINT)
+-        range("max_records", draft.maxRecords, 1, MAX_RECORDS); range("max_artifacts", draft.maxArtifacts, 1, MAX_ARTIFACTS)
+-        range("max_total_bytes", draft.maxTotalBytes, 1, MAX_TOTAL_BYTES); range("max_dex_bytes", draft.maxDexBytes, 1, MAX_DEX_BYTES)
+-        range("buffer_pool_bytes", draft.bufferPoolBytes, 1, MAX_BUFFER_POOL_BYTES); range("max_code_item_bytes", draft.maxCodeItemBytes, 1, MAX_CODE_ITEM_BYTES)
+-        range("max_frozen_generations", draft.maxFrozenGenerations, 1, MAX_FROZEN_GENERATIONS); range("flush_idle_ms", draft.flushIdleMs, 1, MAX_FLUSH_IDLE_MS)
+-        range("manifest_max_components", draft.manifestMaxComponents, 1, 16384); range("manifest_max_splits", draft.manifestMaxSplits, 0, 32)
+-        range("manifest_max_events_per_source", draft.manifestMaxEventsPerSource, 1, 262144); range("manifest_max_total_events", draft.manifestMaxTotalEvents, 1, 1048576)
+-        range("manifest_max_xml_depth", draft.manifestMaxXmlDepth, 1, 256); range("manifest_max_attribute_length", draft.manifestMaxAttributeLength, 1, 4096)
+-        range("walk_delay_ms", draft.walkDelayMs, 0, 0xffff_ffffL); range("walk_max_classes", draft.walkMaxClasses, 1, 1_000_000)
+-        range("walk_max_methods", draft.walkMaxMethods, 1, 10_000_000); range("force_max_calls", draft.forceMaxCalls, 1, 10_000_000)
++        range("max_records", draft.maxRecords, 1, MAX_RECORDS)
++        range("max_artifacts", draft.maxArtifacts, 1, MAX_ARTIFACTS)
++        range("max_total_bytes", draft.maxTotalBytes, 1, MAX_TOTAL_BYTES)
++        range("max_dex_bytes", draft.maxDexBytes, 1, MAX_DEX_BYTES)
++        range("buffer_pool_bytes", draft.bufferPoolBytes, 1, MAX_BUFFER_POOL_BYTES)
++        range("max_code_item_bytes", draft.maxCodeItemBytes, 1, MAX_CODE_ITEM_BYTES)
++        range("max_frozen_generations", draft.maxFrozenGenerations, 1, MAX_FROZEN_GENERATIONS)
++        range("flush_idle_ms", draft.flushIdleMs, 1, MAX_FLUSH_IDLE_MS)
++        range("manifest_max_components", draft.manifestMaxComponents, 1, 16384)
++        range("manifest_max_splits", draft.manifestMaxSplits, 0, 32)
++        range("manifest_max_events_per_source", draft.manifestMaxEventsPerSource, 1, 262144)
++        range("manifest_max_total_events", draft.manifestMaxTotalEvents, 1, 1048576)
++        range("manifest_max_xml_depth", draft.manifestMaxXmlDepth, 1, 256)
++        range("manifest_max_attribute_length", draft.manifestMaxAttributeLength, 1, 4096)
++        range("walk_delay_ms", draft.walkDelayMs, 0, 0xffff_ffffL)
++        range("walk_max_classes", draft.walkMaxClasses, 1, 1_000_000)
++        range("walk_max_methods", draft.walkMaxMethods, 1, 10_000_000)
++        range("force_max_calls", draft.forceMaxCalls, 1, 10_000_000)
+         if (draft.walkNamespacePrefix.isNotEmpty() && !namespacePrefix.matches(draft.walkNamespacePrefix)) {
+             error("walk_namespace_prefix", FusionValidationErrorCode.INVALID_NAMESPACE_PREFIX)
+         }
+-- 
+2.43.0
+

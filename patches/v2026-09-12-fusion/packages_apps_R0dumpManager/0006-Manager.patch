@@ -1,0 +1,3178 @@
+From 18e3a0eea15f9f57e3a42f7cd013a75244e6388c Mon Sep 17 00:00:00 2001
+From: Ivory <contact@ivory.cafe>
+Date: Tue, 1 Sep 2026 09:28:21 +0800
+Subject: [PATCH 06/32] =?UTF-8?q?=E8=AE=A9=20Manager=20=E5=AE=89=E5=85=A8?=
+ =?UTF-8?q?=E5=AE=8C=E6=88=90=E4=BA=A7=E7=89=A9=E4=BF=AE=E5=A4=8D=E5=AF=BC?=
+ =?UTF-8?q?=E5=87=BA?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Manager 通过受限 Framework 事务请求 root helper，修复最新 run 并将 APK、Manifest、报告和校验信息导出到 Downloads；同时将导出入口放在配置方案下方并记录 DEX checksum 修复状态。\n\nConstraint: 导出必须保持 owner、前台、设备凭据和固定路径约束，不能把原始产物 reader 放进 Manager。\nRejected: 让 Manager 直接读取或修复产物 | 会绕过 root helper 和系统权限边界。\nConfidence: high\nScope-risk: moderate\nDirective: 后续修改协议布局时必须同步 Framework、helper、Manager parser 和测试。\nTested: helper native 7/7、Manager instrumentation 50/50、Python tests 15/15 + 7/7、source contract、j8 module build。\nNot-tested: 本次 checksum/UI 调整未在设备上重新装机验证。
+---
+ AndroidManifest.xml                           |    1 +
+ IMPLEMENTATION.md                             |  104 +-
+ helper/Android.bp                             |   27 +-
+ helper/r0dump_export_core.cpp                 | 1679 +++++++++++++++++
+ helper/r0dump_export_core.h                   |   38 +
+ helper/r0dump_file_helper.cpp                 |  226 ++-
+ helper/r0dump_file_helper_protocol.h          |   40 +
+ helper/r0dump_file_helper_test.cpp            |   67 +
+ ...-permissions-com.android.r0dumpmanager.xml |    1 +
+ res/values-zh-rCN/strings.xml                 |    9 +
+ res/values/strings.xml                        |    9 +
+ .../app/R0dumpManagerViewModel.kt             |   58 +-
+ .../data/audit/MutationAuditLog.kt            |    2 +-
+ .../data/export/ArtifactExportRepository.kt   |  109 ++
+ .../r0dumpmanager/ui/R0dumpManagerScreen.kt   |   65 +-
+ .../app/R0dumpManagerViewModelTest.kt         |   29 +
+ .../export/ArtifactExportRepositoryTest.kt    |   52 +
+ tools/deploy_userdebug.sh                     |    3 +
+ tools/validate_source_contracts.sh            |   36 +-
+ 19 files changed, 2490 insertions(+), 65 deletions(-)
+ create mode 100644 helper/r0dump_export_core.cpp
+ create mode 100644 helper/r0dump_export_core.h
+ create mode 100644 src/com/android/r0dumpmanager/data/export/ArtifactExportRepository.kt
+ create mode 100644 tests/src/com/android/r0dumpmanager/data/export/ArtifactExportRepositoryTest.kt
+
+diff --git a/AndroidManifest.xml b/AndroidManifest.xml
+index cff79b6..39419b5 100644
+--- a/AndroidManifest.xml
++++ b/AndroidManifest.xml
+@@ -7,6 +7,7 @@
+     <uses-permission android:name="android.permission.USE_BIOMETRIC" />
+     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
++    <uses-permission android:name="android.permission.MANAGE_R0DUMP_EXPORT" />
+ 
+     <application
+         android:allowBackup="false"
+diff --git a/IMPLEMENTATION.md b/IMPLEMENTATION.md
+index 4f040c0..d3cf0ac 100644
+--- a/IMPLEMENTATION.md
++++ b/IMPLEMENTATION.md
+@@ -10,7 +10,7 @@
+ | 应用模块 | `packages/apps/R0dumpManager` |
+ | 包名 | `com.android.r0dumpmanager` |
+ | 配置前缀 | `persist.sys.r0dump.fusion.*` |
+-| 发布形态 | 平台系统应用 + init root 文件准备 helper；开发验收仍以 userdebug 真机为准 |
++| 发布形态 | 平台系统应用 + init root 文件准备/导出 helper；开发验收仍以 userdebug 真机为准 |
+ | UI 技术 | Jetpack Compose + Material 3 Expressive |
+ | 文档状态 | Manager 已完成；方案一已完成源码、构建、SELinux 与 userdebug 真机 M9 闭环（2026-08-31） |
+ | 主要用户 | ROM、ART、逆向与脱壳实验人员 |
+@@ -31,6 +31,7 @@ Manager 完成证据和范围边界见 [STATUS.md](STATUS.md)。该状态只标
+ | Framework / ART | 已实现 | `ParcelFileDescriptor` 到 native owned FD 的交接、固定子目录验证和 `0660` 原子发布已落地 |
+ | 产品与 SELinux | 已实现并通过策略构建 | helper 进入 lemonade/lemonadep 产品配置，独立 enforcing domain 和 neverallow/兼容性检查通过 |
+ | 真机实时读写 | 已验收 | 同一 revision 增量替换并重启后，普通非 root `adb shell` 已对 canonical 文件完成 stat/read/create/append/delete |
++| 修复与导出 | 已验收 | Manager 经 AMS 请求 helper 修复最新 run、执行 CodeItem 回填，并把 APK、Manifest、报告和 SHA256 ZIP 导出到 Downloads；真机证据见 12.0.2 |
+ 
+ 这里的“实时”以 canonical 文件的发布边界为准：隐藏临时文件写入期间不承诺可读；原子 rename 成功后不允许再有
+ 异步 `chown`/`chmod` 窗口。M9 已使用 `com.coolapk.market` 完成真机闭环，具体证据见 12.0.1。
+@@ -63,9 +64,9 @@ Broker。该实现由 tag `r0dump-too-complex-wip` 保留，不作为新实现
+ - 保留 Compose、平台签名、priv-app 模块和可复用的包选择基础；
+ - 点位表切换为当前 42-bit registry；
+ - 只解决配置编辑、校验、事务发布、会话启动和会话结束；
+-- 不恢复承载产物内容的服务端 Broker，不增加数据库、产物 reader、导出或删除能力；
++- 不恢复常驻的产物 Broker、数据库或任意路径 reader；导出使用一次性、固定协议的显式 helper 操作；
+ - 为 `user`/`userdebug` 共用的实时权限准备新增一个极窄 init root helper。helper 只预建目录、设置 owner/group/mode
+-  并返回目录 FD，不接收、缓存、解析或转发任何 dump payload。
++  并返回目录 FD。另有隔离的显式导出请求，由 helper 在本地修复最新 run 后直接生成 ZIP，不把 dump payload 传入 Manager。
+ 
+ ### 1.3 核心架构决定
+ 
+@@ -75,7 +76,8 @@ SELinux domain 决定是否允许写入。
+ 
+ 配置发布入口不是 Binder Broker，不引入配置数据库或跨进程配置副本。实时权限准备另设一条独立、极窄的同步路径：
+ 目标进程通过 Framework 隐藏入口请求 system_server 校验调用身份，system_server 再调用 init root helper 预建输出树并取得
+-目录 FD。该路径不承载配置写入或产物字节，不能浏览、导出、删除或修改既有运行。
++目录 FD。文件准备路径不承载配置写入或产物字节；显式导出使用独立协议、独立权限和固定输出根，不能接受任意路径、
++删除源运行或把产物内容送回 Manager。
+ 
+ ### 1.4 实时可读输出合同
+ 
+@@ -123,13 +125,15 @@ SELinux domain 决定是否允许写入。
+ 12. 完整支持 Android 16 edge-to-edge、预测返回、大屏自适应和 Material 3 Expressive。
+ 13. 所有用户可见文案支持简体中文和英文，并提供应用内语言切换。
+ 14. 新运行产物在原子发布后立即可由普通 `adb shell` 读写，且同一机制在 `user` 与 `userdebug` 构建中生效。
++15. 经认证后可导出目标包最新有效 run；helper 保守修复 DEX、回填 CodeItem，并把 base/split APK、提取的 Manifest、
++    修复报告和 SHA256 一并写入 `/sdcard/Downloads/r0dump-exports/<package>/`，供 JADX 使用。
+ 
+ ### 2.2 非目标
+ 
+-- 不浏览、修复、导出或删除 dump 产物；
++- 不提供跨 run 浏览器、源产物删除、任意路径导出或源 run 原地修改；
+ - 不读取目标应用私有目录；
+ - 不实现可浏览、传输或修改产物内容的 r0dump Binder/cmd service；
+-- 不在 Manager 内解析 DEX；
++- 不在 Manager 进程内读取或解析 DEX；
+ - 不执行 adb、shell、su 或外部命令；
+ - 不给目标应用追加 `ext_data_rw` 补充组，不扩大其读取其它应用 external data 的能力；
+ - 不使用 inotify 事后补权限作为实时可读保证；
+@@ -315,6 +319,8 @@ packages/apps/R0dumpManager/helper/r0dump_file_helper.cpp
+ packages/apps/R0dumpManager/helper/r0dump_file_helper.rc
+ packages/apps/R0dumpManager/helper/r0dump_file_helper_core.cpp
+ packages/apps/R0dumpManager/helper/r0dump_file_helper_core.h
++packages/apps/R0dumpManager/helper/r0dump_export_core.cpp
++packages/apps/R0dumpManager/helper/r0dump_export_core.h
+ packages/apps/R0dumpManager/helper/r0dump_file_helper_protocol.h
+ packages/apps/R0dumpManager/helper/r0dump_file_helper_test.cpp
+ ```
+@@ -366,9 +372,38 @@ PrepareResponseV1 (12 bytes, little-endian) {
+ 
+ 稳定 status 至少区分 `OK`、`INVALID_CALLER`、`DISABLED`、`CONFIG_MISMATCH`、`STORAGE_UNAVAILABLE`、`EXISTS`、
+ `PERMISSION_DENIED`、`TIMEOUT`、`PROTOCOL_ERROR` 和 `INTERNAL_ERROR`。V1 响应不携带 errno、路径或诊断字符串；
+-system_server 当前只把失败收敛为 null PFD 和稳定日志，不向目标应用泄露内部绝对路径或其它包信息。
++system_server 当前只把准备失败收敛为 null PFD 和稳定日志，不向目标应用泄露内部绝对路径或其它包信息。
+ 
+-#### 4.3.2 目录与所有权
++#### 4.3.2 修复与导出协议
++
++导出使用同一私有 socket 上的独立固定消息，不复用目录准备权限语义：
++
++```text
++ExportRequestV1 (116 bytes, little-endian) {
++  magic, version, size, user_id, requester_uid, apk_count, package_name
++} + base.apk first, then split APK FDs via SCM_RIGHTS
++
++ExportResponseV1 (682 bytes, little-endian) {
++  magic, version, size, status, counters,
++  run_id, archive_path, sha256, bounded_detail
++}
++```
++
++- Manager 只调用隐藏 AMS 入口，不直接连接 helper，也不请求共享存储权限；
++- AMS 要求调用者持有 signature/privileged `MANAGE_R0DUMP_EXPORT`，且必须是 owner user、精确 Manager UID/PID、
++  前台进程；目标包和 APK 路径均由 PackageManager 重新取得；
++- AMS 只读打开 base/split APK 并以 FD 传递，helper 不接受 APK 路径；
++- helper 只接受 system_server peer，首版只处理 owner user，一次只运行一个导出任务；导出在线程中执行，不能阻塞目录准备；
++- helper 只在固定的 `Android/data/<package>/files/r0dump-fusion/runs` 下选择最新且含 `session.json` 和 artifact 的 run，
++  拒绝 symlink，限制文件数量、单文件大小和总大小；
++- 源 run 始终只读。helper 在隐藏 staging 中复制、验证和修复标准 DEX，重新计算 signature/checksum，并按 class、method、
++  descriptor 与 `code_off` 保守回填可证明唯一的 CodeItem；冲突或越界记录保持 partial，不猜测覆盖；
++- ZIP 内含原始 run、`repaired/`、`partial/`、`inputs.json`、`report.json`、`export-report.json`、base/split APK、
++  从每个 APK 提取的二进制 `AndroidManifest.xml` 以及 `jadx-input.json`；
++- 最终原子发布到 `/sdcard/Downloads/r0dump-exports/<package>/<run>.zip`，并写同名 `.sha256`；目录使用 `02770`，
++  文件使用 `0660`。Manager 只接收计数、最终路径和哈希，不接收任何 payload 字节。
++
++#### 4.3.3 目录与所有权
+ 
+ helper 在 init/global mount namespace 中使用 `/mnt/user/0/emulated/0` 作为权威根；目标应用和用户看到的
+ `/storage/emulated/0` 是同一 owner-user FUSE view。禁止 helper 依赖调用进程的 `/storage` namespace 或直接操作
+@@ -441,10 +476,10 @@ set_prop(r0dump_manager_app, r0dump_fusion_prop)
+ get_prop({ appdomain system_server }, r0dump_fusion_prop)
+ ```
+ 
+-helper policy 只允许读取 `r0dump_fusion_prop`、接受 system_server 私有 socket、穿越 `mnt_user_file`，并对
+-owner-user backing `media_rw_data_file` 中由固定协议和 descriptor-relative 校验限定的 r0dump 目录执行
+-`create/open/search/getattr/setattr`。禁止网络、Binder service 注册、执行 shell、访问 Manager 私有数据或打开 dump
+-regular file 读取 payload。rc 与 policy 只授予 `CHOWN`、`FOWNER`、`FSETID`、`SETUID`；不能增加
++helper policy 只允许读取 `r0dump_fusion_prop`、接受 system_server 私有 socket、使用 system_server 传入的只读 APK FD、
++穿越 `mnt_user_file`，并对 owner-user backing `media_rw_data_file` 中由固定协议和 descriptor-relative 校验限定的 r0dump
++源树执行只读访问，对固定 Downloads 导出树执行创建、写入、rename 和权限设置。禁止网络、Binder service 注册、执行 shell、
++访问 Manager 私有数据或接受任意路径。rc 与 policy 只授予 `CHOWN`、`FOWNER`、`FSETID`、`SETUID`；不能增加
+ `DAC_OVERRIDE`、`DAC_READ_SEARCH` 或 permissive 掩盖路径错误。
+ 
+ FD 交接只增加两条最小边：`system_server` 可使用 helper 发来的 FD，`appdomain` 可使用 helper 标记的 FD。
+@@ -513,12 +548,13 @@ Manifest 只声明：
+ - `android.permission.USE_BIOMETRIC`：通过平台 `BiometricPrompt` 执行 mutation 前认证；
+ - `android.permission.RECEIVE_BOOT_COMPLETED`：开机后恢复活动配置通知；
+ - `android.permission.POST_NOTIFICATIONS`：显示正式验收要求的 ongoing session notification，按系统运行时授权处理。
++- `android.permission.MANAGE_R0DUMP_EXPORT`：signature/privileged 隐藏权限，仅允许 Manager 请求 AMS 发起修复导出。
+ 
+-不声明网络、共享存储、READ_LOGS、MANAGE_EXTERNAL_STORAGE、shell 或安装包权限。
++不声明网络、共享存储、READ_LOGS、MANAGE_EXTERNAL_STORAGE、shell 或安装包读取权限。
+ 旧实现的 `android.permission.MANAGE_R0DUMP` 同时从 Manifest、privapp allowlist、source contract 和设备验证脚本中删除；
+ 新的 Framework 文件准备入口不依赖该权限，而是以 Binder calling UID/PID、AMS `ProcessRecord` 和 stable enabled snapshot
+-做动态授权。它只返回本次运行的目录 FD，不接受配置 JSON、任意路径或文件操作。privapp allowlist 最终只保留实际需要
+-allowlist 的 `FORCE_STOP_PACKAGES`。
++做动态授权。导出入口额外要求 `MANAGE_R0DUMP_EXPORT`，并再次约束 owner user、精确 Manager 包/UID/PID 和前台状态。
++privapp allowlist 只保留实际需要 allowlist 的 `FORCE_STOP_PACKAGES` 与 `MANAGE_R0DUMP_EXPORT`。
+ 
+ ### 5.1 系统预装版本访问门禁
+ 
+@@ -946,6 +982,8 @@ medium 使用 NavigationRail 和单列内容。所有布局中启用/关闭 swit
+ - 点击应用选择器打开 Material 3 SearchBar，全屏 compact 搜索或 expanded anchored 搜索；
+ - process 模式：主进程、所有进程、自定义 `package:suffix`；
+ - profile 选择；
++- “修复并导出最新产物”区：位于“配置方案”下方；完成认证后请求 helper，进行中禁用其它 mutation，成功后显示 run、修复统计、ZIP 路径和 SHA256；
++- 导出结果明确说明 ZIP 已包含 base/split APK 与提取的 Manifest，可直接作为 JADX 输入；
+ - TopAppBar 最右侧 switch 是启用/关闭主操作，启用时发布配置并启动目标；
+ - `只发布` 次操作；
+ - 活动会话关闭 switch 时结束会话；
+@@ -1209,20 +1247,22 @@ Framework 校验失败返回稳定字段 code，Manager 将其映射到对应页
+ 
+ ## 12. 测试规格
+ 
+-### 12.0 当前验证基线（2026-08-31）
++### 12.0 当前验证基线（2026-09-01）
+ 
+ 以下结果用于区分“源码已落地”和“真机已验收”，后续改动必须重新执行受影响项：
+ 
+ | 验证项 | 当前结果 | 证据/说明 |
+ |---|---|---|
+ | helper 定向构建 | 通过 | `m -j8 r0dump_file_helper r0dump_file_helper_tests` |
+-| helper host native tests | 5/5 通过 | 目录 owner/group/mode、`O_PATH` 交接 FD、重复 process 目录、symlink 和非法 run ID |
++| helper host native tests | 7/7 通过 | 目录 owner/group/mode、`O_PATH` 交接 FD、重复 process 目录、symlink、非法 run ID、完整修复导出和无有效 run 拒绝 |
+ | ART 文件层定向测试 | 25/25 通过 | `r0dump_FileTest.*`，含 `O_PATH` 同 inode 重开、目录 fsync、GID 继承、固定目录和原子发布 |
+ | ART runtime tests 构建 | 通过 | `m -j8 art_runtime_tests` |
+-| Framework 生产目标 | 通过 | `framework-minus-apex`、`services.core` 与 API 检查已完成 |
++| Framework 生产目标 | 通过 | `framework-minus-apex`、`services`、`services.core` 与 API 检查已完成；设备端 `services.jar` 已确认包含导出事务 |
+ | SELinux policy | 通过 | `m -j8 selinux_policy`，含 neverallow、Treble compatibility、freeze/context tests |
++| Manager instrumentation | 50/50 通过 | response parser、认证/前台/owner gate、ViewModel 导出状态与既有 Manager 回归 |
+ | Framework 测试全集 | 基线阻塞 | 现有 `LockPatternUtils.byteArrayToPattern` / `LockPatternView.Cell.of` 测试签名漂移；本特性测试源未出现编译错误 |
+ | userdebug 真机 M9 | 通过 | OnePlus 9 `f5e3adbc`；成套替换并重启后以酷安完成产物发布和非 root shell 实时读写 |
++| userdebug 真机 M10 | 通过 | OnePlus 9 `f5e3adbc`；Manager 导出 `com.VCB` 最新 run，SHA256 与 ZIP 完整性通过，APK/Manifest/报告齐全 |
+ 
+ Framework 测试全集的基线阻塞不得被写成“本特性测试已通过”；在其修复前，以生产目标编译、helper/ART 定向测试、
+ SELinux 全策略构建和真机 M9 共同形成当前验证链。Framework 测试全集的既有基线阻塞不影响已独立
+@@ -1249,6 +1289,21 @@ rename，但 `fsync(O_PATH directory fd)` 返回 `EBADF`，从而误报 `run_deg
+   `shell:ext_data_rw 0660`；
+ - 验收结束后恢复 `enabled=0`、`anr_protection_enabled=0`、`generation=318`（稳定偶数），并停止酷安进程。
+ 
++#### 12.0.2 M10 真机证据
++
++验收设备仍为 OnePlus 9，serial `f5e3adbc`，构建基线为 `lineage_lemonade-bp4a-userdebug`。Manager 经设备凭据认证后，
++通过 AMS 的固定事务请求 helper 导出 `com.VCB` 最新有效 run `20260819T023726Z-VCB-custom`：
++
++- 最终产物为 `/sdcard/Downloads/r0dump-exports/com.VCB/20260819T023726Z-VCB-custom.zip`，大小
++  `633962934` bytes；同目录 `.zip.sha256` 验证为 `OK`；
++- `unzip -t` 对 738 个 ZIP entry 完整检查通过，无压缩数据错误；发布后不存在隐藏 partial staging 目录；
++- ZIP 包含 `apk/base.apk`、`apk/split-1.apk`、base/split `AndroidManifest.xml`、`jadx-input.json`、
++  `export-report.json`、7 个进程的原始记录及设备端修复输出/报告；
++- 汇总为 283 条 record、229 条 repaired、54 条 partial、114 个 usable output；CodeItem 回填流程已执行，
++  此 run 没有符合保守匹配条件的条目，因此 `codeitems_backfilled=0`；
++- 导出目录为 `02770`、ZIP 和校验文件为 `0660`；SELinux 保持 Enforcing，导出阶段无 helper AVC、无
++  system_server/helper crash；Manager 显示同一 run 的修复统计和最终 Downloads 路径。
++
+ ### T1: Schema 单元测试
+ 
+ - 34 字段完整 JSON round-trip；
+@@ -1282,6 +1337,7 @@ rename，但 `fsync(O_PATH directory fd)` 返回 `EBADF`，从而误报 `run_deg
+ ### T5: Repository 测试
+ 
+ 使用 fake property access 覆盖 Unconfigured、Invalid、Disabled、Enabled、Interrupted、ConcurrentChange 和 write denial。
++导出 response parser 覆盖固定 682-byte little-endian 布局、成功计数、非零 status、截断包和未终止字符串。
+ 
+ ### T6: ViewModel 测试
+ 
+@@ -1292,6 +1348,7 @@ rename，但 `fsync(O_PATH directory fd)` 返回 `EBADF`，从而误报 `run_deg
+ - publish 成功按顺序 force-stop/launch；
+ - stop 失败不标记 disabled；
+ - rotation/process recreation 保留草稿。
++- 未选择包、非 owner、非前台、未认证、并发 mutation 时禁止导出；成功后保存摘要，失败显示稳定且可操作的错误信息。
+ 
+ ### T7: Compose UI 测试
+ 
+@@ -1328,6 +1385,7 @@ rename，但 `fsync(O_PATH directory fd)` 返回 `EBADF`，从而误报 `run_deg
+ - 未认证、认证超时和 screen-off 后 mutation 全部拒绝。
+ - `r0dump_file_helper` 运行于独立 enforcing domain，只有 system_server 可连接其 socket；
+ - helper 可以对固定 r0dump 目录执行最小 mkdir/chown/chmod，但不能访问网络、shell、其它应用目录或任意路径；
++- 导出时 helper 只能读取请求包的固定 r0dump run、使用 AMS 传入的 APK FD，并只能写固定 Downloads 导出根；
+ - 普通应用、Manager、shell 直接连接 helper 均被 SELinux 拒绝；
+ - 非目标 UID/PID、stale generation、disabled snapshot、secondary user、symlink、伪造 run owner 和既有 process/PID 目录
+   均 fail closed；
+@@ -1360,6 +1418,7 @@ m R0dumpManager R0dumpManagerTests r0dump_file_helper r0dump_file_helper_tests \
+ - Manager source contract；
+ - `r0dump_FusionConfigTest`；
+ - helper protocol/path/ownership native tests；
++- helper 修复/CodeItem 回填、Manifest 提取、ZIP 条目和 SHA256 native tests；
+ - `r0dump_FileTest` prepared-FD、GID 继承、atomic rename tests；
+ - `treble_sepolicy_tests`；
+ - APK privapp permission allowlist 检查。
+@@ -1430,7 +1489,8 @@ python3 packages/apps/R0dumpManager/tools/export_latest.py \
+ 默认展开结果位于 `r0dump-exports/<package>/<run_id>/`。设备端原始 run 和本地 raw artifact 永不修改；脚本按
+ process 调用既有 `art/tools/r0dump/r0dump_host_repair.py`，在 `process-*/host-repair/` 下生成去重的 `blobs/`、
+ 保守修复的 `repaired/*.dexfixed.dex`、不能安全修复的 `partial/*.json`、`inputs.json` 和 `report.json`。
+-修复器只在 DEX header、section range 和 map list 完整自洽时重算 SHA-1 signature 与 Adler-32 checksum；
++修复器只在 DEX header、section range 和 map list 完整自洽时重算 SHA-1 signature 与 Adler-32 checksum；即使原始 DEX 因 verify
++拒绝或 header checksum 不匹配，也会在输出前重新写回 checksum，并在报告中记录修复前后有效性；
+ 对 `*.codeitem.raw`，Python 修复器通过已有的 `method_index`、class、method 和 descriptor，在所有完整 DEX
+ 中解析 method/class_data 并要求目标唯一；只有原始与捕获 code item 的完整 span 长度相同、偏移和边界均一致且
+ 同一方法不存在字节冲突时才原位回填，随后重新计算 signature/checksum，输出 `*.codeitem.dex`。CompactDex、
+@@ -1516,9 +1576,11 @@ ADB="$ADB" ADB_SERIAL="$ADB_SERIAL" OUT_DIR=out/target/product/lemonadep \
+ | M7 | CoolApk bit 39、ANR 和性能回归 | T11 完成，最终 disabled |
+ | M8 | root helper、Framework preparation bridge、prepared FD ART 写入 | helper/Framework/ART 单测和 policy 全通过 |
+ | M9 | 实时非 root shell 真机矩阵 | canonical 文件首次可见即读写成功，最终 disabled |
++| M10 | Manager→AMS→helper 修复导出 | 最新 run 经 CodeItem 回填后在 Downloads 生成含 APK/Manifest/报告的可校验 ZIP |
+ 
+ 原 Manager 路径依赖顺序为 M1 -> M2 -> M3 -> M4 -> M5 -> M6 -> M7；实时权限扩展在该基线上按 M8 -> M9
+ 实施。M8 未完成时不得用 inotify、world-writable mode、目标进程 supplementary group 或忽略 `fchown` 失败临时代替。
++修复导出按 M10 独立验收，不改变 M8/M9 的实时写入合同。
+ 
+ ## 14. 验收定义
+ 
+@@ -1535,12 +1597,14 @@ R0dump Manager 合格必须同时满足：
+ - force-invoke 和 ANR protection 默认开启；Manifest/完整精确 selector 范围、bit 41、认证及发布校验仍保持强制，all-process 默认关闭；
+ - Android 16 edge-to-edge、predictive back、IME、large screen 和 freeform window 验收通过；
+ - Material 3 Expressive API 集中封装，动态色、深色、高对比度和 reduced motion 完整；
+-- 无承载 payload 的 Broker、数据库、私有产物 reader 或任意路径 root 服务；
++- 无常驻 payload Broker、数据库、Manager 私有产物 reader 或任意路径 root 服务；
+ - root helper 只接受 system_server 的固定协议，为当前 stable enabled snapshot 创建全新目录并返回 FD；
+ - 新目录均为 `ext_data_rw`、`02770`，共享/run 祖先 owner 为 root、process/PID 子树 owner 为目标 UID；新文件为目标
+   UID、`ext_data_rw`、`0660`；
+ - canonical 文件首次可见时普通非 root `adb shell` 已可读写；
+ - helper/Framework/ART 任一环节失败都 fail closed，目标应用继续启动且不产生权限降级输出；
++- 经认证的导出只选择目标包最新有效 run，源数据不原地修改；ZIP 包含修复输出、CodeItem 回填报告、base/split APK、
++  提取的 Manifest、JADX 索引和 SHA256，并发布到 `/sdcard/Downloads/r0dump-exports/<package>/`；
+ - Host、Framework、SELinux、UI 和真机矩阵全部通过；
+ - 最终设备状态为稳定偶数 generation 且 enabled=0。
+ 
+diff --git a/helper/Android.bp b/helper/Android.bp
+index 3a091c8..3212efd 100644
+--- a/helper/Android.bp
++++ b/helper/Android.bp
+@@ -5,8 +5,17 @@ package {
+ cc_library_static {
+     name: "libr0dump_file_helper_core",
+     host_supported: true,
+-    srcs: ["r0dump_file_helper_core.cpp"],
++    srcs: [
++        "r0dump_export_core.cpp",
++        "r0dump_file_helper_core.cpp",
++    ],
+     export_include_dirs: ["."],
++    shared_libs: [
++        "libcrypto",
++        "libjsoncpp",
++        "libziparchive",
++        "libz",
++    ],
+     cflags: ["-Wall", "-Wextra", "-Werror"],
+ }
+ 
+@@ -14,7 +23,15 @@ cc_binary {
+     name: "r0dump_file_helper",
+     srcs: ["r0dump_file_helper.cpp"],
+     static_libs: ["libr0dump_file_helper_core"],
+-    shared_libs: ["libbase", "libcutils", "liblog"],
++    shared_libs: [
++        "libbase",
++        "libcrypto",
++        "libcutils",
++        "libjsoncpp",
++        "liblog",
++        "libziparchive",
++        "libz",
++    ],
+     header_libs: ["libcutils_headers"],
+     init_rc: ["r0dump_file_helper.rc"],
+     cflags: ["-Wall", "-Wextra", "-Werror"],
+@@ -25,6 +42,12 @@ cc_test {
+     host_supported: true,
+     srcs: ["r0dump_file_helper_test.cpp"],
+     static_libs: ["libr0dump_file_helper_core"],
++    shared_libs: [
++        "libcrypto",
++        "libjsoncpp",
++        "libziparchive",
++        "libz",
++    ],
+     cflags: ["-Wall", "-Wextra", "-Werror"],
+     test_suites: ["general-tests"],
+ }
+diff --git a/helper/r0dump_export_core.cpp b/helper/r0dump_export_core.cpp
+new file mode 100644
+index 0000000..9f0f74a
+--- /dev/null
++++ b/helper/r0dump_export_core.cpp
+@@ -0,0 +1,1679 @@
++#include "r0dump_export_core.h"
++
++#include "r0dump_file_helper_core.h"
++
++#include <fcntl.h>
++#include <openssl/sha.h>
++#include <sys/stat.h>
++#include <unistd.h>
++#include <ziparchive/zip_archive.h>
++#include <ziparchive/zip_writer.h>
++#include <zlib.h>
++
++#include <algorithm>
++#include <array>
++#include <cerrno>
++#include <chrono>
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <fstream>
++#include <iomanip>
++#include <limits>
++#include <map>
++#include <optional>
++#include <set>
++#include <sstream>
++#include <string>
++#include <string_view>
++#include <tuple>
++#include <unordered_map>
++#include <utility>
++#include <vector>
++
++#include <json/json.h>
++
++namespace r0dump::file_helper {
++namespace {
++
++namespace fs = std::filesystem;
++
++constexpr char kAlgorithmVersion[] = "r0dump-device-repair-v1";
++constexpr size_t kDexHeaderSize = 0x70u;
++constexpr uint64_t kMaxExportBytes = 2ull * 1024ull * 1024ull * 1024ull;
++constexpr uint64_t kMaxSingleFileBytes = 1024ull * 1024ull * 1024ull;
++constexpr uint32_t kMaxExportFiles = 20000u;
++constexpr uint32_t kMaxMapItems = 4096u;
++constexpr mode_t kDirectoryMode = 02770;
++constexpr mode_t kFileMode = 0660;
++
++struct DexLayout {
++  uint32_t file_size;
++  uint32_t header_size;
++  uint32_t map_off;
++  uint32_t data_off;
++  uint32_t data_size;
++  std::vector<std::tuple<uint16_t, uint32_t, uint32_t>> sections;
++};
++
++struct Validation {
++  std::string kind;
++  std::string reason;
++  std::optional<DexLayout> layout;
++};
++
++struct MethodInfo {
++  std::string class_name;
++  std::string method_name;
++  std::string descriptor;
++  uint32_t class_def_index;
++  uint32_t code_off;
++};
++
++using MethodCatalog = std::map<uint32_t, MethodInfo>;
++
++struct DexCandidate {
++  fs::path artifact;
++  std::string relative_artifact;
++  std::string digest;
++  MethodCatalog catalog;
++};
++
++struct ProcessSummary {
++  uint32_t record_count = 0u;
++  uint32_t verified = 0u;
++  uint32_t repaired = 0u;
++  uint32_t partial = 0u;
++  uint32_t usable_outputs = 0u;
++  uint32_t codeitems_backfilled = 0u;
++  Json::Value report{Json::objectValue};
++};
++
++struct RunCandidate {
++  fs::path path;
++  std::string run_id;
++  fs::file_time_type newest;
++  uint32_t artifact_count;
++};
++
++bool CheckRange(uint64_t offset, uint64_t size, uint64_t limit) {
++  return offset <= limit && size <= limit - offset;
++}
++
++uint16_t ReadU16(const std::vector<uint8_t> &data, size_t offset) {
++  return static_cast<uint16_t>(data[offset]) |
++         static_cast<uint16_t>(data[offset + 1u]) << 8u;
++}
++
++uint32_t ReadU32(const std::vector<uint8_t> &data, size_t offset) {
++  return static_cast<uint32_t>(data[offset]) |
++         static_cast<uint32_t>(data[offset + 1u]) << 8u |
++         static_cast<uint32_t>(data[offset + 2u]) << 16u |
++         static_cast<uint32_t>(data[offset + 3u]) << 24u;
++}
++
++void WriteU32(std::vector<uint8_t> *data, size_t offset, uint32_t value) {
++  (*data)[offset] = static_cast<uint8_t>(value);
++  (*data)[offset + 1u] = static_cast<uint8_t>(value >> 8u);
++  (*data)[offset + 2u] = static_cast<uint8_t>(value >> 16u);
++  (*data)[offset + 3u] = static_cast<uint8_t>(value >> 24u);
++}
++
++std::string Hex(const uint8_t *bytes, size_t size) {
++  std::ostringstream stream;
++  stream << std::hex << std::setfill('0');
++  for (size_t i = 0; i < size; ++i) {
++    stream << std::setw(2) << static_cast<unsigned>(bytes[i]);
++  }
++  return stream.str();
++}
++
++std::string Sha256(const std::vector<uint8_t> &data) {
++  std::array<uint8_t, SHA256_DIGEST_LENGTH> digest{};
++  SHA256(data.data(), data.size(), digest.data());
++  return Hex(digest.data(), digest.size());
++}
++
++std::string Sha256File(const fs::path &path) {
++  std::ifstream input(path, std::ios::binary);
++  if (!input) {
++    return {};
++  }
++  SHA256_CTX context;
++  SHA256_Init(&context);
++  std::array<char, 64 * 1024> buffer{};
++  while (input) {
++    input.read(buffer.data(), buffer.size());
++    const std::streamsize count = input.gcount();
++    if (count > 0) {
++      SHA256_Update(&context, buffer.data(), static_cast<size_t>(count));
++    }
++  }
++  std::array<uint8_t, SHA256_DIGEST_LENGTH> digest{};
++  SHA256_Final(digest.data(), &context);
++  return Hex(digest.data(), digest.size());
++}
++
++bool ReadFile(const fs::path &path, std::vector<uint8_t> *data) {
++  std::error_code error;
++  const uint64_t size = fs::file_size(path, error);
++  if (error || size > kMaxSingleFileBytes ||
++      size > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
++    return false;
++  }
++  std::ifstream input(path, std::ios::binary);
++  if (!input) {
++    return false;
++  }
++  data->assign(static_cast<size_t>(size), 0u);
++  if (size != 0u) {
++    input.read(reinterpret_cast<char *>(data->data()),
++               static_cast<std::streamsize>(size));
++  }
++  return input.good() || input.eof();
++}
++
++bool WriteFile(const fs::path &path, const std::vector<uint8_t> &data) {
++  std::ofstream output(path, std::ios::binary | std::ios::trunc);
++  if (!output) {
++    return false;
++  }
++  if (!data.empty()) {
++    output.write(reinterpret_cast<const char *>(data.data()),
++                 static_cast<std::streamsize>(data.size()));
++  }
++  output.close();
++  chmod(path.c_str(), kFileMode);
++  return output.good();
++}
++
++bool WriteText(const fs::path &path, const std::string &text) {
++  std::ofstream output(path, std::ios::binary | std::ios::trunc);
++  if (!output) {
++    return false;
++  }
++  output << text;
++  output.close();
++  chmod(path.c_str(), kFileMode);
++  return output.good();
++}
++
++std::string JsonText(const Json::Value &value) {
++  Json::StreamWriterBuilder builder;
++  builder["indentation"] = "  ";
++  return Json::writeString(builder, value) + "\n";
++}
++
++bool ReadJson(const fs::path &path, Json::Value *value) {
++  std::ifstream input(path, std::ios::binary);
++  if (!input) {
++    return false;
++  }
++  Json::CharReaderBuilder builder;
++  std::string errors;
++  return Json::parseFromStream(builder, input, value, &errors) &&
++         value->isObject();
++}
++
++bool SafeRelativePath(std::string_view value) {
++  if (value.empty() || value.front() == '/') {
++    return false;
++  }
++  fs::path path(value);
++  if (path.is_absolute()) {
++    return false;
++  }
++  for (const fs::path &part : path) {
++    if (part == ".." || part == ".") {
++      return false;
++    }
++  }
++  return true;
++}
++
++std::optional<std::vector<std::tuple<uint16_t, uint32_t, uint32_t>>>
++ParseMap(const std::vector<uint8_t> &data, uint32_t map_off,
++         uint32_t file_size) {
++  if (!CheckRange(map_off, 4u, file_size)) {
++    return std::nullopt;
++  }
++  const uint32_t count = ReadU32(data, map_off);
++  if (count > kMaxMapItems ||
++      !CheckRange(static_cast<uint64_t>(map_off) + 4u,
++                  static_cast<uint64_t>(count) * 12u, file_size)) {
++    return std::nullopt;
++  }
++  const std::map<uint16_t, uint32_t> fixed_sizes = {
++      {0x0000u, static_cast<uint32_t>(kDexHeaderSize)},
++      {0x0001u, 4u},
++      {0x0002u, 4u},
++      {0x0003u, 12u},
++      {0x0004u, 8u},
++      {0x0005u, 8u},
++      {0x0006u, 32u}};
++  std::set<uint16_t> seen;
++  uint32_t previous_offset = 0u;
++  bool first = true;
++  std::vector<std::tuple<uint16_t, uint32_t, uint32_t>> entries;
++  for (uint32_t index = 0u; index < count; ++index) {
++    const size_t entry = static_cast<size_t>(map_off) + 4u + index * 12u;
++    const uint16_t type = ReadU16(data, entry);
++    const uint16_t unused = ReadU16(data, entry + 2u);
++    const uint32_t size = ReadU32(data, entry + 4u);
++    const uint32_t offset = ReadU32(data, entry + 8u);
++    if (unused != 0u || !seen.insert(type).second ||
++        (!first && offset < previous_offset)) {
++      return std::nullopt;
++    }
++    first = false;
++    previous_offset = offset;
++    const auto fixed = fixed_sizes.find(type);
++    if (fixed != fixed_sizes.end()) {
++      if (size > file_size / fixed->second ||
++          !CheckRange(offset, static_cast<uint64_t>(size) * fixed->second,
++                      file_size)) {
++        return std::nullopt;
++      }
++    } else if (type == 0x1000u) {
++      if (size != 1u || offset != map_off) {
++        return std::nullopt;
++      }
++    } else if (size != 0u && !CheckRange(offset, 1u, file_size)) {
++      return std::nullopt;
++    }
++    entries.emplace_back(type, size, offset);
++  }
++  if (std::find(entries.begin(), entries.end(),
++                std::make_tuple(static_cast<uint16_t>(0x0000u), 1u, 0u)) ==
++          entries.end() ||
++      std::find(entries.begin(), entries.end(),
++                std::make_tuple(static_cast<uint16_t>(0x1000u), 1u, map_off)) ==
++          entries.end()) {
++    return std::nullopt;
++  }
++  return entries;
++}
++
++Validation ValidateDex(const std::vector<uint8_t> &data) {
++  if (data.size() < 8u) {
++    return {"unknown", "truncated_header", std::nullopt};
++  }
++  if (std::equal(data.begin(), data.begin() + 4u, "cdex")) {
++    return {"cdex", "compact_dex_not_repaired", std::nullopt};
++  }
++  if (!std::equal(data.begin(), data.begin() + 4u, "dex\n")) {
++    return {"unknown", "missing_dex_magic", std::nullopt};
++  }
++  if (data[7] != 0u || data[4] < '0' || data[4] > '9' || data[5] < '0' ||
++      data[5] > '9' || data[6] < '0' || data[6] > '9') {
++    return {"standard", "invalid_dex_version", std::nullopt};
++  }
++  if (data.size() < kDexHeaderSize) {
++    return {"standard", "truncated_header", std::nullopt};
++  }
++  const uint32_t file_size = ReadU32(data, 32u);
++  const uint32_t header_size = ReadU32(data, 36u);
++  const uint32_t endian_tag = ReadU32(data, 40u);
++  const uint32_t link_size = ReadU32(data, 44u);
++  const uint32_t link_off = ReadU32(data, 48u);
++  const uint32_t map_off = ReadU32(data, 52u);
++  const uint32_t data_size = ReadU32(data, 104u);
++  const uint32_t data_off = ReadU32(data, 108u);
++  if (header_size != kDexHeaderSize) {
++    return {"standard", "unsupported_header_size", std::nullopt};
++  }
++  if (endian_tag != 0x12345678u) {
++    return {"standard", "unsupported_endian", std::nullopt};
++  }
++  if (file_size < kDexHeaderSize || file_size > data.size()) {
++    return {"standard", "file_size_out_of_bounds", std::nullopt};
++  }
++  if ((link_size == 0u && link_off != 0u) ||
++      (link_size != 0u && !CheckRange(link_off, link_size, file_size))) {
++    return {"standard", "link_range_out_of_bounds", std::nullopt};
++  }
++  const std::array<std::tuple<size_t, size_t, uint32_t>, 6> sections = {{
++      {56u, 60u, 4u},
++      {64u, 68u, 4u},
++      {72u, 76u, 12u},
++      {80u, 84u, 8u},
++      {88u, 92u, 8u},
++      {96u, 100u, 32u},
++  }};
++  for (const auto &[size_offset, offset_offset, item_size] : sections) {
++    const uint32_t count = ReadU32(data, size_offset);
++    const uint32_t offset = ReadU32(data, offset_offset);
++    if ((count == 0u && offset != 0u) ||
++        (count != 0u &&
++         (count > file_size / item_size ||
++          !CheckRange(offset, static_cast<uint64_t>(count) * item_size,
++                      file_size)))) {
++      return {"standard", "section_out_of_bounds", std::nullopt};
++    }
++  }
++  if (data_off < kDexHeaderSize ||
++      !CheckRange(data_off, data_size, file_size) ||
++      static_cast<uint64_t>(data_off) + data_size != file_size) {
++    return {"standard", "data_range_out_of_bounds", std::nullopt};
++  }
++  if (map_off < data_off || map_off >= file_size) {
++    return {"standard", "map_outside_data_section", std::nullopt};
++  }
++  auto map = ParseMap(data, map_off, file_size);
++  if (!map.has_value()) {
++    return {"standard", "map_out_of_bounds", std::nullopt};
++  }
++  return {"standard", "",
++          DexLayout{file_size, header_size, map_off, data_off, data_size,
++                    std::move(*map)}};
++}
++
++std::pair<std::optional<std::vector<uint8_t>>, Json::Value>
++RepairDexFixed(const std::vector<uint8_t> &data) {
++  const Validation validation = ValidateDex(data);
++  Json::Value details(Json::objectValue);
++  details["kind"] = validation.kind;
++  details["output_kind"] = "dexfixed";
++  if (!validation.layout.has_value()) {
++    details["trust"] = "partial";
++    details["reason"] = validation.reason;
++    return {std::nullopt, details};
++  }
++  const DexLayout &layout = *validation.layout;
++  std::vector<uint8_t> repaired(data.begin(), data.begin() + layout.file_size);
++  const std::array<uint8_t, SHA_DIGEST_LENGTH> old_signature = [&]() {
++    std::array<uint8_t, SHA_DIGEST_LENGTH> result{};
++    std::copy_n(repaired.begin() + 12u, result.size(), result.begin());
++    return result;
++  }();
++  const uint32_t old_checksum = ReadU32(repaired, 8u);
++  const uint32_t expected_checksum_before =
++      adler32(0L, repaired.data() + 12u, repaired.size() - 12u);
++  std::array<uint8_t, SHA_DIGEST_LENGTH> signature{};
++  SHA1(repaired.data() + 32u, repaired.size() - 32u, signature.data());
++  std::copy(signature.begin(), signature.end(), repaired.begin() + 12u);
++  const uint32_t expected_checksum_after =
++      adler32(0L, repaired.data() + 12u, repaired.size() - 12u);
++  WriteU32(&repaired, 8u, expected_checksum_after);
++  Json::Value modified(Json::arrayValue);
++  if (old_signature != signature) {
++    modified.append("signature");
++  }
++  if (old_checksum != expected_checksum_after) {
++    modified.append("checksum");
++  }
++  details["trust"] = modified.empty() ? "verified" : "repaired";
++  details["file_size"] = layout.file_size;
++  details["map_off"] = layout.map_off;
++  details["checksum_valid_before"] =
++      old_checksum == expected_checksum_before;
++  details["checksum_repaired"] = old_checksum != expected_checksum_after;
++  details["checksum_valid_after"] =
++      ReadU32(repaired, 8u) == expected_checksum_after;
++  details["modified_fields"] = modified;
++  return {std::move(repaired), details};
++}
++
++bool ReadUleb128(const std::vector<uint8_t> &data, size_t *offset, size_t limit,
++                 uint32_t *value, std::string *error) {
++  uint32_t result = 0u;
++  for (uint32_t index = 0u; index < 5u; ++index) {
++    if (*offset >= limit) {
++      *error = "truncated_uleb128";
++      return false;
++    }
++    const uint8_t byte = data[(*offset)++];
++    result |= static_cast<uint32_t>(byte & 0x7fu) << (index * 7u);
++    if ((byte & 0x80u) == 0u) {
++      if (index == 4u && byte > 0x0fu) {
++        *error = "uleb128_overflow";
++        return false;
++      }
++      *value = result;
++      return true;
++    }
++  }
++  *error = "uleb128_overflow";
++  return false;
++}
++
++bool ReadSleb128(const std::vector<uint8_t> &data, size_t *offset, size_t limit,
++                 int32_t *value, std::string *error) {
++  int64_t result = 0;
++  uint32_t shift = 0u;
++  for (uint32_t index = 0u; index < 5u; ++index) {
++    if (*offset >= limit) {
++      *error = "truncated_sleb128";
++      return false;
++    }
++    const uint8_t byte = data[(*offset)++];
++    result |= static_cast<int64_t>(byte & 0x7fu) << shift;
++    shift += 7u;
++    if ((byte & 0x80u) == 0u) {
++      if (shift < 32u && (byte & 0x40u) != 0u) {
++        result -= static_cast<int64_t>(1) << shift;
++      }
++      if (result < std::numeric_limits<int32_t>::min() ||
++          result > std::numeric_limits<int32_t>::max()) {
++        *error = "sleb128_overflow";
++        return false;
++      }
++      *value = static_cast<int32_t>(result);
++      return true;
++    }
++  }
++  *error = "sleb128_overflow";
++  return false;
++}
++
++bool MethodCodeEntries(
++    const std::vector<uint8_t> &data, const DexLayout &layout,
++    std::map<uint32_t, std::pair<uint32_t, uint32_t>> *entries,
++    std::string *error) {
++  const uint32_t class_count = ReadU32(data, 96u);
++  const uint32_t class_off = ReadU32(data, 100u);
++  const uint32_t method_count = ReadU32(data, 88u);
++  for (uint32_t class_index = 0u; class_index < class_count; ++class_index) {
++    const size_t class_def = static_cast<size_t>(class_off) + class_index * 32u;
++    const uint32_t class_data_off = ReadU32(data, class_def + 24u);
++    if (class_data_off == 0u) {
++      continue;
++    }
++    if (class_data_off < layout.data_off ||
++        class_data_off >= layout.file_size) {
++      *error = "class_data_out_of_bounds";
++      return false;
++    }
++    size_t cursor = class_data_off;
++    std::array<uint32_t, 4> counts{};
++    for (uint32_t &count : counts) {
++      if (!ReadUleb128(data, &cursor, layout.file_size, &count, error)) {
++        return false;
++      }
++      if (count > layout.file_size) {
++        *error = "class_data_count_out_of_bounds";
++        return false;
++      }
++    }
++    for (size_t list = 0u; list < 2u; ++list) {
++      for (uint32_t index = 0u; index < counts[list]; ++index) {
++        uint32_t ignored = 0u;
++        if (!ReadUleb128(data, &cursor, layout.file_size, &ignored, error) ||
++            !ReadUleb128(data, &cursor, layout.file_size, &ignored, error)) {
++          return false;
++        }
++      }
++    }
++    for (size_t list = 2u; list < 4u; ++list) {
++      uint32_t method_index = 0u;
++      for (uint32_t index = 0u; index < counts[list]; ++index) {
++        uint32_t delta = 0u;
++        uint32_t ignored = 0u;
++        uint32_t code_off = 0u;
++        if (!ReadUleb128(data, &cursor, layout.file_size, &delta, error) ||
++            !ReadUleb128(data, &cursor, layout.file_size, &ignored, error) ||
++            !ReadUleb128(data, &cursor, layout.file_size, &code_off, error) ||
++            delta > std::numeric_limits<uint32_t>::max() - method_index) {
++          if (error->empty()) {
++            *error = "method_index_overflow";
++          }
++          return false;
++        }
++        method_index += delta;
++        if (method_index >= method_count) {
++          *error = "method_index_out_of_bounds";
++          return false;
++        }
++        if (code_off != 0u) {
++          if (code_off < layout.data_off || code_off >= layout.file_size) {
++            *error = "code_item_offset_out_of_bounds";
++            return false;
++          }
++          const auto value = std::make_pair(code_off, class_index);
++          const auto [found, inserted] = entries->emplace(method_index, value);
++          if (!inserted && found->second != value) {
++            *error = "method_code_offset_conflict";
++            return false;
++          }
++        }
++      }
++    }
++  }
++  return true;
++}
++
++std::optional<std::string> DexString(const std::vector<uint8_t> &data,
++                                     const DexLayout &layout,
++                                     uint32_t string_index,
++                                     std::string *error) {
++  const uint32_t string_count = ReadU32(data, 56u);
++  const uint32_t string_off = ReadU32(data, 60u);
++  if (string_index >= string_count) {
++    *error = "string_index_out_of_bounds";
++    return std::nullopt;
++  }
++  const uint32_t data_offset =
++      ReadU32(data, static_cast<size_t>(string_off) + string_index * 4u);
++  if (data_offset < layout.data_off || data_offset >= layout.file_size) {
++    *error = "string_data_out_of_bounds";
++    return std::nullopt;
++  }
++  size_t cursor = data_offset;
++  uint32_t ignored = 0u;
++  if (!ReadUleb128(data, &cursor, layout.file_size, &ignored, error)) {
++    return std::nullopt;
++  }
++  size_t terminator = cursor;
++  while (terminator < layout.file_size && data[terminator] != 0u) {
++    ++terminator;
++  }
++  if (terminator == layout.file_size) {
++    *error = "unterminated_string_data";
++    return std::nullopt;
++  }
++  return std::string(reinterpret_cast<const char *>(data.data() + cursor),
++                     terminator - cursor);
++}
++
++std::optional<std::string> TypeDescriptor(const std::vector<uint8_t> &data,
++                                          const DexLayout &layout,
++                                          uint32_t type_index,
++                                          std::string *error) {
++  const uint32_t type_count = ReadU32(data, 64u);
++  const uint32_t type_off = ReadU32(data, 68u);
++  if (type_index >= type_count) {
++    *error = "type_index_out_of_bounds";
++    return std::nullopt;
++  }
++  return DexString(
++      data, layout,
++      ReadU32(data, static_cast<size_t>(type_off) + type_index * 4u), error);
++}
++
++std::optional<MethodCatalog>
++BuildMethodCatalog(const std::vector<uint8_t> &data, const DexLayout &layout,
++                   std::string *error) {
++  const uint32_t method_count = ReadU32(data, 88u);
++  const uint32_t method_off = ReadU32(data, 92u);
++  const uint32_t proto_count = ReadU32(data, 72u);
++  const uint32_t proto_off = ReadU32(data, 76u);
++  std::map<uint32_t, std::pair<uint32_t, uint32_t>> code_entries;
++  if (!MethodCodeEntries(data, layout, &code_entries, error)) {
++    return std::nullopt;
++  }
++  MethodCatalog catalog;
++  for (const auto &[method_index, code_entry] : code_entries) {
++    if (method_index >= method_count) {
++      *error = "method_index_out_of_bounds";
++      return std::nullopt;
++    }
++    const size_t method = static_cast<size_t>(method_off) + method_index * 8u;
++    const uint16_t class_index = ReadU16(data, method);
++    const uint16_t proto_index = ReadU16(data, method + 2u);
++    const uint32_t name_index = ReadU32(data, method + 4u);
++    if (proto_index >= proto_count) {
++      *error = "proto_index_out_of_bounds";
++      return std::nullopt;
++    }
++    const size_t proto = static_cast<size_t>(proto_off) + proto_index * 12u;
++    const uint32_t return_type_index = ReadU32(data, proto + 4u);
++    const uint32_t parameters_off = ReadU32(data, proto + 8u);
++    std::string descriptor = "(";
++    if (parameters_off != 0u) {
++      if (!CheckRange(parameters_off, 4u, layout.file_size)) {
++        *error = "parameter_list_out_of_bounds";
++        return std::nullopt;
++      }
++      const uint32_t parameter_count = ReadU32(data, parameters_off);
++      if (parameter_count > (layout.file_size - parameters_off - 4u) / 2u) {
++        *error = "parameter_list_out_of_bounds";
++        return std::nullopt;
++      }
++      for (uint32_t index = 0u; index < parameter_count; ++index) {
++        auto type =
++            TypeDescriptor(data, layout,
++                           ReadU16(data, static_cast<size_t>(parameters_off) +
++                                             4u + index * 2u),
++                           error);
++        if (!type.has_value()) {
++          return std::nullopt;
++        }
++        descriptor += *type;
++      }
++    }
++    descriptor += ")";
++    auto return_type = TypeDescriptor(data, layout, return_type_index, error);
++    auto class_name = TypeDescriptor(data, layout, class_index, error);
++    auto method_name = DexString(data, layout, name_index, error);
++    if (!return_type.has_value() || !class_name.has_value() ||
++        !method_name.has_value()) {
++      return std::nullopt;
++    }
++    descriptor += *return_type;
++    catalog.emplace(method_index,
++                    MethodInfo{*class_name, *method_name, descriptor,
++                               code_entry.second, code_entry.first});
++  }
++  return catalog;
++}
++
++std::string NormalizeClassName(const std::string &value) {
++  std::string body = value;
++  if (body.size() >= 2u && body.front() == 'L' && body.back() == ';') {
++    body = body.substr(1u, body.size() - 2u);
++  }
++  std::replace(body.begin(), body.end(), '.', '/');
++  return "L" + body + ";";
++}
++
++std::optional<uint32_t> MatchCodeItem(const Json::Value &record,
++                                      const MethodCatalog &catalog) {
++  if (!record["method_index"].isUInt()) {
++    return std::nullopt;
++  }
++  const uint32_t method_index = record["method_index"].asUInt();
++  const auto candidate = catalog.find(method_index);
++  if (candidate == catalog.end() || !record["class_name"].isString() ||
++      !record["method_name"].isString() ||
++      !record["method_descriptor"].isString()) {
++    return std::nullopt;
++  }
++  const MethodInfo &method = candidate->second;
++  if (NormalizeClassName(record["class_name"].asString()) !=
++          method.class_name ||
++      record["method_name"].asString() != method.method_name ||
++      record["method_descriptor"].asString() != method.descriptor) {
++    return std::nullopt;
++  }
++  if (record["class_def_index"].isUInt() &&
++      record["class_def_index"].asUInt() != method.class_def_index) {
++    return std::nullopt;
++  }
++  return method.code_off;
++}
++
++std::optional<size_t> CodeItemSize(const std::vector<uint8_t> &data,
++                                   size_t offset, size_t limit,
++                                   std::string *error) {
++  if (!CheckRange(offset, 16u, limit)) {
++    *error = "code_item_header_out_of_bounds";
++    return std::nullopt;
++  }
++  const uint16_t tries_size = ReadU16(data, offset + 6u);
++  const uint32_t insns_size = ReadU32(data, offset + 12u);
++  size_t cursor = offset + 16u;
++  if (insns_size > (limit - cursor) / 2u) {
++    *error = "code_item_instructions_out_of_bounds";
++    return std::nullopt;
++  }
++  cursor += static_cast<size_t>(insns_size) * 2u;
++  if (tries_size == 0u) {
++    return cursor - offset;
++  }
++  if ((insns_size & 1u) != 0u) {
++    if (!CheckRange(cursor, 2u, limit)) {
++      *error = "code_item_padding_out_of_bounds";
++      return std::nullopt;
++    }
++    cursor += 2u;
++  }
++  if (tries_size > (limit - cursor) / 8u) {
++    *error = "code_item_tries_out_of_bounds";
++    return std::nullopt;
++  }
++  cursor += static_cast<size_t>(tries_size) * 8u;
++  uint32_t handler_count = 0u;
++  if (!ReadUleb128(data, &cursor, limit, &handler_count, error) ||
++      handler_count > limit - cursor) {
++    if (error->empty()) {
++      *error = "code_item_handler_count_out_of_bounds";
++    }
++    return std::nullopt;
++  }
++  for (uint32_t index = 0u; index < handler_count; ++index) {
++    int32_t handler_size = 0;
++    if (!ReadSleb128(data, &cursor, limit, &handler_size, error)) {
++      return std::nullopt;
++    }
++    const uint32_t typed_count =
++        handler_size < 0
++            ? static_cast<uint32_t>(-static_cast<int64_t>(handler_size))
++            : static_cast<uint32_t>(handler_size);
++    for (uint32_t entry = 0u; entry < typed_count; ++entry) {
++      uint32_t ignored = 0u;
++      if (!ReadUleb128(data, &cursor, limit, &ignored, error) ||
++          !ReadUleb128(data, &cursor, limit, &ignored, error)) {
++        return std::nullopt;
++      }
++    }
++    if (handler_size <= 0) {
++      uint32_t ignored = 0u;
++      if (!ReadUleb128(data, &cursor, limit, &ignored, error)) {
++        return std::nullopt;
++      }
++    }
++  }
++  return cursor - offset;
++}
++
++std::string RecordString(const Json::Value &record, const char *name) {
++  return record[name].isString() ? record[name].asString() : std::string();
++}
++
++bool IsCodeItem(const Json::Value &record) {
++  return RecordString(record, "capture_kind") == "codeitem";
++}
++
++std::optional<fs::path> ArtifactPath(const fs::path &process,
++                                     const Json::Value &record) {
++  if (!record["artifact_relative_path"].isString()) {
++    return std::nullopt;
++  }
++  const std::string relative = record["artifact_relative_path"].asString();
++  if (!SafeRelativePath(relative)) {
++    return std::nullopt;
++  }
++  const fs::path path = process / fs::path(relative);
++  std::error_code error;
++  const fs::file_status status = fs::symlink_status(path, error);
++  if (error || !fs::is_regular_file(status) || fs::is_symlink(status)) {
++    return std::nullopt;
++  }
++  return path;
++}
++
++std::optional<std::string> MethodIdentity(const Json::Value &record) {
++  if (!IsCodeItem(record) || !record["method_index"].isUInt()) {
++    return std::nullopt;
++  }
++  const std::string class_name = RecordString(record, "class_name");
++  const std::string method_name = RecordString(record, "method_name");
++  const std::string descriptor = RecordString(record, "method_descriptor");
++  if (!class_name.empty() && !method_name.empty() && !descriptor.empty()) {
++    return NormalizeClassName(class_name) + "\n" + method_name + "\n" +
++           descriptor + "\n" + std::to_string(record["method_index"].asUInt());
++  }
++  if (!record["dex_object_id"].isNull()) {
++    return record["dex_object_id"].asString() + "\n" +
++           std::to_string(record["method_index"].asUInt());
++  }
++  return std::nullopt;
++}
++
++std::vector<fs::path> SortedJsonRecords(const fs::path &records) {
++  std::vector<fs::path> paths;
++  std::error_code error;
++  if (!fs::is_directory(records, error)) {
++    return paths;
++  }
++  for (const fs::directory_entry &entry :
++       fs::directory_iterator(records, error)) {
++    if (error) {
++      break;
++    }
++    if (entry.path().extension() == ".json" && entry.is_regular_file(error) &&
++        !entry.is_symlink(error)) {
++      paths.push_back(entry.path());
++    }
++  }
++  std::sort(paths.begin(), paths.end());
++  return paths;
++}
++
++struct Discovered {
++  std::string name;
++  Json::Value record;
++  std::optional<fs::path> artifact;
++  std::string relative_artifact;
++  std::string digest;
++};
++
++Json::Value BaseRecordItem(const Discovered &entry) {
++  Json::Value item(Json::objectValue);
++  item["algorithm_version"] = kAlgorithmVersion;
++  item["record"] = entry.name;
++  if (!entry.digest.empty()) {
++    item["input_sha256"] = entry.digest;
++  }
++  if (!entry.relative_artifact.empty()) {
++    item["artifact"] = entry.relative_artifact;
++  }
++  item["site"] = entry.record["site"];
++  item["capture_point"] = entry.record["capture_point_name"];
++  item["conflicts"] = Json::Value(Json::arrayValue);
++  return item;
++}
++
++ProcessSummary RepairProcess(const fs::path &process, const fs::path &output) {
++  ProcessSummary summary;
++  std::error_code error;
++  fs::create_directories(output / "blobs", error);
++  fs::create_directories(output / "repaired", error);
++  fs::create_directories(output / "partial", error);
++  chmod(output.c_str(), kDirectoryMode);
++  chmod((output / "blobs").c_str(), kDirectoryMode);
++  chmod((output / "repaired").c_str(), kDirectoryMode);
++  chmod((output / "partial").c_str(), kDirectoryMode);
++
++  std::vector<Discovered> discovered;
++  std::map<std::string, std::set<std::string>> method_hashes;
++  for (const fs::path &record_path : SortedJsonRecords(process / "records")) {
++    Json::Value record;
++    if (!ReadJson(record_path, &record)) {
++      continue;
++    }
++    Discovered entry;
++    entry.name = record_path.filename().string();
++    entry.record = std::move(record);
++    entry.artifact = ArtifactPath(process, entry.record);
++    if (entry.artifact.has_value()) {
++      std::vector<uint8_t> data;
++      if (ReadFile(*entry.artifact, &data)) {
++        entry.relative_artifact =
++            fs::relative(*entry.artifact, process, error).generic_string();
++        if (error) {
++          entry.relative_artifact.clear();
++          error.clear();
++        }
++        entry.digest = Sha256(data);
++        if (auto identity = MethodIdentity(entry.record);
++            identity.has_value()) {
++          method_hashes[*identity].insert(entry.digest);
++        }
++      } else {
++        entry.artifact.reset();
++      }
++    }
++    discovered.push_back(std::move(entry));
++  }
++
++  std::vector<DexCandidate> candidates;
++  std::set<std::string> candidate_digests;
++  for (const Discovered &entry : discovered) {
++    if (!entry.artifact.has_value() || IsCodeItem(entry.record) ||
++        entry.digest.empty() || candidate_digests.count(entry.digest) != 0u) {
++      continue;
++    }
++    std::vector<uint8_t> data;
++    if (!ReadFile(*entry.artifact, &data)) {
++      continue;
++    }
++    const Validation validation = ValidateDex(data);
++    if (!validation.layout.has_value()) {
++      continue;
++    }
++    std::string catalog_error;
++    auto catalog = BuildMethodCatalog(data, *validation.layout, &catalog_error);
++    if (!catalog.has_value()) {
++      continue;
++    }
++    candidates.push_back(DexCandidate{*entry.artifact, entry.relative_artifact,
++                                      entry.digest, std::move(*catalog)});
++    candidate_digests.insert(entry.digest);
++  }
++
++  std::map<std::string, Json::Value> items;
++  std::map<std::string, Json::Value> inputs;
++  std::set<std::string> seen_blobs;
++  std::vector<const Discovered *> code_items;
++  for (const Discovered &entry : discovered) {
++    Json::Value item = BaseRecordItem(entry);
++    if (!entry.artifact.has_value() || entry.digest.empty()) {
++      item["trust"] = "partial";
++      if (RecordString(entry.record, "status") == "dropped") {
++        item["reason"] = "capture_dropped";
++        item["drop_reason"] = entry.record["drop_reason"];
++      } else {
++        item["reason"] = "missing_artifact";
++      }
++      items[entry.name] = std::move(item);
++      continue;
++    }
++    std::vector<uint8_t> data;
++    if (!ReadFile(*entry.artifact, &data)) {
++      item["trust"] = "partial";
++      item["reason"] = "missing_artifact";
++      items[entry.name] = std::move(item);
++      continue;
++    }
++    if (seen_blobs.insert(entry.digest).second) {
++      WriteFile(output / "blobs" / (entry.digest + ".bin"), data);
++    }
++    Json::Value &input = inputs[entry.digest];
++    if (input.isNull()) {
++      input = Json::Value(Json::objectValue);
++      input["sha256"] = entry.digest;
++      input["size"] = Json::UInt64(data.size());
++      input["artifact"] = entry.relative_artifact;
++      input["records"] = Json::Value(Json::arrayValue);
++    }
++    input["records"].append(entry.name);
++
++    if (auto identity = MethodIdentity(entry.record);
++        identity.has_value() && method_hashes[*identity].size() > 1u) {
++      Json::Value conflict(Json::objectValue);
++      conflict["type"] = "code_item_bytes";
++      Json::Value hashes(Json::arrayValue);
++      for (const std::string &digest : method_hashes[*identity]) {
++        hashes.append(digest);
++      }
++      conflict["candidate_sha256"] = std::move(hashes);
++      item["conflicts"].append(std::move(conflict));
++      item["trust"] = "partial";
++      item["reason"] = "code_item_conflict";
++    }
++
++    if (IsCodeItem(entry.record)) {
++      if (!item.isMember("trust")) {
++        item["trust"] = "partial";
++        item["kind"] = "codeitem";
++        item["output_kind"] = "dexrecon";
++        item["reason"] = "method_evidence_only";
++      }
++      items[entry.name] = std::move(item);
++      code_items.push_back(&entry);
++      continue;
++    }
++
++    if (RecordString(entry.record, "capture_kind") == "dexdata") {
++      item["trust"] = "partial";
++      item["kind"] = "dexdata";
++      item["output_kind"] = "dexrecon";
++      item["reason"] = "dexrecon_missing_runtime_tables";
++      const fs::path partial =
++          output / "partial" / (entry.digest + ".partial.json");
++      WriteText(partial, JsonText(item));
++      item["output"] = fs::relative(partial, output, error).generic_string();
++      items[entry.name] = std::move(item);
++      continue;
++    }
++
++    auto [repaired, details] = RepairDexFixed(data);
++    for (const std::string &name : details.getMemberNames()) {
++      item[name] = details[name];
++    }
++    if (repaired.has_value()) {
++      const fs::path fixed =
++          output / "repaired" / (entry.digest + ".dexfixed.dex");
++      WriteFile(fixed, *repaired);
++      item["output"] = fs::relative(fixed, output, error).generic_string();
++    } else {
++      const fs::path partial =
++          output / "partial" / (entry.digest + ".partial.json");
++      WriteText(partial, JsonText(item));
++      item["output"] = fs::relative(partial, output, error).generic_string();
++    }
++    items[entry.name] = std::move(item);
++  }
++
++  struct Patch {
++    const Discovered *entry;
++    uint32_t target_offset;
++  };
++  std::map<std::string, std::vector<Patch>> patch_groups;
++  for (const Discovered *entry : code_items) {
++    Json::Value &item = items[entry->name];
++    if (RecordString(item, "reason") == "code_item_conflict") {
++      continue;
++    }
++    std::vector<std::pair<std::string, uint32_t>> matches;
++    for (const DexCandidate &candidate : candidates) {
++      if (auto offset = MatchCodeItem(entry->record, candidate.catalog);
++          offset.has_value()) {
++        matches.emplace_back(candidate.digest, *offset);
++      }
++    }
++    if (matches.empty()) {
++      item["reason"] = "target_dex_not_found";
++      continue;
++    }
++    if (matches.size() != 1u) {
++      item["reason"] = "target_dex_ambiguous";
++      Json::Value digests(Json::arrayValue);
++      for (const auto &[digest, ignored] : matches) {
++        static_cast<void>(ignored);
++        digests.append(digest);
++      }
++      item["candidate_dex_sha256"] = std::move(digests);
++      continue;
++    }
++    patch_groups[matches.front().first].push_back(
++        Patch{entry, matches.front().second});
++  }
++
++  Json::Value reconstructions(Json::arrayValue);
++  for (const auto &[candidate_digest, patches] : patch_groups) {
++    const auto candidate_it = std::find_if(
++        candidates.begin(), candidates.end(), [&](const DexCandidate &value) {
++          return value.digest == candidate_digest;
++        });
++    if (candidate_it == candidates.end()) {
++      continue;
++    }
++    std::vector<uint8_t> base;
++    if (!ReadFile(candidate_it->artifact, &base)) {
++      continue;
++    }
++    const Validation validation = ValidateDex(base);
++    if (!validation.layout.has_value()) {
++      continue;
++    }
++    std::map<uint32_t,
++             std::pair<std::vector<uint8_t>, std::vector<std::string>>>
++        accepted;
++    std::set<uint32_t> conflicted_offsets;
++    Json::Value outcomes(Json::arrayValue);
++    for (const Patch &patch : patches) {
++      Json::Value outcome(Json::objectValue);
++      outcome["record"] = patch.entry->name;
++      std::vector<uint8_t> code;
++      std::string reason;
++      if (!ReadFile(*patch.entry->artifact, &code) || code.empty()) {
++        reason = "code_item_bytes_missing";
++      } else if (!patch.entry->record["method_index"].isUInt()) {
++        reason = "code_item_mapping_missing";
++      } else if (patch.entry->record["code_item_size"].isUInt64() &&
++                 patch.entry->record["code_item_size"].asUInt64() !=
++                     code.size()) {
++        reason = "code_item_size_mismatch";
++      } else {
++        std::string size_error;
++        auto source_size =
++            CodeItemSize(base, patch.target_offset,
++                         validation.layout->file_size, &size_error);
++        auto captured_size = CodeItemSize(code, 0u, code.size(), &size_error);
++        if (!source_size.has_value() || !captured_size.has_value()) {
++          reason = size_error;
++        } else if (*source_size != code.size() ||
++                   *captured_size != code.size()) {
++          reason = "code_item_span_mismatch";
++        }
++      }
++      if (reason.empty() &&
++          conflicted_offsets.count(patch.target_offset) != 0u) {
++        reason = "code_item_conflict";
++      }
++      if (reason.empty()) {
++        auto previous = accepted.find(patch.target_offset);
++        if (previous != accepted.end() && previous->second.first != code) {
++          for (const std::string &previous_record : previous->second.second) {
++            Json::Value &previous_item = items[previous_record];
++            previous_item["trust"] = "partial";
++            previous_item["reason"] = "code_item_conflict";
++          }
++          accepted.erase(previous);
++          conflicted_offsets.insert(patch.target_offset);
++          reason = "code_item_conflict";
++        } else if (previous == accepted.end()) {
++          accepted.emplace(
++              patch.target_offset,
++              std::make_pair(std::move(code),
++                             std::vector<std::string>{patch.entry->name}));
++        } else {
++          previous->second.second.push_back(patch.entry->name);
++        }
++      }
++      if (reason.empty()) {
++        outcome["status"] = "applied";
++        outcome["method_index"] = patch.entry->record["method_index"].asUInt();
++        outcome["offset"] = patch.target_offset;
++        outcome["size"] =
++            Json::UInt64(accepted[patch.target_offset].first.size());
++      } else {
++        outcome["status"] = "partial";
++        outcome["reason"] = reason;
++      }
++      outcomes.append(std::move(outcome));
++    }
++
++    std::optional<fs::path> output_path;
++    std::string output_digest;
++    if (!accepted.empty()) {
++      std::vector<uint8_t> repaired(
++          base.begin(), base.begin() + validation.layout->file_size);
++      for (const auto &[offset, patch] : accepted) {
++        std::copy(patch.first.begin(), patch.first.end(),
++                  repaired.begin() + offset);
++      }
++      std::array<uint8_t, SHA_DIGEST_LENGTH> signature{};
++      SHA1(repaired.data() + 32u, repaired.size() - 32u, signature.data());
++      std::copy(signature.begin(), signature.end(), repaired.begin() + 12u);
++      WriteU32(&repaired, 8u,
++               adler32(0L, repaired.data() + 12u, repaired.size() - 12u));
++      output_path = output / "repaired" / (candidate_digest + ".codeitem.dex");
++      if (WriteFile(*output_path, repaired)) {
++        output_digest = Sha256(repaired);
++      } else {
++        output_path.reset();
++      }
++    }
++
++    Json::Value reconstruction(Json::objectValue);
++    reconstruction["base_sha256"] = candidate_digest;
++    reconstruction["base_artifact"] = candidate_it->relative_artifact;
++    reconstruction["outcomes"] = outcomes;
++    if (output_path.has_value()) {
++      reconstruction["output"] =
++          fs::relative(*output_path, output, error).generic_string();
++      reconstruction["output_sha256"] = output_digest;
++    } else {
++      reconstruction["output"] = Json::nullValue;
++    }
++    reconstructions.append(reconstruction);
++
++    for (const Json::Value &outcome : outcomes) {
++      Json::Value &item = items[outcome["record"].asString()];
++      if (RecordString(outcome, "status") == "applied" &&
++          output_path.has_value()) {
++        item.removeMember("reason");
++        item["trust"] = "repaired";
++        item["output_kind"] = "codeitem_backfill";
++        item["output"] =
++            fs::relative(*output_path, output, error).generic_string();
++        item["target_dex_sha256"] = candidate_digest;
++        item["backfill_offset"] = outcome["offset"];
++        item["backfill_size"] = outcome["size"];
++      } else {
++        item["trust"] = "partial";
++        item["reason"] = outcome.isMember("reason")
++                             ? outcome["reason"]
++                             : Json::Value("backfill_failed");
++      }
++    }
++  }
++
++  for (const Discovered *entry : code_items) {
++    Json::Value &item = items[entry->name];
++    if (RecordString(item, "trust") != "partial") {
++      continue;
++    }
++    const fs::path partial = output / "partial" /
++                             (fs::path(entry->name).stem().string() + "-" +
++                              entry->digest + ".partial.json");
++    WriteText(partial, JsonText(item));
++    item["output"] = fs::relative(partial, output, error).generic_string();
++  }
++
++  Json::Value report(Json::objectValue);
++  report["algorithm_version"] = kAlgorithmVersion;
++  report["input"] = process.string();
++  report["records"] = Json::Value(Json::arrayValue);
++  std::set<std::string> usable_outputs;
++  for (const auto &[name, item] : items) {
++    static_cast<void>(name);
++    report["records"].append(item);
++    ++summary.record_count;
++    const std::string trust = RecordString(item, "trust");
++    if (trust == "verified") {
++      ++summary.verified;
++    } else if (trust == "repaired") {
++      ++summary.repaired;
++      if (RecordString(item, "output_kind") == "codeitem_backfill") {
++        ++summary.codeitems_backfilled;
++      }
++    } else {
++      ++summary.partial;
++    }
++    if ((trust == "verified" || trust == "repaired") &&
++        item["output"].isString()) {
++      usable_outputs.insert(item["output"].asString());
++    }
++  }
++  report["record_count"] = summary.record_count;
++  report["reconstructions"] = reconstructions;
++  for (const Json::Value &reconstruction : reconstructions) {
++    if (reconstruction["output"].isString()) {
++      usable_outputs.insert(reconstruction["output"].asString());
++    }
++  }
++  summary.usable_outputs = usable_outputs.size();
++
++  Json::Value input_report(Json::objectValue);
++  input_report["run"] = process.string();
++  input_report["blobs"] = Json::Value(Json::arrayValue);
++  for (const auto &[digest, input] : inputs) {
++    static_cast<void>(digest);
++    input_report["blobs"].append(input);
++  }
++  WriteText(output / "inputs.json", JsonText(input_report));
++  WriteText(output / "report.json", JsonText(report));
++  summary.report = std::move(report);
++  return summary;
++}
++
++std::optional<RunCandidate> FindLatestRun(const fs::path &runs) {
++  std::error_code error;
++  if (!fs::is_directory(runs, error)) {
++    return std::nullopt;
++  }
++  std::optional<RunCandidate> selected;
++  for (const fs::directory_entry &run : fs::directory_iterator(runs, error)) {
++    if (error || !run.is_directory(error) || run.is_symlink(error) ||
++        !IsValidRunId(run.path().filename().string())) {
++      error.clear();
++      continue;
++    }
++    uint32_t artifact_count = 0u;
++    fs::file_time_type newest = fs::file_time_type::min();
++    for (const fs::directory_entry &process :
++         fs::directory_iterator(run.path(), error)) {
++      if (error || !process.is_directory(error) || process.is_symlink(error) ||
++          process.path().filename().string().rfind("process-", 0u) != 0u ||
++          !fs::is_regular_file(process.path() / "session.json", error)) {
++        error.clear();
++        continue;
++      }
++      const fs::path artifacts = process.path() / "artifacts";
++      if (!fs::is_directory(artifacts, error)) {
++        error.clear();
++        continue;
++      }
++      for (const fs::directory_entry &artifact :
++           fs::directory_iterator(artifacts, error)) {
++        if (error || !artifact.is_regular_file(error) ||
++            artifact.is_symlink(error)) {
++          error.clear();
++          continue;
++        }
++        ++artifact_count;
++        const fs::file_time_type modified = artifact.last_write_time(error);
++        if (!error && modified > newest) {
++          newest = modified;
++        }
++        error.clear();
++      }
++    }
++    if (artifact_count == 0u) {
++      continue;
++    }
++    RunCandidate candidate{run.path(), run.path().filename().string(), newest,
++                           artifact_count};
++    if (!selected.has_value() ||
++        std::tie(candidate.newest, candidate.run_id) >
++            std::tie(selected->newest, selected->run_id)) {
++      selected = std::move(candidate);
++    }
++  }
++  return selected;
++}
++
++bool CopyTree(const fs::path &source, const fs::path &destination,
++              std::string *detail) {
++  std::error_code error;
++  fs::create_directories(destination, error);
++  if (error) {
++    *detail = "create_staging_failed";
++    return false;
++  }
++  chmod(destination.c_str(), kDirectoryMode);
++  uint64_t total_bytes = 0u;
++  uint32_t file_count = 0u;
++  for (const fs::directory_entry &entry :
++       fs::recursive_directory_iterator(source, error)) {
++    if (error) {
++      *detail = "source_walk_failed";
++      return false;
++    }
++    const fs::file_status status = entry.symlink_status(error);
++    if (error || fs::is_symlink(status)) {
++      *detail = "source_symlink_rejected";
++      return false;
++    }
++    const fs::path relative = fs::relative(entry.path(), source, error);
++    if (error || relative.empty()) {
++      *detail = "source_relative_path_failed";
++      return false;
++    }
++    const fs::path target = destination / relative;
++    if (fs::is_directory(status)) {
++      fs::create_directory(target, error);
++      if (error && error != std::errc::file_exists) {
++        *detail = "create_staging_directory_failed";
++        return false;
++      }
++      error.clear();
++      chmod(target.c_str(), kDirectoryMode);
++      continue;
++    }
++    if (!fs::is_regular_file(status)) {
++      *detail = "source_entry_type_rejected";
++      return false;
++    }
++    const uint64_t size = entry.file_size(error);
++    if (error || size > kMaxSingleFileBytes ||
++        size > kMaxExportBytes - total_bytes ||
++        ++file_count > kMaxExportFiles) {
++      *detail = "source_limits_exceeded";
++      return false;
++    }
++    total_bytes += size;
++    fs::copy_file(entry.path(), target, fs::copy_options::overwrite_existing,
++                  error);
++    if (error) {
++      *detail = "copy_source_failed";
++      return false;
++    }
++    chmod(target.c_str(), kFileMode);
++  }
++  return true;
++}
++
++bool CopyFdToFile(int fd, const fs::path &target) {
++  if (fd < 0 || lseek(fd, 0, SEEK_SET) < 0) {
++    return false;
++  }
++  const int output =
++      open(target.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, kFileMode);
++  if (output < 0) {
++    return false;
++  }
++  bool ok = true;
++  uint64_t total = 0u;
++  std::array<uint8_t, 64 * 1024> buffer{};
++  for (;;) {
++    const ssize_t count =
++        TEMP_FAILURE_RETRY(read(fd, buffer.data(), buffer.size()));
++    if (count == 0) {
++      break;
++    }
++    if (count < 0 ||
++        static_cast<uint64_t>(count) > kMaxSingleFileBytes - total) {
++      ok = false;
++      break;
++    }
++    total += static_cast<uint64_t>(count);
++    size_t offset = 0u;
++    while (offset < static_cast<size_t>(count)) {
++      const ssize_t written = TEMP_FAILURE_RETRY(write(
++          output, buffer.data() + offset, static_cast<size_t>(count) - offset));
++      if (written <= 0) {
++        ok = false;
++        break;
++      }
++      offset += static_cast<size_t>(written);
++    }
++    if (!ok) {
++      break;
++    }
++  }
++  if (fsync(output) != 0) {
++    ok = false;
++  }
++  close(output);
++  if (!ok) {
++    unlink(target.c_str());
++  }
++  return ok;
++}
++
++bool ExtractManifest(const fs::path &apk, const fs::path &target) {
++  ZipArchiveHandle archive = nullptr;
++  if (OpenArchive(apk.c_str(), &archive) != 0) {
++    return false;
++  }
++  ZipEntry entry;
++  bool ok = FindEntry(archive, "AndroidManifest.xml", &entry) == 0 &&
++            entry.uncompressed_length <= kMaxSingleFileBytes;
++  std::vector<uint8_t> manifest;
++  if (ok) {
++    manifest.resize(entry.uncompressed_length);
++    ok =
++        ExtractToMemory(archive, &entry, manifest.data(), manifest.size()) == 0;
++  }
++  CloseArchive(archive);
++  return ok && WriteFile(target, manifest);
++}
++
++bool AddFileToZip(ZipWriter *writer, const fs::path &file,
++                  const std::string &entry_name) {
++  if (writer->StartEntry(entry_name, ZipWriter::kCompress |
++                                         ZipWriter::kDefaultCompression) != 0) {
++    return false;
++  }
++  std::ifstream input(file, std::ios::binary);
++  std::array<char, 64 * 1024> buffer{};
++  while (input) {
++    input.read(buffer.data(), buffer.size());
++    const std::streamsize count = input.gcount();
++    if (count > 0 &&
++        writer->WriteBytes(buffer.data(), static_cast<size_t>(count)) != 0) {
++      return false;
++    }
++  }
++  return (input.eof() || input.good()) && writer->FinishEntry() == 0;
++}
++
++bool CreateZip(const fs::path &source, const fs::path &archive,
++               const std::string &prefix) {
++  FILE *file = fopen(archive.c_str(), "wb");
++  if (file == nullptr) {
++    return false;
++  }
++  ZipWriter writer(file);
++  bool ok = true;
++  std::error_code error;
++  std::vector<fs::path> files;
++  for (const fs::directory_entry &entry :
++       fs::recursive_directory_iterator(source, error)) {
++    if (error || entry.is_symlink(error)) {
++      ok = false;
++      break;
++    }
++    if (entry.is_regular_file(error)) {
++      files.push_back(entry.path());
++    }
++  }
++  std::sort(files.begin(), files.end());
++  for (const fs::path &path : files) {
++    const std::string name =
++        prefix + "/" + fs::relative(path, source, error).generic_string();
++    if (error || !AddFileToZip(&writer, path, name)) {
++      ok = false;
++      break;
++    }
++  }
++  if (ok && writer.Finish() != 0) {
++    ok = false;
++  }
++  if (fclose(file) != 0) {
++    ok = false;
++  }
++  if (!ok) {
++    unlink(archive.c_str());
++  } else {
++    chmod(archive.c_str(), kFileMode);
++  }
++  return ok;
++}
++
++std::string PublicPath(const fs::path &path) {
++  const std::string native = path.string();
++  constexpr std::string_view root = "/mnt/user/0/emulated/0";
++  if (native.rfind(root, 0u) == 0u) {
++    return "/sdcard" + native.substr(root.size());
++  }
++  return native;
++}
++
++bool CopyApksAndManifests(const std::vector<int> &apk_fds,
++                          const fs::path &staging, std::string *detail) {
++  std::error_code error;
++  const fs::path apk_directory = staging / "apk";
++  const fs::path manifest_directory = staging / "manifest";
++  fs::create_directories(apk_directory, error);
++  fs::create_directories(manifest_directory, error);
++  if (error) {
++    *detail = "create_apk_directory_failed";
++    return false;
++  }
++  chmod(apk_directory.c_str(), kDirectoryMode);
++  chmod(manifest_directory.c_str(), kDirectoryMode);
++  for (size_t index = 0u; index < apk_fds.size(); ++index) {
++    const std::string stem =
++        index == 0u ? "base" : "split-" + std::to_string(index);
++    const fs::path apk = apk_directory / (stem + ".apk");
++    if (!CopyFdToFile(apk_fds[index], apk)) {
++      *detail = "copy_apk_failed";
++      return false;
++    }
++    if (!ExtractManifest(apk,
++                         manifest_directory /
++                             (index == 0u ? "AndroidManifest.xml"
++                                          : stem + "-AndroidManifest.xml"))) {
++      *detail = "extract_manifest_failed";
++      return false;
++    }
++  }
++  Json::Value index(Json::objectValue);
++  index["base_apk"] = "apk/base.apk";
++  index["base_manifest"] = "manifest/AndroidManifest.xml";
++  index["split_count"] = static_cast<Json::UInt>(apk_fds.size() - 1u);
++  return WriteText(staging / "jadx-input.json", JsonText(index));
++}
++
++} // namespace
++
++Status ExportLatest(const fs::path &storage_root,
++                    const fs::path &downloads_root,
++                    std::string_view package_name,
++                    const std::vector<int> &apk_fds, ExportSummary *summary) {
++  if (summary == nullptr || !IsValidPackageName(package_name) ||
++      apk_fds.empty() || apk_fds.size() > 32u) {
++    return Status::kProtocolError;
++  }
++  *summary = ExportSummary{};
++  const fs::path runs = storage_root / "Android" / "data" /
++                        std::string(package_name) / "files" / "r0dump-fusion" /
++                        "runs";
++  const auto candidate = FindLatestRun(runs);
++  if (!candidate.has_value()) {
++    summary->detail = "no_run_with_artifacts";
++    return Status::kNoRuns;
++  }
++  summary->run_id = candidate->run_id;
++  summary->remote_artifact_count = candidate->artifact_count;
++
++  std::error_code error;
++  const fs::path package_output =
++      downloads_root / "r0dump-exports" / std::string(package_name);
++  fs::create_directories(package_output, error);
++  if (error) {
++    summary->detail = "downloads_unavailable";
++    return Status::kStorageUnavailable;
++  }
++  chmod((downloads_root / "r0dump-exports").c_str(), kDirectoryMode);
++  chmod(package_output.c_str(), kDirectoryMode);
++
++  const std::string unique =
++      "." + candidate->run_id + ".partial-" + std::to_string(getpid()) + "-" +
++      std::to_string(
++          std::chrono::steady_clock::now().time_since_epoch().count());
++  const fs::path staging = package_output / unique;
++  if (!CopyTree(candidate->path, staging, &summary->detail)) {
++    fs::remove_all(staging, error);
++    return Status::kRepairFailed;
++  }
++  if (!CopyApksAndManifests(apk_fds, staging, &summary->detail)) {
++    fs::remove_all(staging, error);
++    return Status::kRepairFailed;
++  }
++
++  Json::Value process_reports(Json::arrayValue);
++  std::vector<fs::path> processes;
++  for (const fs::directory_entry &entry :
++       fs::directory_iterator(staging, error)) {
++    if (!error && entry.is_directory(error) && !entry.is_symlink(error) &&
++        entry.path().filename().string().rfind("process-", 0u) == 0u) {
++      processes.push_back(entry.path());
++    }
++    error.clear();
++  }
++  std::sort(processes.begin(), processes.end());
++  for (const fs::path &process : processes) {
++    const fs::path repair = process / "host-repair";
++    const ProcessSummary result = RepairProcess(process, repair);
++    summary->record_count += result.record_count;
++    summary->verified += result.verified;
++    summary->repaired += result.repaired;
++    summary->partial += result.partial;
++    summary->usable_outputs += result.usable_outputs;
++    summary->codeitems_backfilled += result.codeitems_backfilled;
++    Json::Value item(Json::objectValue);
++    item["process"] = process.filename().string();
++    item["status"] = "ok";
++    item["algorithm_version"] = kAlgorithmVersion;
++    item["record_count"] = result.record_count;
++    item["verified"] = result.verified;
++    item["repaired"] = result.repaired;
++    item["partial"] = result.partial;
++    item["usable_outputs"] = result.usable_outputs;
++    item["codeitems_backfilled"] = result.codeitems_backfilled;
++    item["report"] = (process.filename() / fs::path("host-repair/report.json"))
++                         .generic_string();
++    process_reports.append(std::move(item));
++  }
++  if (processes.empty()) {
++    summary->detail = "no_process_directories";
++    fs::remove_all(staging, error);
++    return Status::kRepairFailed;
++  }
++
++  Json::Value export_report(Json::objectValue);
++  export_report["schema"] = 1;
++  export_report["algorithm_version"] = kAlgorithmVersion;
++  export_report["package"] = std::string(package_name);
++  export_report["run_id"] = candidate->run_id;
++  export_report["remote_artifact_count"] = candidate->artifact_count;
++  export_report["apk_count"] = static_cast<Json::UInt>(apk_fds.size());
++  export_report["manifest_included"] = true;
++  export_report["process_reports"] = process_reports;
++  if (!WriteText(staging / "export-report.json", JsonText(export_report))) {
++    summary->detail = "write_export_report_failed";
++    fs::remove_all(staging, error);
++    return Status::kRepairFailed;
++  }
++
++  const fs::path temporary_zip =
++      package_output / ("." + candidate->run_id + ".zip.partial");
++  const fs::path final_zip = package_output / (candidate->run_id + ".zip");
++  const fs::path temporary_sha =
++      package_output / ("." + candidate->run_id + ".zip.sha256.partial");
++  const fs::path final_sha =
++      package_output / (candidate->run_id + ".zip.sha256");
++  unlink(temporary_zip.c_str());
++  unlink(temporary_sha.c_str());
++  if (!CreateZip(staging, temporary_zip,
++                 std::string(package_name) + "/" + candidate->run_id)) {
++    summary->detail = "create_archive_failed";
++    fs::remove_all(staging, error);
++    return Status::kArchiveFailed;
++  }
++  summary->sha256 = Sha256File(temporary_zip);
++  if (summary->sha256.empty() ||
++      !WriteText(temporary_sha, summary->sha256 + "  " +
++                                    final_zip.filename().string() + "\n")) {
++    summary->detail = "create_checksum_failed";
++    unlink(temporary_zip.c_str());
++    unlink(temporary_sha.c_str());
++    fs::remove_all(staging, error);
++    return Status::kArchiveFailed;
++  }
++  unlink(final_zip.c_str());
++  unlink(final_sha.c_str());
++  if (rename(temporary_zip.c_str(), final_zip.c_str()) != 0 ||
++      rename(temporary_sha.c_str(), final_sha.c_str()) != 0) {
++    summary->detail = "publish_archive_failed";
++    unlink(temporary_zip.c_str());
++    unlink(temporary_sha.c_str());
++    fs::remove_all(staging, error);
++    return Status::kArchiveFailed;
++  }
++  chmod(final_zip.c_str(), kFileMode);
++  chmod(final_sha.c_str(), kFileMode);
++  fs::remove_all(staging, error);
++  summary->archive_path = PublicPath(final_zip);
++  summary->detail = "ok";
++  return Status::kOk;
++}
++
++} // namespace r0dump::file_helper
+diff --git a/helper/r0dump_export_core.h b/helper/r0dump_export_core.h
+new file mode 100644
+index 0000000..da05342
+--- /dev/null
++++ b/helper/r0dump_export_core.h
+@@ -0,0 +1,38 @@
++#ifndef R0DUMP_EXPORT_CORE_H_
++#define R0DUMP_EXPORT_CORE_H_
++
++#include <stdint.h>
++
++#include <filesystem>
++#include <string>
++#include <vector>
++
++#include "r0dump_file_helper_protocol.h"
++
++namespace r0dump::file_helper {
++
++struct ExportSummary {
++  uint32_t remote_artifact_count = 0u;
++  uint32_t record_count = 0u;
++  uint32_t verified = 0u;
++  uint32_t repaired = 0u;
++  uint32_t partial = 0u;
++  uint32_t usable_outputs = 0u;
++  uint32_t codeitems_backfilled = 0u;
++  std::string run_id;
++  std::string archive_path;
++  std::string sha256;
++  std::string detail;
++};
++
++// Repairs the newest run below storage_root/Android/data/<package>/files and
++// writes the final archive below downloads_root/r0dump-exports/<package>.
++// apk_fds must contain base.apk first, followed by optional split APKs.
++Status ExportLatest(const std::filesystem::path &storage_root,
++                    const std::filesystem::path &downloads_root,
++                    std::string_view package_name,
++                    const std::vector<int> &apk_fds, ExportSummary *summary);
++
++} // namespace r0dump::file_helper
++
++#endif // R0DUMP_EXPORT_CORE_H_
+diff --git a/helper/r0dump_file_helper.cpp b/helper/r0dump_file_helper.cpp
+index 4b4f2b2..37238f4 100644
+--- a/helper/r0dump_file_helper.cpp
++++ b/helper/r0dump_file_helper.cpp
+@@ -11,17 +11,26 @@
+ 
+ #include <private/android_filesystem_config.h>
+ 
++#include <algorithm>
++#include <atomic>
+ #include <cstring>
+ #include <string>
+ #include <string_view>
++#include <thread>
++#include <vector>
+ 
++#include "r0dump_export_core.h"
+ #include "r0dump_file_helper_core.h"
+ 
+ namespace r0dump::file_helper {
+ namespace {
+ 
+ constexpr char kStorageRoot[] = "/mnt/user/0/emulated/0";
++constexpr char kDownloadsRoot[] = "/mnt/user/0/emulated/0/Downloads";
+ constexpr char kPropertyPrefix[] = "persist.sys.r0dump.fusion.";
++constexpr size_t kMaxApkCount = 32u;
++
++std::atomic<bool> g_export_in_progress(false);
+ 
+ std::string Property(std::string_view suffix) {
+   return android::base::GetProperty(
+@@ -86,49 +95,197 @@ bool SendResponse(int client_fd, Status status, int process_fd) {
+          static_cast<ssize_t>(sizeof(response));
+ }
+ 
+-void HandleClient(int client_fd) {
++template <size_t N>
++void CopyResponseString(char (&destination)[N], std::string_view value) {
++  const size_t count = std::min(value.size(), N - 1u);
++  memcpy(destination, value.data(), count);
++  destination[count] = '\0';
++}
++
++bool SendExportResponse(int client_fd, Status status,
++                        const ExportSummary &summary) {
++  ExportResponse response = {};
++  response.magic = kExportResponseMagic;
++  response.version = kExportProtocolVersion;
++  response.size = static_cast<uint16_t>(sizeof(response));
++  response.status = static_cast<int32_t>(status);
++  response.remote_artifact_count = summary.remote_artifact_count;
++  response.record_count = summary.record_count;
++  response.verified = summary.verified;
++  response.repaired = summary.repaired;
++  response.partial = summary.partial;
++  response.usable_outputs = summary.usable_outputs;
++  response.codeitems_backfilled = summary.codeitems_backfilled;
++  CopyResponseString(response.run_id, summary.run_id);
++  CopyResponseString(response.archive_path, summary.archive_path);
++  CopyResponseString(response.sha256, summary.sha256);
++  CopyResponseString(response.detail, summary.detail);
++  return TEMP_FAILURE_RETRY(
++             send(client_fd, &response, sizeof(response), MSG_NOSIGNAL)) ==
++         static_cast<ssize_t>(sizeof(response));
++}
++
++void CloseFds(const std::vector<int> &fds) {
++  for (int fd : fds) {
++    if (fd >= 0)
++      close(fd);
++  }
++}
++
++std::vector<int> ReceiveFds(const msghdr &message) {
++  std::vector<int> fds;
++  for (const cmsghdr *header = CMSG_FIRSTHDR(&message); header != nullptr;
++       header = CMSG_NXTHDR(const_cast<msghdr *>(&message),
++                            const_cast<cmsghdr *>(header))) {
++    if (header->cmsg_level != SOL_SOCKET || header->cmsg_type != SCM_RIGHTS ||
++        header->cmsg_len < CMSG_LEN(sizeof(int))) {
++      continue;
++    }
++    const size_t bytes = header->cmsg_len - CMSG_LEN(0);
++    const size_t count = bytes / sizeof(int);
++    const int *received =
++        reinterpret_cast<const int *>(CMSG_DATA(const_cast<cmsghdr *>(header)));
++    fds.insert(fds.end(), received, received + count);
++  }
++  return fds;
++}
++
++void RunExport(int client_fd, ExportRequest request, std::vector<int> apk_fds) {
++  ExportSummary summary;
++  std::string_view package_name;
++  Status status = Status::kProtocolError;
++  if (ReadFixedString(request.package_name, sizeof(request.package_name),
++                      &package_name) &&
++      IsValidPackageName(package_name)) {
++    status = ExportLatest(kStorageRoot, kDownloadsRoot, package_name, apk_fds,
++                          &summary);
++  } else {
++    summary.detail = "invalid_package";
++  }
++  if (status != Status::kOk) {
++    ALOGW("r0dump export failed: status=%d package=%s detail=%s",
++          static_cast<int>(status), request.package_name,
++          summary.detail.c_str());
++  }
++  SendExportResponse(client_fd, status, summary);
++  CloseFds(apk_fds);
++  close(client_fd);
++  g_export_in_progress.store(false);
++}
++
++// Returns true when the accept loop still owns client_fd.
++bool HandleClient(int client_fd) {
+   ucred peer = {};
+   socklen_t peer_size = sizeof(peer);
+   if (getsockopt(client_fd, SOL_SOCKET, SO_PEERCRED, &peer, &peer_size) != 0 ||
+       peer_size != sizeof(peer) || peer.uid != AID_SYSTEM) {
+     SendResponse(client_fd, Status::kInvalidCaller, -1);
+-    return;
++    return true;
+   }
+-  Request request = {};
+-  const ssize_t received =
+-      TEMP_FAILURE_RETRY(recv(client_fd, &request, sizeof(request), MSG_TRUNC));
+-  if (received != static_cast<ssize_t>(sizeof(request)) ||
+-      request.magic != kProtocolMagic || request.version != kProtocolVersion ||
+-      request.size != sizeof(Request)) {
++
++  std::array<uint8_t, sizeof(Request)> request_bytes{};
++  alignas(cmsghdr) char control[CMSG_SPACE(sizeof(int) * kMaxApkCount)] = {};
++  iovec io = {.iov_base = request_bytes.data(),
++              .iov_len = request_bytes.size()};
++  msghdr message = {};
++  message.msg_iov = &io;
++  message.msg_iovlen = 1;
++  message.msg_control = control;
++  message.msg_controllen = sizeof(control);
++  const ssize_t received = TEMP_FAILURE_RETRY(
++      recvmsg(client_fd, &message, MSG_TRUNC | MSG_CMSG_CLOEXEC));
++  std::vector<int> received_fds = ReceiveFds(message);
++  if (received < static_cast<ssize_t>(sizeof(uint32_t))) {
++    CloseFds(received_fds);
+     SendResponse(client_fd, Status::kProtocolError, -1);
+-    return;
++    return true;
+   }
+-  Status status = ValidateStableConfig(request);
+-  int process_fd = -1;
+-  if (status == Status::kOk) {
+-    const int root_fd =
+-        open(kStorageRoot, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+-    if (root_fd < 0) {
+-      ALOGW("r0dump helper could not open storage root %s: %s",
+-            kStorageRoot, strerror(errno));
+-      status = Status::kStorageUnavailable;
+-    } else {
+-      status = PrepareDirectoryTreeAt(
+-          root_fd, request, {AID_ROOT, request.target_uid, AID_EXT_DATA_RW},
+-          &process_fd);
+-      close(root_fd);
++
++  uint32_t magic = 0u;
++  memcpy(&magic, request_bytes.data(), sizeof(magic));
++  if (magic == kProtocolMagic) {
++    if (!received_fds.empty() ||
++        received != static_cast<ssize_t>(sizeof(Request))) {
++      CloseFds(received_fds);
++      SendResponse(client_fd, Status::kProtocolError, -1);
++      return true;
++    }
++    Request request = {};
++    memcpy(&request, request_bytes.data(), sizeof(request));
++    if (request.version != kProtocolVersion ||
++        request.size != sizeof(Request)) {
++      SendResponse(client_fd, Status::kProtocolError, -1);
++      return true;
++    }
++    Status status = ValidateStableConfig(request);
++    int process_fd = -1;
++    if (status == Status::kOk) {
++      const int root_fd =
++          open(kStorageRoot, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
++      if (root_fd < 0) {
++        ALOGW("r0dump helper could not open storage root %s: %s", kStorageRoot,
++              strerror(errno));
++        status = Status::kStorageUnavailable;
++      } else {
++        status = PrepareDirectoryTreeAt(
++            root_fd, request, {AID_ROOT, request.target_uid, AID_EXT_DATA_RW},
++            &process_fd);
++        close(root_fd);
++      }
+     }
++    if (status != Status::kOk) {
++      ALOGW("r0dump helper rejected request: status=%d package=%s process=%s "
++            "run_id=%s uid=%u pid=%u generation=%" PRIu64,
++            static_cast<int>(status), request.package_name,
++            request.process_name, request.run_id, request.target_uid,
++            request.target_pid, request.generation);
++    }
++    SendResponse(client_fd, status, process_fd);
++    if (process_fd >= 0)
++      close(process_fd);
++    return true;
+   }
+-  if (status != Status::kOk) {
+-    ALOGW("r0dump helper rejected request: status=%d package=%s process=%s "
+-          "run_id=%s uid=%u pid=%u generation=%" PRIu64,
+-          static_cast<int>(status), request.package_name, request.process_name,
+-          request.run_id, request.target_uid, request.target_pid,
+-          request.generation);
++
++  if (magic == kExportProtocolMagic) {
++    if (received != static_cast<ssize_t>(sizeof(ExportRequest))) {
++      CloseFds(received_fds);
++      ExportSummary summary;
++      summary.detail = "invalid_export_request_size";
++      SendExportResponse(client_fd, Status::kProtocolError, summary);
++      return true;
++    }
++    ExportRequest request = {};
++    memcpy(&request, request_bytes.data(), sizeof(request));
++    std::string_view package_name;
++    if (request.version != kExportProtocolVersion ||
++        request.size != sizeof(ExportRequest) || request.user_id != 0u ||
++        request.requester_uid < 10000u || request.apk_count == 0u ||
++        request.apk_count > kMaxApkCount ||
++        received_fds.size() != request.apk_count ||
++        !ReadFixedString(request.package_name, sizeof(request.package_name),
++                         &package_name) ||
++        !IsValidPackageName(package_name)) {
++      CloseFds(received_fds);
++      ExportSummary summary;
++      summary.detail = "invalid_export_request";
++      SendExportResponse(client_fd, Status::kProtocolError, summary);
++      return true;
++    }
++    if (g_export_in_progress.exchange(true)) {
++      CloseFds(received_fds);
++      ExportSummary summary;
++      summary.detail = "export_busy";
++      SendExportResponse(client_fd, Status::kBusy, summary);
++      return true;
++    }
++    std::thread(RunExport, client_fd, request, std::move(received_fds))
++        .detach();
++    return false;
+   }
+-  SendResponse(client_fd, status, process_fd);
+-  if (process_fd >= 0)
+-    close(process_fd);
++
++  CloseFds(received_fds);
++  SendResponse(client_fd, Status::kProtocolError, -1);
++  return true;
+ }
+ 
+ } // namespace
+@@ -148,7 +305,8 @@ int main() {
+       ALOGE("r0dump helper accept failed: %s", strerror(errno));
+       continue;
+     }
+-    HandleClient(client_fd);
+-    close(client_fd);
++    if (HandleClient(client_fd)) {
++      close(client_fd);
++    }
+   }
+ }
+diff --git a/helper/r0dump_file_helper_protocol.h b/helper/r0dump_file_helper_protocol.h
+index 1bb3bf3..2c642c0 100644
+--- a/helper/r0dump_file_helper_protocol.h
++++ b/helper/r0dump_file_helper_protocol.h
+@@ -8,9 +8,15 @@ namespace r0dump::file_helper {
+ 
+ inline constexpr uint32_t kProtocolMagic = 0x52304648u; // R0FH
+ inline constexpr uint16_t kProtocolVersion = 1u;
++inline constexpr uint32_t kExportProtocolMagic = 0x52304558u; // R0EX
++inline constexpr uint16_t kExportProtocolVersion = 1u;
++inline constexpr uint32_t kExportResponseMagic = 0x52304552u; // R0ER
+ inline constexpr size_t kPackageBytes = 96u;
+ inline constexpr size_t kProcessBytes = 96u;
+ inline constexpr size_t kRunIdBytes = 65u;
++inline constexpr size_t kArchivePathBytes = 256u;
++inline constexpr size_t kSha256Bytes = 65u;
++inline constexpr size_t kExportDetailBytes = 256u;
+ 
+ enum class Status : int32_t {
+   kOk = 0,
+@@ -23,6 +29,10 @@ enum class Status : int32_t {
+   kTimeout = 7,
+   kProtocolError = 8,
+   kInternalError = 9,
++  kNoRuns = 10,
++  kBusy = 11,
++  kRepairFailed = 12,
++  kArchiveFailed = 13,
+ };
+ 
+ #pragma pack(push, 1)
+@@ -45,10 +55,40 @@ struct Response {
+   uint16_t size;
+   int32_t status;
+ };
++
++struct ExportRequest {
++  uint32_t magic;
++  uint16_t version;
++  uint16_t size;
++  uint32_t user_id;
++  uint32_t requester_uid;
++  uint32_t apk_count;
++  char package_name[kPackageBytes];
++};
++
++struct ExportResponse {
++  uint32_t magic;
++  uint16_t version;
++  uint16_t size;
++  int32_t status;
++  uint32_t remote_artifact_count;
++  uint32_t record_count;
++  uint32_t verified;
++  uint32_t repaired;
++  uint32_t partial;
++  uint32_t usable_outputs;
++  uint32_t codeitems_backfilled;
++  char run_id[kRunIdBytes];
++  char archive_path[kArchivePathBytes];
++  char sha256[kSha256Bytes];
++  char detail[kExportDetailBytes];
++};
+ #pragma pack(pop)
+ 
+ static_assert(sizeof(Request) == 285u);
+ static_assert(sizeof(Response) == 12u);
++static_assert(sizeof(ExportRequest) == 116u);
++static_assert(sizeof(ExportResponse) == 682u);
+ 
+ } // namespace r0dump::file_helper
+ 
+diff --git a/helper/r0dump_file_helper_test.cpp b/helper/r0dump_file_helper_test.cpp
+index e298523..4fdb665 100644
+--- a/helper/r0dump_file_helper_test.cpp
++++ b/helper/r0dump_file_helper_test.cpp
+@@ -1,12 +1,16 @@
++#include "r0dump_export_core.h"
+ #include "r0dump_file_helper_core.h"
+ 
+ #include <fcntl.h>
+ #include <gtest/gtest.h>
+ #include <sys/stat.h>
+ #include <unistd.h>
++#include <ziparchive/zip_archive.h>
++#include <ziparchive/zip_writer.h>
+ 
+ #include <cstring>
+ #include <filesystem>
++#include <fstream>
+ #include <string>
+ 
+ namespace r0dump::file_helper {
+@@ -141,5 +145,68 @@ TEST_F(HelperTest, RejectsPathLikeRunId) {
+             Status::kProtocolError);
+ }
+ 
++TEST_F(HelperTest, ExportLatestPackagesRepairReportApkAndManifest) {
++  const std::string process =
++      root_ + "/Android/data/com.example.target/files/r0dump-fusion/runs/"
++              "run-1/process-1234";
++  std::filesystem::create_directories(process + "/artifacts");
++  std::filesystem::create_directories(process + "/records");
++  std::ofstream(process + "/session.json") << "{}\n";
++  std::ofstream(process + "/artifacts/bad.dex", std::ios::binary)
++      << "not-a-dex";
++  std::ofstream(process + "/records/000001.json")
++      << R"({"capture_kind":"dexfile","artifact_relative_path":"artifacts/bad.dex","site":"test","capture_point_name":"test.point"})"
++      << "\n";
++
++  const std::string apk = root_ + "/base.apk";
++  FILE *apk_file = fopen(apk.c_str(), "wb");
++  ASSERT_NE(apk_file, nullptr);
++  ZipWriter writer(apk_file);
++  ASSERT_EQ(writer.StartEntry("AndroidManifest.xml", 0), 0);
++  constexpr char manifest[] = "binary-manifest-test";
++  ASSERT_EQ(writer.WriteBytes(manifest, sizeof(manifest) - 1u), 0);
++  ASSERT_EQ(writer.FinishEntry(), 0);
++  ASSERT_EQ(writer.Finish(), 0);
++  ASSERT_EQ(fclose(apk_file), 0);
++  const int apk_fd = open(apk.c_str(), O_RDONLY | O_CLOEXEC);
++  ASSERT_GE(apk_fd, 0);
++
++  ExportSummary summary;
++  EXPECT_EQ(ExportLatest(root_, root_ + "/Downloads", "com.example.target",
++                         {apk_fd}, &summary),
++            Status::kOk);
++  close(apk_fd);
++  EXPECT_EQ(summary.run_id, "run-1");
++  EXPECT_EQ(summary.remote_artifact_count, 1u);
++  EXPECT_EQ(summary.record_count, 1u);
++  EXPECT_EQ(summary.partial, 1u);
++  EXPECT_TRUE(std::filesystem::is_regular_file(summary.archive_path));
++  EXPECT_TRUE(
++      std::filesystem::is_regular_file(summary.archive_path + ".sha256"));
++
++  ZipArchiveHandle archive = nullptr;
++  ASSERT_EQ(OpenArchive(summary.archive_path.c_str(), &archive), 0);
++  ZipEntry manifest_entry;
++  EXPECT_EQ(FindEntry(archive,
++                      "com.example.target/run-1/manifest/AndroidManifest.xml",
++                      &manifest_entry),
++            0);
++  ZipEntry report_entry;
++  EXPECT_EQ(FindEntry(archive,
++                      "com.example.target/run-1/process-1234/host-repair/"
++                      "report.json",
++                      &report_entry),
++            0);
++  CloseArchive(archive);
++}
++
++TEST_F(HelperTest, ExportLatestRejectsPackageWithoutCapturedRun) {
++  ExportSummary summary;
++  EXPECT_EQ(ExportLatest(root_, root_ + "/Downloads", "com.example.target",
++                         {STDIN_FILENO}, &summary),
++            Status::kNoRuns);
++  EXPECT_EQ(summary.detail, "no_run_with_artifacts");
++}
++
+ } // namespace
+ } // namespace r0dump::file_helper
+diff --git a/privapp-permissions-com.android.r0dumpmanager.xml b/privapp-permissions-com.android.r0dumpmanager.xml
+index 5f518c3..cc0dca9 100644
+--- a/privapp-permissions-com.android.r0dumpmanager.xml
++++ b/privapp-permissions-com.android.r0dumpmanager.xml
+@@ -2,5 +2,6 @@
+ <permissions>
+     <privapp-permissions package="com.android.r0dumpmanager">
+         <permission name="android.permission.FORCE_STOP_PACKAGES" />
++        <permission name="android.permission.MANAGE_R0DUMP_EXPORT" />
+     </privapp-permissions>
+ </permissions>
+diff --git a/res/values-zh-rCN/strings.xml b/res/values-zh-rCN/strings.xml
+index 151725c..2ec618e 100644
+--- a/res/values-zh-rCN/strings.xml
++++ b/res/values-zh-rCN/strings.xml
+@@ -51,6 +51,15 @@
+     <string name="clear_search">清除搜索</string>
+     <string name="no_app_results">没有匹配的应用</string>
+     <string name="target_package">目标包名</string>
++    <string name="artifact_export_title">产物导出</string>
++    <string name="artifact_export_detail">由 root helper 修复最新捕获记录，并在 /sdcard/Downloads/r0dump-exports 中生成 ZIP 和 SHA-256 校验文件。</string>
++    <string name="artifact_export_action">修复并导出最新产物</string>
++    <string name="artifact_exporting">正在修复并导出…</string>
++    <string name="artifact_export_summary">%1$d 条已验证，%2$d 条已修复，%3$d 条部分可用，已回填 %4$d 条 CodeItem</string>
++    <string name="artifact_export_includes">包含 base/split APK 和提取的 AndroidManifest.xml，便于 JADX 分析。</string>
++    <string name="export_select_package">请先选择要导出的应用。</string>
++    <string name="export_completed">导出完成：%1$s</string>
++    <string name="export_failed">导出失败：%1$s</string>
+     <string name="target_process">目标进程</string>
+     <string name="process_mode">进程模式</string>
+     <string name="process_mode_main">主进程</string>
+diff --git a/res/values/strings.xml b/res/values/strings.xml
+index 5a3b450..c19d792 100644
+--- a/res/values/strings.xml
++++ b/res/values/strings.xml
+@@ -51,6 +51,15 @@
+     <string name="clear_search">Clear search</string>
+     <string name="no_app_results">No matching applications</string>
+     <string name="target_package">Target package</string>
++    <string name="artifact_export_title">Artifact export</string>
++    <string name="artifact_export_detail">Repair the newest captured run through the root helper, then create a ZIP and SHA-256 file in /sdcard/Downloads/r0dump-exports.</string>
++    <string name="artifact_export_action">Repair and export latest run</string>
++    <string name="artifact_exporting">Repairing and exporting…</string>
++    <string name="artifact_export_summary">%1$d verified, %2$d repaired, %3$d partial, %4$d CodeItems backfilled</string>
++    <string name="artifact_export_includes">Includes base/split APKs and extracted AndroidManifest.xml files for JADX.</string>
++    <string name="export_select_package">Select an application before exporting.</string>
++    <string name="export_completed">Export complete: %1$s</string>
++    <string name="export_failed">Export failed: %1$s</string>
+     <string name="target_process">Target process</string>
+     <string name="process_mode">Process mode</string>
+     <string name="process_mode_main">Main</string>
+diff --git a/src/com/android/r0dumpmanager/app/R0dumpManagerViewModel.kt b/src/com/android/r0dumpmanager/app/R0dumpManagerViewModel.kt
+index 3cb0d71..fcf34ee 100644
+--- a/src/com/android/r0dumpmanager/app/R0dumpManagerViewModel.kt
++++ b/src/com/android/r0dumpmanager/app/R0dumpManagerViewModel.kt
+@@ -12,6 +12,8 @@ import com.android.r0dumpmanager.data.audit.MutationAuditEntry
+ import com.android.r0dumpmanager.data.audit.MutationAuditLog
+ import com.android.r0dumpmanager.data.draft.DraftStateStore
+ import com.android.r0dumpmanager.data.draft.SavedFusionDraft
++import com.android.r0dumpmanager.data.export.ArtifactExportRepository
++import com.android.r0dumpmanager.data.export.ArtifactExportResult
+ import com.android.r0dumpmanager.data.packageinfo.PackageRepository
+ import com.android.r0dumpmanager.data.packageinfo.TargetApplication
+ import com.android.r0dumpmanager.data.property.FusionDeviceSnapshot
+@@ -38,7 +40,7 @@ import java.time.Instant
+ import java.time.ZoneOffset
+ import java.time.format.DateTimeFormatter
+ 
+-sealed interface MutationOperation { data object Idle : MutationOperation; data object Publishing : MutationOperation; data class Failed(val reason: String) : MutationOperation }
++sealed interface MutationOperation { data object Idle : MutationOperation; data object Publishing : MutationOperation; data object Exporting : MutationOperation; data class Failed(val reason: String) : MutationOperation }
+ private fun validateForUi(draft: FusionConfigDraft): FusionValidationResult = FusionValidationResult(
+     FusionConfigValidator.validate(draft, true).errors - "run_id",
+ )
+@@ -50,13 +52,14 @@ data class R0dumpUiState(
+     val isForeground: Boolean = false, val isDeviceSecure: Boolean = false, val operation: MutationOperation = MutationOperation.Idle,
+     val message: String? = null, val messageSerial: Long = 0,
+     val draftNoticeSerial: Long = 0, val draftNoticeShown: Boolean = false,
++    val lastExport: ArtifactExportResult? = null,
+ ) {
+     val isInterrupted get() = deviceSnapshot is FusionDeviceSnapshot.Interrupted
+     val canEdit get() = isOwnerUser && isDeviceSecure && deviceSnapshot !is FusionDeviceSnapshot.Interrupted &&
+         deviceSnapshot !is FusionDeviceSnapshot.ConcurrentChange && deviceSnapshot !is FusionDeviceSnapshot.Invalid &&
+-        operation !is MutationOperation.Publishing
++        operation is MutationOperation.Idle
+     val canMutate get() = isOwnerUser && isDeviceSecure && isForeground &&
+-        authentication is AuthenticationState.ValidUntil && operation !is MutationOperation.Publishing
++        authentication is AuthenticationState.ValidUntil && operation is MutationOperation.Idle
+     val isDirty get() = draft != deviceSnapshot.draftOrNull()
+     val maskText get() = FusionConfigSchema.maskText(draft.capturePointMask)
+ }
+@@ -84,6 +87,7 @@ interface R0dumpManagerDependencies {
+     fun loadInstalledApplications(): List<TargetApplication>
+     fun launch(packageName: String): Result<Unit>
+     suspend fun forceStopAndWait(packageName: String): Result<Unit>
++    suspend fun exportLatest(packageName: String): ArtifactExportResult
+     fun savePersistedDraft(draft: FusionConfigDraft, generation: Long, profile: ProfileId)
+     fun restorePersistedDraft(generation: Long): SavedFusionDraft?
+     fun clearPersistedDraft()
+@@ -99,6 +103,7 @@ private class AndroidR0dumpManagerDependencies(application: Application) : R0dum
+     private val drafts = DraftStateStore(application)
+     private val audit = MutationAuditLog(application)
+     private val notifier = ActiveSessionNotifier(application)
++    private val exports = ArtifactExportRepository()
+     private val keyguard = application.getSystemService(KeyguardManager::class.java)
+ 
+     override suspend fun readSnapshot() = properties.read()
+@@ -108,6 +113,7 @@ private class AndroidR0dumpManagerDependencies(application: Application) : R0dum
+     override fun loadInstalledApplications() = packages.loadInstalledApplications()
+     override fun launch(packageName: String) = packages.launch(packageName)
+     override suspend fun forceStopAndWait(packageName: String) = packages.forceStopAndWait(packageName)
++    override suspend fun exportLatest(packageName: String) = exports.exportLatest(packageName)
+     override fun savePersistedDraft(draft: FusionConfigDraft, generation: Long, profile: ProfileId) = drafts.save(draft, generation, profile)
+     override fun restorePersistedDraft(generation: Long) = drafts.restore(generation)
+     override fun clearPersistedDraft() = drafts.clear()
+@@ -204,6 +210,52 @@ class R0dumpManagerViewModel(
+     fun disableNewProcesses() = disable(MutationAction.DISABLE, false)
+     fun endSession() = disable(MutationAction.END_SESSION, true)
+     fun recoverInterrupted() = execute(MutationAction.RECOVER) { require(_uiState.value.deviceSnapshot is FusionDeviceSnapshot.Interrupted); dependencies.recoverInterrupted() }
++    fun exportLatest() {
++        val state = _uiState.value
++        val packageName = state.draft.targetPackage
++        if (packageName.isBlank()) return failure(text(R.string.export_select_package))
++        if (!_uiState.value.isOwnerUser) return failure(text(R.string.error_owner_only))
++        if (!dependencies.isDeviceSecure()) {
++            setDeviceSecure(false)
++            return failure(text(R.string.error_device_credential_required))
++        }
++        if (!_uiState.value.isForeground) return failure(text(R.string.error_foreground_required))
++        if (!authenticator.isAuthenticated()) return failure(text(R.string.error_authentication_required))
++        if (!inFlight.compareAndSet(false, true)) return
++        _uiState.update { it.copy(operation = MutationOperation.Exporting, lastExport = null) }
++        viewModelScope.launch(ioDispatcher) {
++            runCatching { dependencies.exportLatest(packageName) }.onSuccess { result ->
++                dependencies.appendAudit(
++                    MutationAuditEntry(
++                        System.currentTimeMillis(),
++                        MutationAction.EXPORT,
++                        packageName,
++                        _uiState.value.deviceSnapshot.generationOrNull(),
++                        true,
++                    ),
++                )
++                _uiState.update {
++                    it.copy(
++                        operation = MutationOperation.Idle,
++                        authentication = authenticator.state(),
++                        lastExport = result,
++                    ).message(text(R.string.export_completed, result.archivePath))
++                }
++            }.onFailure { error ->
++                dependencies.appendAudit(
++                    MutationAuditEntry(
++                        System.currentTimeMillis(),
++                        MutationAction.EXPORT,
++                        packageName,
++                        _uiState.value.deviceSnapshot.generationOrNull(),
++                        false,
++                    ),
++                )
++                failure(text(R.string.export_failed, error.message ?: error.javaClass.simpleName))
++            }
++            inFlight.set(false)
++        }
++    }
+     private fun mutate(action: MutationAction, launch: Boolean) = execute(action) {
+         val state = _uiState.value
+         val draft = state.draft.copy(
+diff --git a/src/com/android/r0dumpmanager/data/audit/MutationAuditLog.kt b/src/com/android/r0dumpmanager/data/audit/MutationAuditLog.kt
+index 4d3b372..18e43dd 100644
+--- a/src/com/android/r0dumpmanager/data/audit/MutationAuditLog.kt
++++ b/src/com/android/r0dumpmanager/data/audit/MutationAuditLog.kt
+@@ -4,7 +4,7 @@ import android.content.Context
+ import org.json.JSONObject
+ import java.io.File
+ 
+-enum class MutationAction { PUBLISH, PUBLISH_AND_LAUNCH, DISABLE, END_SESSION, RECOVER }
++enum class MutationAction { PUBLISH, PUBLISH_AND_LAUNCH, DISABLE, END_SESSION, RECOVER, EXPORT }
+ data class MutationAuditEntry(val timestampMillis: Long, val action: MutationAction, val targetPackage: String?, val generation: Long?, val succeeded: Boolean)
+ 
+ /** Bounded, private audit log. Deliberately excludes the force selector and property values. */
+diff --git a/src/com/android/r0dumpmanager/data/export/ArtifactExportRepository.kt b/src/com/android/r0dumpmanager/data/export/ArtifactExportRepository.kt
+new file mode 100644
+index 0000000..90b7314
+--- /dev/null
++++ b/src/com/android/r0dumpmanager/data/export/ArtifactExportRepository.kt
+@@ -0,0 +1,109 @@
++package com.android.r0dumpmanager.data.export
++
++import android.app.ActivityManager
++import android.os.ParcelFileDescriptor
++import java.io.EOFException
++import java.io.IOException
++import java.nio.ByteBuffer
++import java.nio.ByteOrder
++import java.nio.charset.StandardCharsets
++
++data class ArtifactExportResult(
++    val runId: String,
++    val archivePath: String,
++    val sha256: String,
++    val remoteArtifactCount: Int,
++    val recordCount: Int,
++    val verified: Int,
++    val repaired: Int,
++    val partial: Int,
++    val usableOutputs: Int,
++    val codeItemsBackfilled: Int,
++)
++
++class ArtifactExportException(
++    val status: Int,
++    val detail: String,
++) : IOException("artifact export failed: status=$status detail=$detail")
++
++class ArtifactExportRepository {
++    fun exportLatest(packageName: String): ArtifactExportResult {
++        val descriptor = ActivityManager.getService().r0dump_exportLatest(packageName)
++            ?: throw ArtifactExportException(STATUS_INTERNAL_ERROR, "request_rejected")
++        return descriptor.use(::readResponse)
++    }
++
++    private fun readResponse(descriptor: ParcelFileDescriptor): ArtifactExportResult {
++        val bytes = ByteArray(RESPONSE_BYTES)
++        ParcelFileDescriptor.AutoCloseInputStream(descriptor).use { input ->
++            var offset = 0
++            while (offset < bytes.size) {
++                val read = input.read(bytes, offset, bytes.size - offset)
++                if (read < 0) throw EOFException("short helper response")
++                offset += read
++            }
++        }
++        return decodeResponse(bytes)
++    }
++
++    companion object {
++        private const val RESPONSE_MAGIC = 0x52304552
++        private const val RESPONSE_VERSION: Short = 1
++        private const val RESPONSE_BYTES = 682
++        private const val RUN_ID_BYTES = 65
++        private const val ARCHIVE_PATH_BYTES = 256
++        private const val SHA256_BYTES = 65
++        private const val DETAIL_BYTES = 256
++        private const val STATUS_OK = 0
++        private const val STATUS_INTERNAL_ERROR = 9
++
++        fun decodeResponse(bytes: ByteArray): ArtifactExportResult {
++            require(bytes.size == RESPONSE_BYTES) { "invalid helper response size" }
++            val buffer = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
++            require(buffer.int == RESPONSE_MAGIC) { "invalid helper response magic" }
++            require(buffer.short == RESPONSE_VERSION) { "invalid helper response version" }
++            require((buffer.short.toInt() and 0xffff) == RESPONSE_BYTES) {
++                "invalid helper response layout"
++            }
++            val status = buffer.int
++            val remoteArtifactCount = buffer.int
++            val recordCount = buffer.int
++            val verified = buffer.int
++            val repaired = buffer.int
++            val partial = buffer.int
++            val usableOutputs = buffer.int
++            val codeItemsBackfilled = buffer.int
++            val runId = buffer.fixedString(RUN_ID_BYTES)
++            val archivePath = buffer.fixedString(ARCHIVE_PATH_BYTES)
++            val sha256 = buffer.fixedString(SHA256_BYTES)
++            val detail = buffer.fixedString(DETAIL_BYTES)
++            if (status != STATUS_OK) throw ArtifactExportException(status, detail)
++            require(runId.isNotBlank() && archivePath.isNotBlank() && sha256.length == 64) {
++                "incomplete helper success response"
++            }
++            return ArtifactExportResult(
++                runId = runId,
++                archivePath = archivePath,
++                sha256 = sha256,
++                remoteArtifactCount = remoteArtifactCount,
++                recordCount = recordCount,
++                verified = verified,
++                repaired = repaired,
++                partial = partial,
++                usableOutputs = usableOutputs,
++                codeItemsBackfilled = codeItemsBackfilled,
++            )
++        }
++
++        private fun ByteBuffer.fixedString(size: Int): String {
++            val bytes = ByteArray(size)
++            get(bytes)
++            val terminator = bytes.indexOf(0)
++            require(terminator >= 0) { "unterminated helper response field" }
++            require(bytes.drop(terminator + 1).all { it == 0.toByte() }) {
++                "non-zero helper response padding"
++            }
++            return String(bytes, 0, terminator, StandardCharsets.UTF_8)
++        }
++    }
++}
+diff --git a/src/com/android/r0dumpmanager/ui/R0dumpManagerScreen.kt b/src/com/android/r0dumpmanager/ui/R0dumpManagerScreen.kt
+index 31d09cc..4a906ba 100644
+--- a/src/com/android/r0dumpmanager/ui/R0dumpManagerScreen.kt
++++ b/src/com/android/r0dumpmanager/ui/R0dumpManagerScreen.kt
+@@ -43,6 +43,7 @@ import androidx.compose.material.icons.filled.Checklist
+ import androidx.compose.material.icons.filled.Close
+ import androidx.compose.material.icons.filled.DataUsage
+ import androidx.compose.material.icons.filled.Apps
++import androidx.compose.material.icons.filled.Archive
+ import androidx.compose.material.icons.filled.ErrorOutline
+ import androidx.compose.material.icons.filled.ExpandLess
+ import androidx.compose.material.icons.filled.ExpandMore
+@@ -70,6 +71,7 @@ import androidx.compose.material3.ExposedDropdownMenuDefaults
+ import androidx.compose.material3.Icon
+ import androidx.compose.material3.IconButton
+ import androidx.compose.material3.HorizontalFloatingToolbar
++import androidx.compose.material3.HorizontalDivider
+ import androidx.compose.material3.LinearProgressIndicator
+ import androidx.compose.material3.LoadingIndicator
+ import androidx.compose.material3.MaterialTheme
+@@ -267,10 +269,11 @@ fun R0dumpManagerScreen(
+                             isDeviceSecure,
+                             compact,
+                             uiStateStore,
++                            onAuthenticate,
+                         )
+                     }
+                 } else {
+-                    DestinationContent(destination, state, viewModel, Modifier.weight(1f), isDeviceSecure, compact, uiStateStore)
++                    DestinationContent(destination, state, viewModel, Modifier.weight(1f), isDeviceSecure, compact, uiStateStore, onAuthenticate)
+                 }
+                 if (!compact && shouldShowActionToolbar(state)) {
+                     FusionActionToolbar(
+@@ -466,9 +469,10 @@ private fun DestinationContent(
+     isDeviceSecure: Boolean,
+     compact: Boolean,
+     uiStateStore: UiStateStore,
++    onAuthenticate: ((() -> Unit) -> Unit),
+ ) {
+     when (destination) {
+-        Destination.APPLICATION -> ApplicationScreen(state, viewModel, modifier, isDeviceSecure, compact)
++        Destination.APPLICATION -> ApplicationScreen(state, viewModel, modifier, isDeviceSecure, compact, onAuthenticate)
+         Destination.CAPTURE -> CaptureScreen(state, viewModel, modifier, uiStateStore)
+         Destination.LIMITS -> LimitsScreen(state, viewModel, modifier, uiStateStore)
+         Destination.ADVANCED -> AdvancedScreen(state, viewModel, modifier, uiStateStore)
+@@ -596,6 +600,7 @@ private fun ApplicationScreen(
+     modifier: Modifier,
+     isDeviceSecure: Boolean,
+     compact: Boolean,
++    onAuthenticate: ((() -> Unit) -> Unit),
+ ) {
+     var query by rememberSaveable { mutableStateOf("") }
+     var searchExpanded by rememberSaveable { mutableStateOf(false) }
+@@ -656,6 +661,7 @@ private fun ApplicationScreen(
+                     }
+                 }
+             }
++            ArtifactExportSection(state, viewModel, onAuthenticate)
+         }
+         if (searchExpanded) {
+             ApplicationSearchBar(
+@@ -685,6 +691,61 @@ private fun ApplicationScreen(
+     }
+ }
+ 
++@Composable
++private fun ArtifactExportSection(
++    state: R0dumpUiState,
++    viewModel: R0dumpManagerViewModel,
++    onAuthenticate: ((() -> Unit) -> Unit),
++) {
++    val exporting = state.operation is MutationOperation.Exporting
++    val startExport = { viewModel.exportLatest() }
++    HorizontalDivider(Modifier.padding(vertical = 8.dp))
++    Text(stringResource(R.string.artifact_export_title), style = MaterialTheme.typography.titleMedium)
++    Text(
++        stringResource(R.string.artifact_export_detail),
++        style = MaterialTheme.typography.bodyMedium,
++        color = MaterialTheme.colorScheme.onSurfaceVariant,
++    )
++    Button(
++        onClick = {
++            if (state.canMutate) startExport() else onAuthenticate(startExport)
++        },
++        modifier = Modifier.fillMaxWidth(),
++        enabled = state.isOwnerUser && state.isDeviceSecure &&
++            state.draft.targetPackage.isNotBlank() && state.operation is MutationOperation.Idle,
++    ) {
++        if (exporting) {
++            CircularProgressIndicator(Modifier.size(24.dp), strokeWidth = 2.dp)
++        } else {
++            Icon(Icons.Default.Archive, null)
++        }
++        Spacer(Modifier.width(8.dp))
++        Text(stringResource(if (exporting) R.string.artifact_exporting else R.string.artifact_export_action))
++    }
++    state.lastExport?.let { result ->
++        Text(
++            stringResource(
++                R.string.artifact_export_summary,
++                result.verified,
++                result.repaired,
++                result.partial,
++                result.codeItemsBackfilled,
++            ),
++            style = MaterialTheme.typography.bodyMedium,
++        )
++        Text(
++            result.archivePath,
++            style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
++            color = MaterialTheme.colorScheme.onSurfaceVariant,
++        )
++        Text(
++            stringResource(R.string.artifact_export_includes),
++            style = MaterialTheme.typography.bodySmall,
++            color = MaterialTheme.colorScheme.onSurfaceVariant,
++        )
++    }
++}
++
+ @OptIn(ExperimentalMaterial3Api::class)
+ @Composable
+ private fun ApplicationSearchBar(
+diff --git a/tests/src/com/android/r0dumpmanager/app/R0dumpManagerViewModelTest.kt b/tests/src/com/android/r0dumpmanager/app/R0dumpManagerViewModelTest.kt
+index c38705e..9eacabe 100644
+--- a/tests/src/com/android/r0dumpmanager/app/R0dumpManagerViewModelTest.kt
++++ b/tests/src/com/android/r0dumpmanager/app/R0dumpManagerViewModelTest.kt
+@@ -5,6 +5,7 @@ import androidx.lifecycle.SavedStateHandle
+ import androidx.test.platform.app.InstrumentationRegistry
+ import com.android.r0dumpmanager.data.audit.MutationAuditEntry
+ import com.android.r0dumpmanager.data.draft.SavedFusionDraft
++import com.android.r0dumpmanager.data.export.ArtifactExportResult
+ import com.android.r0dumpmanager.data.packageinfo.TargetApplication
+ import com.android.r0dumpmanager.data.property.FusionDeviceSnapshot
+ import com.android.r0dumpmanager.domain.FusionConfigDraft
+@@ -213,6 +214,18 @@ class R0dumpManagerViewModelTest {
+         assertEquals(ProfileId.DEFAULTS, viewModel.uiState.value.selectedProfile)
+     }
+ 
++    @Test
++    fun exportLatestUsesSelectedPackageAndPublishesHelperResult() {
++        val dependencies = FakeDependencies()
++        val viewModel = configuredViewModel(dependencies)
++
++        viewModel.exportLatest()
++
++        assertEquals(listOf("export:com.example.target"), dependencies.exportEvents)
++        assertEquals("/sdcard/Downloads/r0dump-exports/com.example.target/run-1.zip", viewModel.uiState.value.lastExport?.archivePath)
++        assertEquals(MutationOperation.Idle, viewModel.uiState.value.operation)
++    }
++
+     private fun configuredViewModel(dependencies: FakeDependencies): R0dumpManagerViewModel {
+         val viewModel = R0dumpManagerViewModel(
+             application = application,
+@@ -252,6 +265,7 @@ private class FakeDependencies : R0dumpManagerDependencies {
+     var forceStopFailure: Throwable? = null
+     var publishGate: CompletableDeferred<Unit>? = null
+     val events = mutableListOf<String>()
++    val exportEvents = mutableListOf<String>()
+     private var persistedDraft: SavedFusionDraft? = null
+ 
+     override suspend fun readSnapshot() = snapshot
+@@ -294,6 +308,21 @@ private class FakeDependencies : R0dumpManagerDependencies {
+         events += "stop:$packageName"
+         return forceStopFailure?.let(Result.Companion::failure) ?: Result.success(Unit)
+     }
++    override suspend fun exportLatest(packageName: String): ArtifactExportResult {
++        exportEvents += "export:$packageName"
++        return ArtifactExportResult(
++            runId = "run-1",
++            archivePath = "/sdcard/Downloads/r0dump-exports/$packageName/run-1.zip",
++            sha256 = "a".repeat(64),
++            remoteArtifactCount = 3,
++            recordCount = 3,
++            verified = 1,
++            repaired = 1,
++            partial = 1,
++            usableOutputs = 2,
++            codeItemsBackfilled = 1,
++        )
++    }
+     override fun savePersistedDraft(draft: FusionConfigDraft, generation: Long, profile: ProfileId) {
+         persistedDraft = SavedFusionDraft(draft, generation, profile)
+     }
+diff --git a/tests/src/com/android/r0dumpmanager/data/export/ArtifactExportRepositoryTest.kt b/tests/src/com/android/r0dumpmanager/data/export/ArtifactExportRepositoryTest.kt
+new file mode 100644
+index 0000000..57018a6
+--- /dev/null
++++ b/tests/src/com/android/r0dumpmanager/data/export/ArtifactExportRepositoryTest.kt
+@@ -0,0 +1,52 @@
++package com.android.r0dumpmanager.data.export
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertThrows
++import org.junit.Test
++import java.nio.ByteBuffer
++import java.nio.ByteOrder
++import java.nio.charset.StandardCharsets
++
++class ArtifactExportRepositoryTest {
++    @Test
++    fun decodeResponseReadsStableHelperLayout() {
++        val bytes = response(status = 0, detail = "ok")
++
++        val result = ArtifactExportRepository.decodeResponse(bytes)
++
++        assertEquals("run-1", result.runId)
++        assertEquals("/sdcard/Downloads/r0dump-exports/com.example/run-1.zip", result.archivePath)
++        assertEquals(9, result.remoteArtifactCount)
++        assertEquals(2, result.codeItemsBackfilled)
++    }
++
++    @Test
++    fun decodeResponsePreservesHelperFailureDetail() {
++        val error = assertThrows(ArtifactExportException::class.java) {
++            ArtifactExportRepository.decodeResponse(response(status = 10, detail = "no_run_with_artifacts"))
++        }
++
++        assertEquals(10, error.status)
++        assertEquals("no_run_with_artifacts", error.detail)
++    }
++
++    private fun response(status: Int, detail: String): ByteArray {
++        val buffer = ByteBuffer.allocate(682).order(ByteOrder.LITTLE_ENDIAN)
++        buffer.putInt(0x52304552)
++        buffer.putShort(1.toShort())
++        buffer.putShort(682.toShort())
++        buffer.putInt(status)
++        listOf(9, 12, 7, 3, 2, 8, 2).forEach(buffer::putInt)
++        buffer.putFixed("run-1", 65)
++        buffer.putFixed("/sdcard/Downloads/r0dump-exports/com.example/run-1.zip", 256)
++        buffer.putFixed("a".repeat(64), 65)
++        buffer.putFixed(detail, 256)
++        return buffer.array()
++    }
++
++    private fun ByteBuffer.putFixed(value: String, size: Int) {
++        val bytes = value.toByteArray(StandardCharsets.UTF_8)
++        put(bytes)
++        position(position() + size - bytes.size)
++    }
++}
+diff --git a/tools/deploy_userdebug.sh b/tools/deploy_userdebug.sh
+index 2df7127..31bd72a 100755
+--- a/tools/deploy_userdebug.sh
++++ b/tools/deploy_userdebug.sh
+@@ -54,6 +54,7 @@ push_system_file() {
+ apk="$OUT_DIR/system/priv-app/R0dumpManager/R0dumpManager.apk"
+ privapp="$OUT_DIR/system/etc/permissions/privapp-permissions-com.android.r0dumpmanager.xml"
+ framework="$OUT_DIR/system/framework/framework.jar"
++framework_res="$OUT_DIR/system/framework/framework-res.apk"
+ services="$OUT_DIR/system/framework/services.jar"
+ art_apex="$OUT_DIR/system/apex/com.android.art.capex"
+ file_helper="$OUT_DIR/system/bin/r0dump_file_helper"
+@@ -94,6 +95,7 @@ require_file "$apk"
+ require_file "$privapp"
+ if [[ "$WITH_FRAMEWORK" -eq 1 ]]; then
+   require_file "$framework"
++  require_file "$framework_res"
+   require_file "$services"
+ fi
+ if [[ "$WITH_ART" -eq 1 ]]; then
+@@ -148,6 +150,7 @@ push_system_file "$privapp" /system/etc/permissions/privapp-permissions-com.andr
+ 
+ if [[ "$WITH_FRAMEWORK" -eq 1 ]]; then
+   push_system_file "$framework" /system/framework/framework.jar
++  push_system_file "$framework_res" /system/framework/framework-res.apk
+   push_system_file "$services" /system/framework/services.jar
+ fi
+ 
+diff --git a/tools/validate_source_contracts.sh b/tools/validate_source_contracts.sh
+index 1874795..f101b21 100755
+--- a/tools/validate_source_contracts.sh
++++ b/tools/validate_source_contracts.sh
+@@ -41,6 +41,11 @@ property_te = read(root / "system/sepolicy/private/property.te")
+ property_contexts = read(root / "system/sepolicy/private/property_contexts")
+ seapp_contexts = read(root / "system/sepolicy/private/seapp_contexts")
+ manager_te = read(root / "system/sepolicy/private/r0dump_manager_app.te")
++helper_te = read(root / "system/sepolicy/private/r0dump_file_helper.te")
++helper_protocol = read(app / "helper/r0dump_file_helper_protocol.h")
++helper_export = read(app / "helper/r0dump_export_core.cpp")
++export_repository = read(app / "src/com/android/r0dumpmanager/data/export/ArtifactExportRepository.kt")
++activity_manager = read(root / "frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java")
+ 
+ field_block = re.search(r"private static final Set<String> FIELDS\s*=\s*Set\.of\((.*?)\);", framework, re.S)
+ framework_fields = re.findall(r'"([a-z0-9_]+)"', field_block.group(1)) if field_block else []
+@@ -85,7 +90,7 @@ for required in (
+ for required in ("SystemProperties.get", "r0dump_writePersistedForManager", "Mutex", "readStable"):
+     if required not in repository:
+         errors.append(f"property repository contract missing: {required}")
+-for required in ("publishAndLaunch", "endSession", "recoverInterrupted", "restoreDefaults", "restoreDefaultBudgets", "MutationAuthenticator"):
++for required in ("publishAndLaunch", "endSession", "recoverInterrupted", "restoreDefaults", "restoreDefaultBudgets", "exportLatest", "MutationAuthenticator"):
+     if required not in view_model:
+         errors.append(f"ViewModel workflow missing: {required}")
+ for required in ("SavedStateHandle", "DRAFT_PROFILE_KEY", "createRunId", "activeTarget"):
+@@ -115,15 +120,17 @@ uses = {node.attrib.get(android_name, "") for node in manifest.findall("uses-per
+ required_permissions = {
+     "android.permission.QUERY_ALL_PACKAGES", "android.permission.FORCE_STOP_PACKAGES",
+     "android.permission.USE_BIOMETRIC", "android.permission.RECEIVE_BOOT_COMPLETED",
+-    "android.permission.POST_NOTIFICATIONS",
++    "android.permission.POST_NOTIFICATIONS", "android.permission.MANAGE_R0DUMP_EXPORT",
+ }
+ if not required_permissions.issubset(uses):
+     errors.append(f"Manifest permissions missing: {sorted(required_permissions - uses)}")
+ for forbidden in ("android.permission.MANAGE_R0DUMP", "android.permission.MANAGE_EXTERNAL_STORAGE", "android.permission.READ_LOGS"):
+-    if forbidden in uses or forbidden in privapp:
++    if forbidden in uses or f'name="{forbidden}"' in privapp:
+         errors.append(f"obsolete/excess permission remains: {forbidden}")
+ if "android.permission.FORCE_STOP_PACKAGES" not in privapp:
+     errors.append("privapp allowlist must grant FORCE_STOP_PACKAGES")
++if "android.permission.MANAGE_R0DUMP_EXPORT" not in privapp:
++    errors.append("privapp allowlist must grant MANAGE_R0DUMP_EXPORT")
+ if manifest is not None:
+     application = manifest.find("application")
+     if application is None or application.attrib.get(android_locale_config) != "@xml/locales_config":
+@@ -179,6 +186,29 @@ for generic_writer in ("set_prop(platform_app, r0dump_fusion_prop)", "set_prop(p
+     if generic_writer in manager_te:
+         errors.append(f"generic property writer forbidden: {generic_writer}")
+ 
++for required in (
++    "kExportProtocolMagic", "struct ExportRequest", "struct ExportResponse",
++    "kArchivePathBytes", "kSha256Bytes",
++):
++    if required not in helper_protocol:
++        errors.append(f"helper export protocol missing: {required}")
++for required in (
++    'kDownloadsRoot[] = "/mnt/user/0/emulated/0/Downloads"',
++    "RepairProcess", "codeitem_backfill", "AndroidManifest.xml", "CreateZip",
++    "Sha256File", "r0dump-exports",
++):
++    if required not in helper_export and required not in read(app / "helper/r0dump_file_helper.cpp"):
++        errors.append(f"helper repair/export implementation missing: {required}")
++for required in ("r0dump_exportLatest", "MANAGE_R0DUMP_EXPORT", "isUidForeground", "splitSourceDirs"):
++    if required not in activity_manager:
++        errors.append(f"system_server export boundary missing: {required}")
++for required in ("r0dump_exportLatest", "decodeResponse", "ArtifactExportResult"):
++    if required not in export_repository:
++        errors.append(f"Manager export repository missing: {required}")
++for required in ("allow r0dump_file_helper fuse:file create_file_perms", "allow r0dump_file_helper system_server:fd use"):
++    if required not in helper_te:
++        errors.append(f"helper export SELinux contract missing: {required}")
++
+ if errors:
+     print("FAIL: R0dumpManager source contracts", file=sys.stderr)
+     for error in errors:
+-- 
+2.43.0
+

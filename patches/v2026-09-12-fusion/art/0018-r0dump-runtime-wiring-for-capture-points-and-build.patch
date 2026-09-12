@@ -1,0 +1,103 @@
+From f49a7e884d1201187a143209bf8aeee35327c929 Mon Sep 17 00:00:00 2001
+From: Ivory <contact@ivory.cafe>
+Date: Thu, 10 Sep 2026 21:44:54 +0800
+Subject: [PATCH 18/21] r0dump: runtime wiring for capture points and build
+
+Wire the class_linker/art_method observation sites and the
+dalvik.system.r0dump_Runtime native binding into the capture pipeline;
+add the r0dump sources to runtime/Android.bp.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Change-Id: I0db712aab3b92dc60fe0a64de0c6c54482b0690f
+---
+ runtime/Android.bp                            |  1 +
+ runtime/art_method.cc                         |  7 +++++--
+ runtime/class_linker.cc                       | 19 ++++++++-----------
+ .../native/dalvik_system_r0dump_Runtime.cc    |  1 +
+ 4 files changed, 15 insertions(+), 13 deletions(-)
+
+diff --git a/runtime/Android.bp b/runtime/Android.bp
+index 781fa20..dac6630 100644
+--- a/runtime/Android.bp
++++ b/runtime/Android.bp
+@@ -412,6 +412,7 @@ cc_defaults {
+         "r0dump/r0dump_file.cc",
+         "r0dump/r0dump_hook_point.cc",
+         "r0dump/r0dump_log.cc",
++        "r0dump/r0dump_nearby_snapshot.cc",
+         "read_barrier.cc",
+         "reflection.cc",
+         "reflective_handle_scope.cc",
+diff --git a/runtime/art_method.cc b/runtime/art_method.cc
+index 7335a55..86ce9a2 100644
+--- a/runtime/art_method.cc
++++ b/runtime/art_method.cc
+@@ -379,11 +379,14 @@ void ArtMethod::Invoke(Thread* self, uint32_t* args, uint32_t args_size, JValue*
+     return;
+   }
+   if (UNLIKELY(r0dump_IsCapturePointActiveFast(r0dump_Point::kArtMethodInvokeDispatch))) {
+-    r0dump_ObserveMethodCodeItem(
++    r0dump_ObserveMethodCodeItemOrMetadata(
+         r0dump_Point::kArtMethodInvokeDispatch,
+         "ArtMethod.invoke.dispatch",
+         this,
+-        r0dump_CodeItemRole::kArtMethodInvoke);
++        r0dump_CodeItemRole::kArtMethodInvoke,
++        /* attempt_id= */ 0u,
++        "execution",
++        {});
+   }
+ 
+   if (kIsDebugBuild) {
+diff --git a/runtime/class_linker.cc b/runtime/class_linker.cc
+index 806eae7..0ef3305 100644
+--- a/runtime/class_linker.cc
++++ b/runtime/class_linker.cc
+@@ -10442,11 +10442,10 @@ ArtMethod* ClassLinker::ResolveMethodId(uint32_t method_idx,
+     DCHECK(!resolved->IsRuntimeMethod());
+     DCHECK(resolved->GetDeclaringClassUnchecked() != nullptr) << resolved->GetDexMethodIndex();
+     if (UNLIKELY(r0dump_IsCapturePointActive(r0dump_Point::kResolveMethodCacheHit))) {
+-      r0dump_RecordMetadata metadata;
+-      metadata.method_index = method_idx;
+-      metadata.resolve_status = "cache_hit";
+-      r0dump_ObserveMetadata(
+-          r0dump_Point::kResolveMethodCacheHit, "ResolveMethod.cache_hit", std::move(metadata));
++      r0dump_ObserveResolveMethodMetadata(r0dump_Point::kResolveMethodCacheHit,
++                                          "ResolveMethod.cache_hit",
++                                          method_idx,
++                                          "cache_hit");
+     }
+     return resolved;
+   }
+@@ -10461,12 +10460,10 @@ ArtMethod* ClassLinker::ResolveMethodId(uint32_t method_idx,
+       FindResolvedMethod(klass, dex_cache.Get(), class_loader.Get(), method_idx);
+   if (UNLIKELY(r0dump_IsCapturePointActive(r0dump_Point::kResolveMethodLookupSuccess) &&
+                resolved_method != nullptr)) {
+-    r0dump_RecordMetadata metadata;
+-    metadata.method_index = method_idx;
+-    metadata.resolve_status = "lookup_success";
+-    r0dump_ObserveMetadata(r0dump_Point::kResolveMethodLookupSuccess,
+-                           "ResolveMethod.lookup_success",
+-                           std::move(metadata));
++    r0dump_ObserveResolveMethodMetadata(r0dump_Point::kResolveMethodLookupSuccess,
++                                        "ResolveMethod.lookup_success",
++                                        method_idx,
++                                        "lookup_success");
+   }
+   return resolved_method;
+ }
+diff --git a/runtime/native/dalvik_system_r0dump_Runtime.cc b/runtime/native/dalvik_system_r0dump_Runtime.cc
+index 45336fd..dbb411d 100644
+--- a/runtime/native/dalvik_system_r0dump_Runtime.cc
++++ b/runtime/native/dalvik_system_r0dump_Runtime.cc
+@@ -691,6 +691,7 @@ static void r0dump_Runtime_r0dump_CaptureExecutable(JNIEnv* env,
+   prepared.method_name = method->GetNameView();
+   prepared.method_descriptor = method->GetSignature().ToString();
+   prepared.source_kind = r0dump_SourceKind(source_id);
++  r0dump_SetPreparedMethodState(method, "walk_inventory", &prepared);
+   r0dump_SubmitPreparedCodeItem(std::move(prepared));
+   g_r0dump_walk_code_items_captured.fetch_add(1u, std::memory_order_relaxed);
+ }
+-- 
+2.43.0
+

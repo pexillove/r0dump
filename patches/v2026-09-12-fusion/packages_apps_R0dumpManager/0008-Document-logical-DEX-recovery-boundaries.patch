@@ -1,0 +1,48 @@
+From 8713a1892b52bce0d7903056d927a106479500c1 Mon Sep 17 00:00:00 2001
+From: Ivory <contact@ivory.cafe>
+Date: Tue, 1 Sep 2026 22:00:36 +0800
+Subject: [PATCH 08/32] Document logical DEX recovery boundaries
+
+Record the old r0dump runtime-view evidence model and Fusion trust tiers so Manager export behavior is explicit and non-guessing.\n\nConstraint: Manager output must remain actionable while helper/host repair owns reconstruction decisions.\nRejected: Treating class names and CodeItems as a complete DEX | Runtime ID tables and class-data provenance are required for JADX-safe output.\nConfidence: high\nScope-risk: narrow\nDirective: Update this contract before changing artifact trust or rehydration behavior.\nTested: Markdown diff --check.\nNot-tested: Device UI validation and Android build.
+---
+ IMPLEMENTATION.md | 24 ++++++++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+
+diff --git a/IMPLEMENTATION.md b/IMPLEMENTATION.md
+index 1cbc868..c59c0b7 100644
+--- a/IMPLEMENTATION.md
++++ b/IMPLEMENTATION.md
+@@ -1498,6 +1498,30 @@ process 调用既有 `art/tools/r0dump/r0dump_host_repair.py`，在 `process-*/h
+ 同一方法不存在字节冲突时才原位回填，随后重新计算 signature/checksum，输出 `*.codeitem.dex`。CompactDex、
+ 截断 blob、目标缺失/不唯一、长度变化、冲突 code item 或缺少重建输入的 dexdata 明确标记为 partial，不做猜测性重建。
+ 
++#### 旧版完整类恢复方案在 Fusion 中的落地边界
++
++旧版 r0dump 能导出 `com.VCB.ui.*`，关键并不是单独增加一个“按类名 dump”的点位，而是保存了
++ART 仍在内存中的**逻辑 DEX 视图**：`DexFile` 的 identity/location、`data_begin/data_size`、六张 ID
++表的地址与数量、class-def/class-data 以及每个方法的原始 `code_off`。随后主机端把这些带 provenance 的
++运行时字节按标准 DEX 035 重新排布，再计算 SHA-1/Adler-32。普通 `DexFile::Begin()/Size()` 快照在
++verify、重定位或保护器处理后可能已经不是可解析的标准 DEX，因此不能替代逻辑视图。
++
++Fusion 采用相同的证据分层，但不恢复旧版的全局 watcher：
++
++* `runtime_view` 只描述 ART 实际观察到的地址、长度、section pointer/count、`dex_identity`、location
++  和每个 region 的来源；地址没有对应 raw span 时，报告必须降级，禁止填零或猜测 vendor 偏移。
++* `logical-data.raw` 是无 header 的 `DataBegin()/DataSize()` 逻辑镜像；与同 run 的
++  `logical-layout.json`（或 record 中内嵌的 `runtime_view`）配对后，才允许进入重建器。
++* 只有六张 ID 表、所有可达 class-data、annotation/debug 及 CodeItem 均能在边界内解析，且引用关系
++  自洽时，输出 `reconstructed_standard_verified/*.dex`；缺少任一表或存在冲突时输出
++  `logical_layout`/evidence，仍可提供 descriptor catalog，但绝不伪造方法体。
++* 标准 DEX 修复、CodeItem 回填、逻辑视图重建是三个独立阶段。每阶段都保留原始 blob 和 report，重建
++  后再次校验 map list、header ranges、SHA-1 和 Adler-32；JADX 只消费 verified standard DEX。
++
++因此，“有类名、类、CodeItem 就一定能还原 DEX”并不成立：没有运行时 ID 表和 class-data 的 provenance，
++最多只能生成 descriptor catalog。该降级是设计契约，不是失败隐藏；Manager 只显示可操作的缺失输入，
++helper/host repair 负责最终判定与 checksum 修复。
++
+ 要在设备 run 中产生 codeitem，至少启用实际会捕获方法体的点位，例如主动 walk 使用 bit 40
+ `Walk.executable.method`；仅启用 bit 39 `Walk.cookie.dex` 只会得到 DEX。bit 41
+ `ForceInvoke.no_execute` 还要求 `force_invoke_enabled=true` 才会产生强制调用 codeitem。
+-- 
+2.43.0
+

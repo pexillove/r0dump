@@ -1,0 +1,1166 @@
+From eb2d416da3c09d4858a1ea0403e94c9c920d994b Mon Sep 17 00:00:00 2001
+From: Ivory <contact@ivory.cafe>
+Date: Thu, 10 Sep 2026 21:44:28 +0800
+Subject: [PATCH 17/21] r0dump: converge capture pipeline (early standard
+ snapshot + nearby)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Keep the early standard_snapshot and the default-off synchronous
+nearby_candidate experiment (bit 40, one attempt per DexFile identity),
+routing all dump sites through the single capture pipeline. Remove the
+constructor Header/RuntimeView snapshot and logical-data table overlay
+that had no host consumption closure (§0.2 convergence), restoring the
+original logical-data copy. Update capture/file/config tests and the
+f2/f3/f4/f9 source contracts to match.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Change-Id: I183be7711abf543193c42785ba5417f630371f1d
+---
+ libdexfile/dex/dex_file.h                     |   1 +
+ runtime/r0dump/r0dump_buffer.h                |   6 +
+ runtime/r0dump/r0dump_capture.cc              | 341 ++++++++++++++++--
+ runtime/r0dump/r0dump_capture.h               |  51 ++-
+ runtime/r0dump/r0dump_capture_test.cc         |  41 +++
+ runtime/r0dump/r0dump_config_test.cc          |   2 +-
+ runtime/r0dump/r0dump_f2_flush_source_test.py |   6 +-
+ runtime/r0dump/r0dump_f3_hook_source_test.py  |   2 +-
+ .../r0dump_f4_class_linker_source_test.py     |   2 +-
+ .../r0dump/r0dump_f9_dispatch_source_test.py  |   9 +-
+ runtime/r0dump/r0dump_file.cc                 |   9 +
+ runtime/r0dump/r0dump_file_test.cc            |  43 +++
+ runtime/r0dump/r0dump_nearby_snapshot.cc      | 162 +++++++++
+ runtime/r0dump/r0dump_nearby_snapshot.h       |  47 +++
+ 14 files changed, 676 insertions(+), 46 deletions(-)
+ create mode 100644 runtime/r0dump/r0dump_nearby_snapshot.cc
+ create mode 100644 runtime/r0dump/r0dump_nearby_snapshot.h
+
+diff --git a/libdexfile/dex/dex_file.h b/libdexfile/dex/dex_file.h
+index bee012e..5f755a6 100644
+--- a/libdexfile/dex/dex_file.h
++++ b/libdexfile/dex/dex_file.h
+@@ -21,6 +21,7 @@
+ 
+ #include <array>
+ #include <cstdint>
++#include <cstring>
+ #include <memory>
+ #include <optional>
+ #include <string>
+diff --git a/runtime/r0dump/r0dump_buffer.h b/runtime/r0dump/r0dump_buffer.h
+index b433c10..69e9bbf 100644
+--- a/runtime/r0dump/r0dump_buffer.h
++++ b/runtime/r0dump/r0dump_buffer.h
+@@ -191,6 +191,12 @@ struct r0dump_RecordMetadata final {
+   std::string materialize_status;
+   std::string dispatch_status;
+   std::string exception_class;
++  std::string entry_kind;
++  std::optional<uint32_t> access_flags;
++  std::optional<bool> nterp_entry_fast_path;
++  std::optional<bool> nterp_invoke_fast_path;
++  std::optional<bool> code_item_present;
++  std::string observation_phase;
+   // Runtime addresses are provenance only. They let host rehydration relate a
+   // logical-data capture to the live DexFile without treating pointers as DEX
+   // file offsets. They are intentionally optional and never dereferenced by
+diff --git a/runtime/r0dump/r0dump_capture.cc b/runtime/r0dump/r0dump_capture.cc
+index 6f9fcda..a5dbf58 100644
+--- a/runtime/r0dump/r0dump_capture.cc
++++ b/runtime/r0dump/r0dump_capture.cc
+@@ -29,6 +29,7 @@
+ #include <string_view>
+ #include <sys/uio.h>
+ #include <unistd.h>
++#include <unordered_set>
+ #include <utility>
+ 
+ #include "art_method-inl.h"
+@@ -38,12 +39,16 @@
+ #include "dex/dex_file.h"
+ #include "dex/dex_file_loader.h"
+ #include "dex/standard_dex_file.h"
++#include "instrumentation.h"
+ #include "oat/oat_file.h"
+ #include "r0dump/r0dump_file.h"
++#include "r0dump/r0dump_nearby_snapshot.h"
+ 
+ namespace art HIDDEN {
+ 
+ std::atomic<r0dump_CapturePointMask> g_r0dump_active_capture_point_mask{0u};
++extern "C" std::atomic<uint32_t> g_r0dump_nterp_method_entry_enabled{0u};
++static_assert(decltype(g_r0dump_nterp_method_entry_enabled)::is_always_lock_free);
+ 
+ std::atomic<uint64_t> g_r0dump_jit_compile_attempt_id{0u};
+ 
+@@ -120,6 +125,11 @@ struct r0dump_CaptureProcessState final {
+   r0dump_ObservationSlots route_observations = {};
+   size_t route_observation_count = 0u;
+   std::array<std::atomic<uint64_t>, kR0dumpPointCount> point_seen = {};
++  // A protected DexFile can expose the same logical image through many
++  // ArtMethods. Limit the bounded memory scan to one attempt per DexFile
++  // identity so a failed scan cannot multiply its cost by method count.
++  std::mutex nearby_snapshot_lock;
++  std::unordered_set<uint64_t> nearby_snapshot_attempted_identities;
+ };
+ 
+ std::mutex g_r0dump_capture_configure_lock;
+@@ -331,6 +341,77 @@ uint64_t r0dump_DexIdentity(const DexFile& dex_file) {
+          static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&dex_file));
+ }
+ 
++NO_INLINE std::optional<r0dump_DexFormat> r0dump_ValidateDexImage(const uint8_t* begin,
++                                                                   size_t size);
++r0dump_RecordMetadata r0dump_DexMetadata(const DexFile& dex);
++
++// Protected loaders commonly repoint or clear DexFile::Begin()/DataBegin() after
++// methods have been linked.  The CodeItem is still a useful anchor at walk time,
++// so look for a complete standard image in a tightly bounded neighborhood and
++// submit it through the normal buffer/staging path.  This is intentionally
++// limited to the executable class-walk point; it must not add a maps scan to
++// ordinary ART method dispatch or parsing.
++bool r0dump_CaptureNearbyDexCandidate(r0dump_CaptureProcessState* state,
++                                      r0dump_Point point,
++                                      std::string_view site,
++                                      const DexFile& dex_file,
++                                      const dex::CodeItem* code_item)
++    REQUIRES_SHARED(Locks::mutator_lock_) {
++  if (state == nullptr || point != r0dump_Point::kWalkExecutableMethod || code_item == nullptr) {
++    return false;
++  }
++  const uint64_t dex_identity = r0dump_DexIdentity(dex_file);
++  // Record the attempt before scanning. Otherwise a protected DexFile with no
++  // valid nearby image would repeat the full scan for every executable method.
++  // Do not hold this lock while reading maps or copying a candidate.
++  {
++    std::lock_guard<std::mutex> identity_guard(state->nearby_snapshot_lock);
++    if (!state->nearby_snapshot_attempted_identities.insert(dex_identity).second) {
++      return false;
++    }
++  }
++  constexpr size_t kBytesBefore = 64u * 1024u * 1024u;
++  constexpr size_t kBytesAfter = 8u * 1024u * 1024u;
++  // Prefer ART's logical data anchor when it is readable.  Protected loaders may relocate the
++  // CodeItem into a detached mapping; scanning from DataBegin preserves the intended DEX image
++  // neighborhood while retaining the CodeItem as a safe fallback for ordinary files.
++  const uint8_t* scan_anchor = reinterpret_cast<const uint8_t*>(code_item);
++  if (dex_file.DataBegin() != nullptr && dex_file.DataSize() != 0u &&
++      r0dump_IsReadableSpan(dex_file.DataBegin(), 1u)) {
++    scan_anchor = dex_file.DataBegin();
++  }
++  const std::vector<r0dump_NearbyDexCandidate> candidates = r0dump_FindNearbyDexCandidates(
++      scan_anchor,
++      kBytesBefore,
++      kBytesAfter,
++      std::min(state->max_dex_bytes, static_cast<size_t>(kR0dumpMaxDexBytesHardLimit)));
++  for (const r0dump_NearbyDexCandidate& candidate : candidates) {
++    const std::optional<r0dump_DexFormat> format =
++        r0dump_ValidateDexImage(candidate.begin, candidate.size);
++    if (!format.has_value() || *format != r0dump_DexFormat::kStandard) {
++      continue;
++    }
++    r0dump_RecordMetadata metadata = r0dump_DexMetadata(dex_file);
++    metadata.capture_role = "nearby_candidate";
++    metadata.source_kind = "code_item_nearby";
++    metadata.declared_size = candidate.size;
++    metadata.data_size = candidate.size;
++    metadata.container_size = candidate.size;
++    metadata.begin = reinterpret_cast<uintptr_t>(candidate.begin);
++    metadata.data_begin = reinterpret_cast<uintptr_t>(candidate.begin);
++    const r0dump_CaptureResult result = r0dump_CaptureBuffer(
++        *state->pool,
++        *state->staging,
++        {candidate.begin, candidate.size, candidate.begin, candidate.size},
++        r0dump_MakeHookContext(point, site),
++        std::move(metadata));
++    if (r0dump_IsCaptureStaged(result)) {
++      return true;
++    }
++  }
++  return false;
++}
++
+ std::string_view r0dump_CodeItemRoleName(r0dump_CodeItemRole role) {
+   switch (role) {
+     case r0dump_CodeItemRole::kLoadMethod:
+@@ -351,7 +432,51 @@ std::string_view r0dump_CodeItemRoleName(r0dump_CodeItemRole role) {
+       return "reflect_method";
+     case r0dump_CodeItemRole::kReflectConstructor:
+       return "reflect_constructor";
++    case r0dump_CodeItemRole::kNterpEntry:
++      return "nterp_entry";
++  }
++}
++
++std::string_view r0dump_ObservationPhase(r0dump_Point point) {
++  switch (point) {
++    case r0dump_Point::kArtMethodInvokeDispatch:
++      return "before_dispatch";
++    case r0dump_Point::kInterpreterExecuteEntry:
++      return "interpreter_entry";
++    case r0dump_Point::kWalkExecutableMethod:
++      return "walk_inventory";
++    case r0dump_Point::kForceInvokeNoExecute:
++      return "no_execute_capture";
++    case r0dump_Point::kNterpMethodEntry:
++      return "nterp_entry";
++    default:
++      return {};
++  }
++}
++
++std::string r0dump_EntryKind(ArtMethod* method) REQUIRES_SHARED(Locks::mutator_lock_) {
++  const void* entry = method->GetEntryPointFromQuickCompiledCode();
++  if (entry == nullptr) {
++    return "null";
+   }
++  return std::string(r0dump_EntryKindFromInstrumentationString(
++      instrumentation::Instrumentation::EntryPointString(entry)));
++}
++
++void r0dump_SetMethodExecutionMetadata(ArtMethod* method,
++                                       std::string_view observation_phase,
++                                       r0dump_RecordMetadata* metadata)
++    REQUIRES_SHARED(Locks::mutator_lock_) {
++  if (method == nullptr || metadata == nullptr) {
++    return;
++  }
++  const uint32_t access_flags = method->GetAccessFlags();
++  metadata->entry_kind = r0dump_EntryKind(method);
++  metadata->access_flags = access_flags;
++  metadata->nterp_entry_fast_path = ArtMethod::HasNterpEntryPointFastPathFlag(access_flags);
++  metadata->nterp_invoke_fast_path = (access_flags & kAccNterpInvokeFastPathFlag) != 0u;
++  metadata->code_item_present = method->HasCodeItem() && method->GetCodeItem() != nullptr;
++  metadata->observation_phase = std::string(observation_phase);
+ }
+ 
+ void r0dump_CountPointObservation(r0dump_CaptureProcessState* state, r0dump_Point point) {
+@@ -460,17 +585,81 @@ void r0dump_ReleaseRouteObservation(r0dump_CaptureProcessState* state,
+                             {dex_identity, 0u, point});
+ }
+ 
+-std::optional<r0dump_DexFormat> r0dump_ValidateDexImage(const uint8_t* begin, size_t size) {
+-  if (size < sizeof(DexFile::Header)) {
++bool r0dump_CheckedDexRange(uint32_t offset, uint64_t size, uint32_t file_size) {
++  return offset <= file_size && size <= static_cast<uint64_t>(file_size - offset);
++}
++
++bool r0dump_ValidateStandardDexLayout(const uint8_t* begin,
++                                      const DexFile::Header& header,
++                                      size_t readable_size) {
++  if (!StandardDexFile::IsMagicValid(header.magic_) ||
++      !StandardDexFile::IsVersionValid(header.magic_.data()) ||
++      header.header_size_ != header.GetExpectedHeaderSize() ||
++      header.header_size_ < sizeof(DexFile::Header) || header.file_size_ < header.header_size_ ||
++      header.file_size_ > readable_size || header.endian_tag_ != DexFile::kDexEndianConstant ||
++      !r0dump_CheckedDexRange(header.data_off_, header.data_size_, header.file_size_)) {
++    return false;
++  }
++  const auto table = [&](uint32_t offset, uint32_t count, size_t item_size) {
++    return r0dump_CheckedDexRange(
++        offset, static_cast<uint64_t>(count) * item_size, header.file_size_);
++  };
++  if (!table(header.string_ids_off_, header.string_ids_size_, 4u) ||
++      !table(header.type_ids_off_, header.type_ids_size_, 4u) ||
++      !table(header.proto_ids_off_, header.proto_ids_size_, 12u) ||
++      !table(header.field_ids_off_, header.field_ids_size_, 8u) ||
++      !table(header.method_ids_off_, header.method_ids_size_, 8u) ||
++      !table(header.class_defs_off_, header.class_defs_size_, 32u) ||
++      header.map_off_ < header.data_off_ ||
++      !r0dump_CheckedDexRange(header.map_off_, sizeof(uint32_t), header.file_size_)) {
++    return false;
++  }
++  if (header.map_off_ > header.file_size_ - sizeof(uint32_t) ||
++      !r0dump_IsReadableSpan(begin + header.map_off_, sizeof(uint32_t))) {
++    return false;
++  }
++  uint32_t map_count = 0u;
++  std::memcpy(&map_count, begin + header.map_off_, sizeof(map_count));
++  constexpr size_t kMapItemBytes = 12u;
++  if (map_count > (header.file_size_ - header.map_off_ - sizeof(uint32_t)) / kMapItemBytes ||
++      !r0dump_CheckedDexRange(
++          header.map_off_, sizeof(uint32_t) + static_cast<uint64_t>(map_count) * kMapItemBytes,
++          header.file_size_) ||
++      !r0dump_IsReadableSpan(begin + header.map_off_,
++                             sizeof(uint32_t) + static_cast<size_t>(map_count) * kMapItemBytes)) {
++    return false;
++  }
++  for (uint32_t index = 0u; index != map_count; ++index) {
++    uint32_t item_offset = 0u;
++    std::memcpy(&item_offset,
++                begin + header.map_off_ + sizeof(uint32_t) + index * kMapItemBytes + 8u,
++                sizeof(item_offset));
++    if (item_offset >= header.file_size_) {
++      return false;
++    }
++  }
++  return true;
++}
++
++NO_INLINE std::optional<r0dump_DexFormat> r0dump_ValidateDexImage(const uint8_t* begin, size_t size) {
++  if (begin == nullptr || size < sizeof(DexFile::Header) ||
++      !r0dump_IsReadableSpan(begin, sizeof(DexFile::Header))) {
+     return std::nullopt;
+   }
+   DexFile::Header header;
+   std::memcpy(&header, begin, sizeof(header));
++  if (r0dump_ValidateStandardDexLayout(begin, header, size)) {
++    return r0dump_DexFormat::kStandard;
++  }
+   const bool common_valid = header.endian_tag_ == DexFile::kDexEndianConstant &&
+                             header.file_size_ >= header.header_size_ && header.file_size_ <= size;
++  // Test and legacy in-memory loaders may expose a minimal standard header
++  // without a map_list.  Keep the historical capture contract for that input;
++  // host repair still requires the complete canonical map before accepting a
++  // DEX for JADX.
+   if (common_valid && StandardDexFile::IsMagicValid(header.magic_) &&
+       StandardDexFile::IsVersionValid(header.magic_.data()) &&
+-      header.header_size_ == header.GetExpectedHeaderSize()) {
++      header.header_size_ == header.GetExpectedHeaderSize() && header.map_off_ == 0u) {
+     return r0dump_DexFormat::kStandard;
+   }
+   constexpr uint8_t kR0dumpCompactDexMagic[] = {'c', 'd', 'e', 'x', '0', '0', '1', '\0'};
+@@ -562,6 +751,7 @@ r0dump_RecordMetadata r0dump_DexMetadata(const DexFile& dex) {
+         "\",\"field_ids\":\"" + hex(runtime.field_ids) +
+         "\",\"method_ids\":\"" + hex(runtime.method_ids) +
+         "\",\"class_defs\":\"" + hex(runtime.class_defs) + "\"";
++    metadata.runtime_view_json += ",\"header_source\":\"current\"";
+     const bool have_runtime_counts = runtime.string_ids_count != 0u || runtime.type_ids_count != 0u ||
+                                      runtime.proto_ids_count != 0u || runtime.field_ids_count != 0u ||
+                                      runtime.method_ids_count != 0u || runtime.class_defs_count != 0u;
+@@ -652,6 +842,20 @@ r0dump_SubmitCapturedCodeItem(r0dump_Staging& staging,
+   };
+ }
+ 
++bool r0dump_IsEarlyRecoveryPoint(r0dump_Point point) {
++  return point == r0dump_Point::kOpenCommonReturn ||
++         point == r0dump_Point::kDefineClassSuccess ||
++         point == r0dump_Point::kDexFileBeforeDefine ||
++         point == r0dump_Point::kDexFileOpenMemoryReturn;
++}
++
++void r0dump_SetActiveCapturePointMask(r0dump_CapturePointMask mask) {
++  g_r0dump_nterp_method_entry_enabled.store(
++      (mask & r0dump_PointBit(r0dump_Point::kNterpMethodEntry)) != 0u ? 1u : 0u,
++      std::memory_order_release);
++  g_r0dump_active_capture_point_mask.store(mask, std::memory_order_release);
++}
++
+ void r0dump_ObserveOpenCommon(const DexFile& dex) {
+   r0dump_ObserveDex(r0dump_Point::kOpenCommonReturn, "OpenCommon.return", dex);
+ }
+@@ -667,6 +871,22 @@ r0dump_HookContext r0dump_MakeHookContext(r0dump_Point point, std::string_view s
+   };
+ }
+ 
++void r0dump_SetPreparedMethodState(ArtMethod* method,
++                                   std::string_view observation_phase,
++                                   r0dump_PreparedCodeItem* prepared) {
++  if (method == nullptr || prepared == nullptr) {
++    return;
++  }
++  r0dump_RecordMetadata metadata;
++  r0dump_SetMethodExecutionMetadata(method, observation_phase, &metadata);
++  prepared->entry_kind = std::move(metadata.entry_kind);
++  prepared->access_flags = metadata.access_flags.value_or(0u);
++  prepared->nterp_entry_fast_path = metadata.nterp_entry_fast_path.value_or(false);
++  prepared->nterp_invoke_fast_path = metadata.nterp_invoke_fast_path.value_or(false);
++  prepared->code_item_present = metadata.code_item_present.value_or(false);
++  prepared->observation_phase = std::move(metadata.observation_phase);
++}
++
+ bool r0dump_ConfigureCaptureProcessOnce(r0dump_ProcessConfig config, r0dump_ConfigError* error) {
+   if (!r0dump_ValidateConfig(config, error)) {
+     return false;
+@@ -703,7 +923,7 @@ bool r0dump_ConfigureCaptureProcessOnce(r0dump_ProcessConfig config, r0dump_Conf
+   if (state != nullptr) {
+     g_r0dump_capture_process_state.store(state.release(), std::memory_order_release);
+   }
+-  g_r0dump_active_capture_point_mask.store(active_mask, std::memory_order_release);
++  r0dump_SetActiveCapturePointMask(active_mask);
+   if (install_open_common) {
+     r0dump_SetOpenCommonObserver(r0dump_ObserveOpenCommon);
+   }
+@@ -736,7 +956,7 @@ std::array<uint64_t, kR0dumpPointCount> r0dump_GetCapturePointSeen() {
+ 
+ void r0dump_DisableCaptureForDegradedFlush() {
+   if (r0dump_IsFlushDegraded()) {
+-    g_r0dump_active_capture_point_mask.store(0u, std::memory_order_release);
++    r0dump_SetActiveCapturePointMask(0u);
+   }
+ }
+ 
+@@ -803,7 +1023,7 @@ void r0dump_CompleteCaptureBootstrapInventory(bool completed) {
+ }
+ 
+ void r0dump_FinalizeCaptureFlushRun(bool try_lock) {
+-  g_r0dump_active_capture_point_mask.store(0u, std::memory_order_release);
++  r0dump_SetActiveCapturePointMask(0u);
+   const r0dump_ProcessConfig* config = r0dump_GetProcessConfig();
+   r0dump_Staging* staging = r0dump_GetCaptureProcessStaging();
+   if (config != nullptr && staging != nullptr) {
+@@ -824,6 +1044,19 @@ r0dump_CaptureResult r0dump_ObserveDex(r0dump_Point point,
+       g_r0dump_capture_process_state.load(std::memory_order_acquire);
+   DCHECK(state != nullptr);
+   r0dump_CountPointObservation(state, point);
++  const std::optional<r0dump_DexFormat> view_format =
++      r0dump_ValidateDexImage(dex.Begin(), dex.Size());
++  const bool standard_view_valid =
++      view_format.has_value() && *view_format == r0dump_DexFormat::kStandard;
++  const r0dump_HookContext context = r0dump_MakeHookContext(point, site);
++  if (standard_view_valid && r0dump_IsEarlyRecoveryPoint(point)) {
++    return r0dump_CaptureDex(*state->pool,
++                             *state->staging,
++                             {dex, method, class_def_index},
++                             r0dump_CaptureKind::kDexView,
++                             context,
++                             "standard_snapshot");
++  }
+   // A protected or relocated DexFile may no longer expose a valid standard
+   // header, while its logical DataBegin/DataSize range is still live. Capture
+   // that range as dexdata so host rehydration can use a runtime view later.
+@@ -834,7 +1067,6 @@ r0dump_CaptureResult r0dump_ObserveDex(r0dump_Point point,
+     capture_kind = r0dump_CaptureKind::kDexData;
+   }
+   const size_t size = capture_kind == r0dump_CaptureKind::kDexData ? dex.DataSize() : dex.Size();
+-  const r0dump_HookContext context = r0dump_MakeHookContext(point, site);
+   if (size > state->max_dex_bytes) {
+     return {
+         .status = r0dump_CaptureStatus::kInvalidRange,
+@@ -995,6 +1227,29 @@ void r0dump_ObserveOatFileRegistration(r0dump_Point point,
+       });
+ }
+ 
++NO_INLINE r0dump_SubmitResult r0dump_SubmitDexReference(
++    r0dump_CaptureProcessState* state,
++    const r0dump_HookContext& context,
++    const DexFile& dex,
++    std::unique_ptr<r0dump_RecordMetadata> metadata) {
++  const std::shared_ptr<DexFileContainer>& container = dex.GetContainer();
++  const r0dump_DexFormat format =
++      r0dump_ValidateDexImage(dex.Begin(), dex.Size()).value_or(r0dump_DexFormat::kNotApplicable);
++  if (dex.Size() > state->max_dex_bytes || dex.Size() > kR0dumpMaxDexBytesHardLimit ||
++      container == nullptr || format == r0dump_DexFormat::kNotApplicable ||
++      !r0dump_IsBoundedSpan(
++          dex.Begin(), dex.Size(), container->Begin(), container->End() - container->Begin())) {
++    return state->staging->r0dump_TrySubmitMetadata(context, std::move(*metadata));
++  }
++  return state->staging->r0dump_TryReferenceDexOrMetadata(r0dump_CaptureKind::kDexView,
++                                                           format,
++                                                           dex.Begin(),
++                                                           dex.Size(),
++                                                           r0dump_HashBytes(dex.Begin(), dex.Size()),
++                                                           context,
++                                                           std::move(*metadata));
++}
++
+ bool r0dump_ObserveDexReference(r0dump_Point point,
+                                 std::string_view site,
+                                 const DexFile& dex,
+@@ -1018,27 +1273,11 @@ bool r0dump_ObserveDexReference(r0dump_Point point,
+   }
+ 
+   const r0dump_HookContext context = r0dump_MakeHookContext(point, site);
+-  r0dump_RecordMetadata metadata = r0dump_DexMetadata(dex);
+-  r0dump_SetSourceMetadata(source, &metadata);
+-  metadata.class_name = class_name;
+-  const std::shared_ptr<DexFileContainer>& container = dex.GetContainer();
+-  const std::optional<r0dump_DexFormat> format = r0dump_ValidateDexImage(dex.Begin(), dex.Size());
+-  r0dump_SubmitResult submit;
+-  if (dex.Size() > state->max_dex_bytes || dex.Size() > kR0dumpMaxDexBytesHardLimit ||
+-      container == nullptr || !format.has_value() ||
+-      !r0dump_IsBoundedSpan(
+-          dex.Begin(), dex.Size(), container->Begin(), container->End() - container->Begin())) {
+-    submit = state->staging->r0dump_TrySubmitMetadata(context, std::move(metadata));
+-  } else {
+-    submit =
+-        state->staging->r0dump_TryReferenceDexOrMetadata(r0dump_CaptureKind::kDexView,
+-                                                         *format,
+-                                                         dex.Begin(),
+-                                                         dex.Size(),
+-                                                         r0dump_HashBytes(dex.Begin(), dex.Size()),
+-                                                         context,
+-                                                         std::move(metadata));
+-  }
++  auto metadata = std::make_unique<r0dump_RecordMetadata>(r0dump_DexMetadata(dex));
++  r0dump_SetSourceMetadata(source, metadata.get());
++  metadata->class_name = class_name;
++  r0dump_SubmitResult submit =
++      r0dump_SubmitDexReference(state, context, dex, std::move(metadata));
+   if (submit.status == r0dump_SubmitStatus::kLockBusy ||
+       submit.status == r0dump_SubmitStatus::kInvalid) {
+     r0dump_ReleaseRouteObservation(state, point, dex_identity);
+@@ -1062,8 +1301,8 @@ r0dump_CaptureResult r0dump_ObserveRawBuffer(r0dump_Point point,
+   DCHECK(state != nullptr);
+   r0dump_CountPointObservation(state, point);
+   const r0dump_HookContext context = r0dump_MakeHookContext(point, site);
+-  r0dump_RecordMetadata metadata;
+-  r0dump_SetSourceMetadata(source, &metadata);
++  auto metadata = std::make_unique<r0dump_RecordMetadata>();
++  r0dump_SetSourceMetadata(source, metadata.get());
+   if (size > state->max_dex_bytes) {
+     return {
+         .status = r0dump_CaptureStatus::kInvalidRange,
+@@ -1071,14 +1310,14 @@ r0dump_CaptureResult r0dump_ObserveRawBuffer(r0dump_Point point,
+                                                     r0dump_CaptureKind::kBuffer,
+                                                     r0dump_DexFormat::kNotApplicable,
+                                                     "dex_bytes_limit",
+-                                                    std::move(metadata)),
++                                                    std::move(*metadata)),
+     };
+   }
+   return r0dump_CaptureBuffer(*state->pool,
+                               *state->staging,
+                               {begin, size, container_begin, container_size},
+                               context,
+-                              std::move(metadata));
++                              std::move(*metadata));
+ }
+ 
+ r0dump_CaptureResult r0dump_ObserveMetadata(r0dump_Point point,
+@@ -1098,6 +1337,19 @@ r0dump_CaptureResult r0dump_ObserveMetadata(r0dump_Point point,
+   };
+ }
+ 
++void r0dump_ObserveResolveMethodMetadata(r0dump_Point point,
++                                         std::string_view site,
++                                         uint32_t method_index,
++                                         std::string_view resolve_status) {
++  if (!r0dump_IsCapturePointActive(point)) {
++    return;
++  }
++  r0dump_RecordMetadata metadata;
++  metadata.method_index = method_index;
++  metadata.resolve_status = resolve_status;
++  r0dump_ObserveMetadata(point, site, std::move(metadata));
++}
++
+ r0dump_CaptureResult r0dump_TryObserveMetadata(r0dump_Point point,
+                                                std::string_view site,
+                                                r0dump_RecordMetadata metadata) {
+@@ -1159,6 +1411,11 @@ bool r0dump_ObserveMethodCodeItem(r0dump_Point point,
+     return false;
+   }
+ 
++  // The nearby snapshot is submitted before the first CodeItem so that the
++  // configured artifact cap cannot be consumed by CodeItems before their base
++  // DEX becomes available for host-side backfill.
++  r0dump_CaptureNearbyDexCandidate(state, point, site, *dex_file, code_item);
++
+   r0dump_PreparedCodeItem prepared;
+   if (r0dump_TryPrepareCodeItem(point,
+                                 site,
+@@ -1178,6 +1435,7 @@ bool r0dump_ObserveMethodCodeItem(r0dump_Point point,
+   prepared.method_name = method->GetNameView();
+   prepared.method_descriptor = method->GetSignature().ToString();
+   prepared.source_kind = source_kind;
++  r0dump_SetPreparedMethodState(method, r0dump_ObservationPhase(point), &prepared);
+   const r0dump_SubmitResult submit = r0dump_SubmitPreparedCodeItem(std::move(prepared)).submit;
+   const bool accepted = submit.status == r0dump_SubmitStatus::kAccepted ||
+                         submit.status == r0dump_SubmitStatus::kDuplicate;
+@@ -1218,11 +1476,8 @@ void r0dump_ObserveMethodCodeItemOrMetadata(r0dump_Point point,
+     return;
+   }
+   if (method != nullptr && !method->IsRuntimeMethod()) {
+-    r0dump_SetMethodMetadata(method, &metadata);
+-    r0dump_CaptureProcessState* state =
+-        g_r0dump_capture_process_state.load(std::memory_order_acquire);
+-    DCHECK(state != nullptr);
+-    state->staging->r0dump_SubmitMetadata(r0dump_MakeHookContext(point, site), std::move(metadata));
++    r0dump_SetMethodExecutionMetadata(method, r0dump_ObservationPhase(point), &metadata);
++    r0dump_ObserveMethodMetadata(point, site, method, std::move(metadata));
+   }
+ }
+ 
+@@ -1351,7 +1606,8 @@ r0dump_CaptureResult r0dump_CaptureDex(r0dump_BufferPool& pool,
+                                        r0dump_Staging& staging,
+                                        const r0dump_BorrowedDex& borrowed,
+                                        r0dump_CaptureKind kind,
+-                                       const r0dump_HookContext& context) {
++                                       const r0dump_HookContext& context,
++                                       std::string_view capture_role) {
+   r0dump_RecursionGuard guard;
+   if (!guard.r0dump_Entered()) {
+     return {.status = r0dump_CaptureStatus::kReentrant};
+@@ -1403,6 +1659,9 @@ r0dump_CaptureResult r0dump_CaptureDex(r0dump_BufferPool& pool,
+   }
+   r0dump_RecordMetadata metadata = r0dump_DexMetadata(borrowed.dex);
+   metadata.class_def_index = borrowed.class_def_index;
++  if (!capture_role.empty()) {
++    metadata.capture_role = std::string(capture_role);
++  }
+   if (logical_copy != nullptr) {
+     r0dump_AnnotateLogicalCopy(&metadata, logical_copy_complete, logical_copy_bytes);
+   }
+@@ -1557,6 +1816,12 @@ r0dump_CaptureResult r0dump_SubmitPreparedCodeItem(r0dump_Staging& staging,
+   r0dump_RecordMetadata record_metadata = {
+       .source_kind = std::move(prepared.source_kind),
+       .class_def_index = prepared.class_def_index,
++      .entry_kind = std::move(prepared.entry_kind),
++      .access_flags = prepared.access_flags,
++      .nterp_entry_fast_path = prepared.nterp_entry_fast_path,
++      .nterp_invoke_fast_path = prepared.nterp_invoke_fast_path,
++      .code_item_present = prepared.code_item_present,
++      .observation_phase = std::move(prepared.observation_phase),
+   };
+   record_metadata.dex_object_id = prepared.dex_identity;
+   record_metadata.declared_size = prepared.dex_size;
+diff --git a/runtime/r0dump/r0dump_capture.h b/runtime/r0dump/r0dump_capture.h
+index befe322..2411982 100644
+--- a/runtime/r0dump/r0dump_capture.h
++++ b/runtime/r0dump/r0dump_capture.h
+@@ -112,6 +112,7 @@ enum class r0dump_CodeItemRole : uint8_t {
+   kJitCompile,
+   kReflectMethod,
+   kReflectConstructor,
++  kNterpEntry,
+ };
+ 
+ struct r0dump_PreparedCodeItem final {
+@@ -130,6 +131,12 @@ struct r0dump_PreparedCodeItem final {
+   std::string source_kind;
+   bool class_initialized = false;
+   bool no_execute = false;
++  std::string entry_kind;
++  uint32_t access_flags = 0u;
++  bool nterp_entry_fast_path = false;
++  bool nterp_invoke_fast_path = false;
++  bool code_item_present = false;
++  std::string observation_phase;
+ };
+ 
+ extern std::atomic<r0dump_CapturePointMask> g_r0dump_active_capture_point_mask;
+@@ -141,6 +148,37 @@ ALWAYS_INLINE inline bool r0dump_IsCapturePointActiveFast(r0dump_Point point) {
+ 
+ r0dump_HookContext r0dump_MakeHookContext(r0dump_Point point, std::string_view site);
+ 
++// Convert ART's diagnostic entry-point labels into the stable on-disk enum.
++// Raw entry addresses are process-local and are never used as identities. Keep the
++// classifier header-local so ART gtests exercise the exact runtime mapping under LTO.
++inline std::string_view r0dump_EntryKindFromInstrumentationString(std::string_view runtime_kind) {
++  if (runtime_kind == "interpreter") {
++    return "quick_to_interpreter_bridge";
++  }
++  if (runtime_kind == "resolution") {
++    return "resolution_stub";
++  }
++  if (runtime_kind == "generic jni") {
++    return "generic_jni_stub";
++  }
++  if (runtime_kind == "jit") {
++    return "jit_code";
++  }
++  if (runtime_kind == "oat") {
++    return "aot_code";
++  }
++  if (runtime_kind == "nterp") {
++    return "nterp";
++  }
++  if (runtime_kind == "nterp with clinit") {
++    return "nterp_with_clinit";
++  }
++  if (runtime_kind == "unknown") {
++    return "unknown";
++  }
++  return "other_quick_code";
++}
++
+ bool r0dump_ConfigureCaptureProcessOnce(r0dump_ProcessConfig config, r0dump_ConfigError* error);
+ bool r0dump_IsCapturePointActive(r0dump_Point point);
+ r0dump_Staging* r0dump_GetCaptureProcessStaging();
+@@ -201,6 +239,11 @@ r0dump_CaptureResult r0dump_ObserveMetadata(r0dump_Point point,
+                                             std::string_view site,
+                                             r0dump_RecordMetadata metadata);
+ 
++void r0dump_ObserveResolveMethodMetadata(r0dump_Point point,
++                                         std::string_view site,
++                                         uint32_t method_index,
++                                         std::string_view resolve_status);
++
+ r0dump_CaptureResult r0dump_TryObserveMetadata(r0dump_Point point,
+                                                std::string_view site,
+                                                r0dump_RecordMetadata metadata);
+@@ -270,11 +313,17 @@ r0dump_CaptureStatus r0dump_TryPrepareCodeItem(r0dump_Point point,
+ 
+ r0dump_CaptureResult r0dump_SubmitPreparedCodeItem(r0dump_PreparedCodeItem&& prepared);
+ 
++void r0dump_SetPreparedMethodState(ArtMethod* method,
++                                   std::string_view observation_phase,
++                                   r0dump_PreparedCodeItem* prepared)
++    REQUIRES_SHARED(Locks::mutator_lock_);
++
+ r0dump_CaptureResult r0dump_CaptureDex(r0dump_BufferPool& pool,
+                                        r0dump_Staging& staging,
+                                        const r0dump_BorrowedDex& borrowed,
+                                        r0dump_CaptureKind kind,
+-                                       const r0dump_HookContext& context);
++                                       const r0dump_HookContext& context,
++                                       std::string_view capture_role = {});
+ 
+ r0dump_CaptureResult r0dump_CaptureBuffer(r0dump_BufferPool& pool,
+                                           r0dump_Staging& staging,
+diff --git a/runtime/r0dump/r0dump_capture_test.cc b/runtime/r0dump/r0dump_capture_test.cc
+index 4e89456..84f5728 100644
+--- a/runtime/r0dump/r0dump_capture_test.cc
++++ b/runtime/r0dump/r0dump_capture_test.cc
+@@ -27,10 +27,26 @@
+ #include "dex/standard_dex_file.h"
+ #include "dex/test_dex_file_builder.h"
+ #include "gtest/gtest.h"
++#include "r0dump/r0dump_nearby_snapshot.h"
+ 
+ namespace art HIDDEN {
+ namespace {
+ 
++TEST(r0dump_CaptureTest, EntryKindClassificationUsesStableEnums) {
++  EXPECT_EQ(r0dump_EntryKindFromInstrumentationString("interpreter"),
++            "quick_to_interpreter_bridge");
++  EXPECT_EQ(r0dump_EntryKindFromInstrumentationString("resolution"), "resolution_stub");
++  EXPECT_EQ(r0dump_EntryKindFromInstrumentationString("generic jni"), "generic_jni_stub");
++  EXPECT_EQ(r0dump_EntryKindFromInstrumentationString("jit"), "jit_code");
++  EXPECT_EQ(r0dump_EntryKindFromInstrumentationString("oat"), "aot_code");
++  EXPECT_EQ(r0dump_EntryKindFromInstrumentationString("nterp"), "nterp");
++  EXPECT_EQ(r0dump_EntryKindFromInstrumentationString("nterp with clinit"),
++            "nterp_with_clinit");
++  EXPECT_EQ(r0dump_EntryKindFromInstrumentationString("unknown"), "unknown");
++  EXPECT_EQ(r0dump_EntryKindFromInstrumentationString("stub"), "other_quick_code");
++  EXPECT_EQ(r0dump_EntryKindFromInstrumentationString("obsolete"), "other_quick_code");
++}
++
+ std::unique_ptr<const DexFile> r0dump_BuildTestDex(char fill = 'x') {
+   TestDexFileBuilder builder;
+   builder.AddString(std::string(120u, fill));
+@@ -64,6 +80,19 @@ TEST(r0dump_CaptureTest, StagedResultRequiresAcceptedOrDuplicateSubmit) {
+   EXPECT_FALSE(r0dump_IsCaptureStaged(result));
+ }
+ 
++TEST(r0dump_CaptureTest, NearbyScannerFindsCompleteDexContainingAnchor) {
++  std::unique_ptr<const DexFile> dex = r0dump_BuildTestDex();
++  ASSERT_NE(dex->Begin(), nullptr);
++  ASSERT_GT(dex->Size(), 0u);
++  const uint8_t* anchor = dex->Begin() + dex->Size() / 2u;
++  const std::vector<r0dump_NearbyDexCandidate> candidates = r0dump_FindNearbyDexCandidates(
++      anchor, dex->Size(), dex->Size(), dex->Size());
++  ASSERT_FALSE(candidates.empty());
++  EXPECT_EQ(candidates.front().begin, dex->Begin());
++  EXPECT_EQ(candidates.front().size, dex->Size());
++  EXPECT_EQ(candidates.front().distance, dex->Size() / 2u);
++}
++
+ uint64_t r0dump_ReentrantHash(const r0dump_Segment* segments, size_t segment_count) {
+   const r0dump_BorrowedDex borrowed{*g_r0dump_reentrant_dex, nullptr};
+   g_r0dump_nested_status =
+@@ -244,6 +273,12 @@ TEST(r0dump_CaptureTest, DefersPreparedCodeItemSubmissionWithOwnedMetadata) {
+                              r0dump_Context(r0dump_Point::kLoadMethodReady, "LoadMethod.ready", 7u),
+                              &prepared),
+       r0dump_CaptureStatus::kSubmitted);
++  prepared.entry_kind = "nterp";
++  prepared.access_flags = 0x1234u;
++  prepared.nterp_entry_fast_path = true;
++  prepared.nterp_invoke_fast_path = true;
++  prepared.code_item_present = true;
++  prepared.observation_phase = "nterp_entry";
+   code[0] = 'X';
+   ASSERT_EQ(r0dump_SubmitPreparedCodeItem(staging, std::move(prepared)).submit.status,
+             r0dump_SubmitStatus::kAccepted);
+@@ -262,6 +297,12 @@ TEST(r0dump_CaptureTest, DefersPreparedCodeItemSubmissionWithOwnedMetadata) {
+   EXPECT_EQ(record.site, "LoadMethod.ready");
+   EXPECT_EQ(record.metadata.class_def_index, 9u);
+   EXPECT_EQ(record.metadata.capture_role, "load_method");
++  EXPECT_EQ(record.metadata.entry_kind, "nterp");
++  EXPECT_EQ(record.metadata.access_flags, 0x1234u);
++  EXPECT_EQ(record.metadata.nterp_entry_fast_path, true);
++  EXPECT_EQ(record.metadata.nterp_invoke_fast_path, true);
++  EXPECT_EQ(record.metadata.code_item_present, true);
++  EXPECT_EQ(record.metadata.observation_phase, "nterp_entry");
+ }
+ 
+ TEST(r0dump_CaptureTest, ExecutionSitesKeepIndependentCodeItemRoles) {
+diff --git a/runtime/r0dump/r0dump_config_test.cc b/runtime/r0dump/r0dump_config_test.cc
+index 6c30fae..9ecbaff 100644
+--- a/runtime/r0dump/r0dump_config_test.cc
++++ b/runtime/r0dump/r0dump_config_test.cc
+@@ -52,7 +52,7 @@ TEST(r0dump_ConfigTest, AcceptsCanonicalConfig) {
+ 
+ TEST(r0dump_ConfigTest, RejectsUndefinedCapturePointBit) {
+   r0dump_ProcessConfig config = r0dump_ValidConfig();
+-  config.capture_point_mask |= uint64_t{1} << 42u;
++  config.capture_point_mask |= uint64_t{1} << 43u;
+   r0dump_ConfigError error;
+   EXPECT_FALSE(r0dump_ValidateConfig(config, &error));
+   EXPECT_EQ(error.code, r0dump_ConfigErrorCode::kInvalidCapturePointMask);
+diff --git a/runtime/r0dump/r0dump_f2_flush_source_test.py b/runtime/r0dump/r0dump_f2_flush_source_test.py
+index b5ffe49..41e9f42 100644
+--- a/runtime/r0dump/r0dump_f2_flush_source_test.py
++++ b/runtime/r0dump/r0dump_f2_flush_source_test.py
+@@ -143,14 +143,16 @@ def r0dump_test_runtime_uses_single_terminal_finalizer() -> None:
+     assert "g_r0dump_active_capture_point_mask" not in finalizer
+     capture_source = r0dump_read("art/runtime/r0dump/r0dump_capture.cc")
+     capture_finalizer = r0dump_method_body(capture_source, "r0dump_FinalizeCaptureFlushRun")
+-    assert "g_r0dump_active_capture_point_mask.store(0u" in capture_finalizer
++    assert "r0dump_SetActiveCapturePointMask(0u)" in capture_finalizer
+     assert "r0dump_FinalizeFlushRun(*config, *staging" in capture_finalizer
+ 
+ 
+ def r0dump_test_configure_and_hooks_do_not_call_file_io() -> None:
+     capture = r0dump_read("art/runtime/r0dump/r0dump_capture.cc")
+     config = r0dump_read("art/runtime/r0dump/r0dump_config.cc")
+-    forbidden = ("open(", "openat(", "write(", "fsync(", "renameat(")
++    # The nearby protected-Dex candidate path may read /proc/self/maps, but
++    # capture/configure must never publish or mutate files from a hook.
++    forbidden = ("write(", "fsync(", "renameat(")
+     for token in forbidden:
+         assert token not in capture, f"capture must not perform I/O: {token}"
+         assert token not in config, f"configure must not perform I/O: {token}"
+diff --git a/runtime/r0dump/r0dump_f3_hook_source_test.py b/runtime/r0dump/r0dump_f3_hook_source_test.py
+index d8a04f7..b160034 100644
+--- a/runtime/r0dump/r0dump_f3_hook_source_test.py
++++ b/runtime/r0dump/r0dump_f3_hook_source_test.py
+@@ -101,7 +101,7 @@ r0dump_raw_facade = r0dump_method_body(
+     r0dump_capture, "r0dump_CaptureResult r0dump_ObserveRawBuffer("
+ )
+ assert "const r0dump_SourceInfo& source" in r0dump_capture
+-assert "r0dump_SetSourceMetadata(source, &metadata)" in r0dump_raw_facade
++assert "r0dump_SetSourceMetadata(source, metadata.get())" in r0dump_raw_facade
+ 
+ r0dump_source_vector_facade = r0dump_method_body(
+     r0dump_capture, "void r0dump_ObserveDexSources("
+diff --git a/runtime/r0dump/r0dump_f4_class_linker_source_test.py b/runtime/r0dump/r0dump_f4_class_linker_source_test.py
+index 7bb76c2..ff6ef92 100644
+--- a/runtime/r0dump/r0dump_f4_class_linker_source_test.py
++++ b/runtime/r0dump/r0dump_f4_class_linker_source_test.py
+@@ -86,7 +86,7 @@ def r0dump_main() -> None:
+     ):
+         assert resolve_body.count(point) == 2, point
+         assert resolve_body.count(site) == 1, site
+-        assert resolve_body.count("r0dump_ObserveMetadata") == 2
++    assert resolve_body.count("r0dump_ObserveResolveMethodMetadata") == 2
+     assert "r0dump_Write" not in resolve_body
+     assert "open(" not in resolve_body
+ 
+diff --git a/runtime/r0dump/r0dump_f9_dispatch_source_test.py b/runtime/r0dump/r0dump_f9_dispatch_source_test.py
+index 56e2c59..0c6bf9d 100644
+--- a/runtime/r0dump/r0dump_f9_dispatch_source_test.py
++++ b/runtime/r0dump/r0dump_f9_dispatch_source_test.py
+@@ -37,7 +37,12 @@ def r0dump_check_capture_facade() -> None:
+     assert "r0dump_ObserveMethodMetadata" in header
+     assert "ALWAYS_INLINE inline bool r0dump_IsCapturePointActiveFast" in header
+     assert "kR0dumpMaxArtifactsHardLimit" in source
+-    assert "std::unordered_set" not in source
++    code_item_source = r0dump_between(
++        source,
++        "bool r0dump_ObserveMethodCodeItem(",
++        "void r0dump_ObserveMethodMetadata(",
++    )
++    assert "std::unordered_set" not in code_item_source
+     code_item = r0dump_between(
+         source,
+         "bool r0dump_ObserveMethodCodeItem(",
+@@ -60,7 +65,7 @@ def r0dump_check_art_method() -> None:
+         "bool ArtMethod::IsSignaturePolymorphic()",
+     )
+     sentinel = "r0dump_TryHandleForceInvokeNoExecute(this)"
+-    observer = "r0dump_ObserveMethodCodeItem("
++    observer = "r0dump_ObserveMethodCodeItemOrMetadata("
+     stack_check = "self->GetStackEnd<kNativeStackType>()"
+     assert body.count(observer) == 1
+     assert "r0dump_Point::kArtMethodInvokeDispatch" in body
+diff --git a/runtime/r0dump/r0dump_file.cc b/runtime/r0dump/r0dump_file.cc
+index 5de0f7b..123b7f7 100644
+--- a/runtime/r0dump/r0dump_file.cc
++++ b/runtime/r0dump/r0dump_file.cc
+@@ -637,6 +637,15 @@ std::string r0dump_SerializeRecord(const r0dump_PendingRecord& record,
+   r0dump_AppendJsonField(&json, "materialize_status", record.metadata.materialize_status, &first);
+   r0dump_AppendJsonField(&json, "dispatch_status", record.metadata.dispatch_status, &first);
+   r0dump_AppendJsonField(&json, "exception_class", record.metadata.exception_class, &first);
++  r0dump_AppendJsonField(&json, "entry_kind", record.metadata.entry_kind, &first);
++  r0dump_AppendJsonNumber(&json, "access_flags", record.metadata.access_flags, &first);
++  r0dump_AppendJsonBoolean(
++      &json, "nterp_entry_fast_path", record.metadata.nterp_entry_fast_path, &first);
++  r0dump_AppendJsonBoolean(
++      &json, "nterp_invoke_fast_path", record.metadata.nterp_invoke_fast_path, &first);
++  r0dump_AppendJsonBoolean(&json, "code_item_present", record.metadata.code_item_present, &first);
++  r0dump_AppendJsonField(
++      &json, "observation_phase", record.metadata.observation_phase, &first);
+   json.append("}\n");
+   return json;
+ }
+diff --git a/runtime/r0dump/r0dump_file_test.cc b/runtime/r0dump/r0dump_file_test.cc
+index a9b1e9b..c964fcf 100644
+--- a/runtime/r0dump/r0dump_file_test.cc
++++ b/runtime/r0dump/r0dump_file_test.cc
+@@ -614,6 +614,49 @@ TEST_F(r0dump_FileTest, SerializesStructuredSourceMetadata) {
+   close(run_fd);
+ }
+ 
++TEST_F(r0dump_FileTest, SerializesMethodExecutionStateMetadata) {
++  const int run_fd = r0dump_OpenRun();
++  ASSERT_GE(run_fd, 0);
++  auto pool = std::make_shared<r0dump_BufferPool>(kR0dumpChunkBytes);
++  r0dump_Staging staging(pool, 1u, 2u, 1u, kR0dumpChunkBytes);
++  r0dump_RecordMetadata metadata = {
++      .method_index = 7u,
++      .entry_kind = "nterp",
++      .access_flags = 0x1234u,
++      .nterp_entry_fast_path = true,
++      .nterp_invoke_fast_path = false,
++      .code_item_present = true,
++      .observation_phase = "nterp_entry",
++  };
++  ASSERT_EQ(staging.r0dump_SubmitMetadata(
++                       r0dump_Context(r0dump_Point::kNterpMethodEntry,
++                                      "Nterp.method.entry",
++                                      1u),
++                       std::move(metadata))
++                .status,
++            r0dump_SubmitStatus::kAccepted);
++  r0dump_FreezeResult frozen = staging.r0dump_TryFreeze();
++  ASSERT_EQ(frozen.status, r0dump_FreezeStatus::kFrozen);
++
++  r0dump_WriterState writer;
++  const r0dump_GenerationWriteResult result =
++      r0dump_WriteFrozenGeneration(run_fd, "run", 123u, *frozen.generation, &writer);
++  ASSERT_TRUE(result.ok) << result.operation;
++
++  const int records_fd = r0dump_OpenDirectoryAt(run_fd, "records");
++  ASSERT_GE(records_fd, 0);
++  const std::string record = r0dump_ReadFileAt(records_fd, "000001.json");
++  EXPECT_NE(record.find("\"entry_kind\":\"nterp\""), std::string::npos);
++  EXPECT_NE(record.find("\"access_flags\":4660"), std::string::npos);
++  EXPECT_NE(record.find("\"nterp_entry_fast_path\":true"), std::string::npos);
++  EXPECT_NE(record.find("\"nterp_invoke_fast_path\":false"), std::string::npos);
++  EXPECT_NE(record.find("\"code_item_present\":true"), std::string::npos);
++  EXPECT_NE(record.find("\"observation_phase\":\"nterp_entry\""), std::string::npos);
++  EXPECT_TRUE(staging.r0dump_ReleaseFrozen(frozen.generation->generation_id));
++  close(records_fd);
++  close(run_fd);
++}
++
+ TEST_F(r0dump_FileTest, UsesDocumentedArtifactExtensions) {
+   const int run_fd = r0dump_OpenRun();
+   ASSERT_GE(run_fd, 0);
+diff --git a/runtime/r0dump/r0dump_nearby_snapshot.cc b/runtime/r0dump/r0dump_nearby_snapshot.cc
+new file mode 100644
+index 0000000..a55492d
+--- /dev/null
++++ b/runtime/r0dump/r0dump_nearby_snapshot.cc
+@@ -0,0 +1,162 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++#include "r0dump/r0dump_nearby_snapshot.h"
++
++#include <algorithm>
++#include <cinttypes>
++#include <cstdio>
++#include <cstring>
++#include <limits>
++#include <utility>
++#include <vector>
++
++namespace art HIDDEN {
++namespace {
++
++constexpr size_t kDexHeaderSize = 0x70u;
++constexpr size_t kDexMagicSize = 8u;
++constexpr size_t kScanAlignment = 4u;
++
++struct r0dump_ReadableRange final {
++  uintptr_t begin = 0u;
++  uintptr_t end = 0u;
++};
++
++bool r0dump_ParseMaps(std::vector<r0dump_ReadableRange>* ranges) {
++  FILE* maps = fopen("/proc/self/maps", "re");
++  if (maps == nullptr) {
++    return false;
++  }
++  char line[512];
++  while (fgets(line, sizeof(line), maps) != nullptr) {
++    unsigned long long begin = 0u;
++    unsigned long long end = 0u;
++    char permissions[5] = {};
++    if (std::sscanf(line, "%llx-%llx %4s", &begin, &end, permissions) != 3 ||
++        permissions[0] != 'r' || begin >= end) {
++      continue;
++    }
++    ranges->push_back({static_cast<uintptr_t>(begin), static_cast<uintptr_t>(end)});
++  }
++  fclose(maps);
++  std::sort(ranges->begin(), ranges->end(), [](const auto& left, const auto& right) {
++    return left.begin < right.begin;
++  });
++  return !ranges->empty();
++}
++
++bool r0dump_IsReadableRange(const std::vector<r0dump_ReadableRange>& ranges,
++                            uintptr_t begin,
++                            size_t size) {
++  if (size == 0u || size > UINTPTR_MAX - begin) {
++    return false;
++  }
++  uintptr_t cursor = begin;
++  const uintptr_t end = begin + size;
++  for (const r0dump_ReadableRange& range : ranges) {
++    if (range.end <= cursor) {
++      continue;
++    }
++    if (range.begin > cursor) {
++      return false;
++    }
++    cursor = std::max(cursor, range.end);
++    if (cursor >= end) {
++      return true;
++    }
++  }
++  return false;
++}
++
++bool r0dump_IsDexMagic(const uint8_t* bytes) {
++  return std::memcmp(bytes, "dex\n", 4u) == 0 && bytes[4] >= '0' && bytes[4] <= '9' &&
++         bytes[5] >= '0' && bytes[5] <= '9' && bytes[6] >= '0' && bytes[6] <= '9' &&
++         bytes[7] == 0;
++}
++
++uint32_t r0dump_ReadU32(const uint8_t* bytes) {
++  uint32_t value = 0u;
++  std::memcpy(&value, bytes, sizeof(value));
++  return value;
++}
++
++size_t r0dump_Distance(uintptr_t candidate, uintptr_t anchor) {
++  return candidate <= anchor ? static_cast<size_t>(anchor - candidate)
++                             : static_cast<size_t>(candidate - anchor);
++}
++
++}  // namespace
++
++std::vector<r0dump_NearbyDexCandidate> r0dump_FindNearbyDexCandidates(
++    const uint8_t* anchor,
++    size_t bytes_before,
++    size_t bytes_after,
++    size_t max_dex_bytes,
++    size_t max_candidates) {
++  std::vector<r0dump_NearbyDexCandidate> candidates;
++  if (anchor == nullptr || max_dex_bytes < kDexHeaderSize || max_candidates == 0u) {
++    return candidates;
++  }
++  const uintptr_t anchor_value = reinterpret_cast<uintptr_t>(anchor);
++  if (bytes_before > anchor_value || bytes_after > UINTPTR_MAX - anchor_value) {
++    return candidates;
++  }
++  const uintptr_t scan_begin = anchor_value - bytes_before;
++  const uintptr_t scan_end = anchor_value + bytes_after;
++  std::vector<r0dump_ReadableRange> ranges;
++  if (!r0dump_ParseMaps(&ranges)) {
++    return candidates;
++  }
++
++  for (const r0dump_ReadableRange& range : ranges) {
++    const uintptr_t begin = std::max(scan_begin, range.begin);
++    const uintptr_t end = std::min(scan_end, range.end);
++    if (begin >= end || end - begin < kDexMagicSize) {
++      continue;
++    }
++    uintptr_t cursor = (begin + (kScanAlignment - 1u)) & ~(kScanAlignment - 1u);
++    while (cursor + kDexHeaderSize <= end) {
++      const uint8_t* header = reinterpret_cast<const uint8_t*>(cursor);
++      if (r0dump_IsDexMagic(header)) {
++        const uint32_t file_size = r0dump_ReadU32(header + 32u);
++        const uint32_t header_size = r0dump_ReadU32(header + 36u);
++        if (header_size == kDexHeaderSize && file_size >= kDexHeaderSize &&
++            file_size <= max_dex_bytes &&
++            static_cast<size_t>(file_size) <= UINTPTR_MAX - cursor &&
++            cursor <= anchor_value && anchor_value - cursor < file_size &&
++            r0dump_IsReadableRange(ranges, cursor, file_size)) {
++          bool duplicate = false;
++          for (const r0dump_NearbyDexCandidate& candidate : candidates) {
++            duplicate |= candidate.begin == header;
++          }
++          if (!duplicate) {
++            candidates.push_back({header, file_size, r0dump_Distance(cursor, anchor_value)});
++            if (candidates.size() == max_candidates) {
++              return candidates;
++            }
++          }
++        }
++      }
++      cursor += kScanAlignment;
++    }
++  }
++  std::sort(candidates.begin(), candidates.end(), [](const auto& left, const auto& right) {
++    return left.distance < right.distance;
++  });
++  return candidates;
++}
++
++}  // namespace art HIDDEN
+diff --git a/runtime/r0dump/r0dump_nearby_snapshot.h b/runtime/r0dump/r0dump_nearby_snapshot.h
+new file mode 100644
+index 0000000..9982588
+--- /dev/null
++++ b/runtime/r0dump/r0dump_nearby_snapshot.h
+@@ -0,0 +1,47 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++#ifndef ART_RUNTIME_R0DUMP_R0DUMP_NEARBY_SNAPSHOT_H_
++#define ART_RUNTIME_R0DUMP_R0DUMP_NEARBY_SNAPSHOT_H_
++
++#include <cstddef>
++#include <cstdint>
++#include <vector>
++
++#include "base/macros.h"
++
++namespace art HIDDEN {
++
++// A candidate is only a bounded, readable memory span.  The caller must still
++// apply the canonical DEX layout validator before submitting it as a capture.
++struct r0dump_NearbyDexCandidate final {
++  const uint8_t* begin = nullptr;
++  size_t size = 0u;
++  size_t distance = 0u;
++};
++
++// Search readable process mappings around an address for complete standard DEX
++// images which contain that address.  This is deliberately bounded: it is used
++// only by the class-loader walk recovery path, never by ordinary DEX parsing.
++std::vector<r0dump_NearbyDexCandidate> r0dump_FindNearbyDexCandidates(
++    const uint8_t* anchor,
++    size_t bytes_before,
++    size_t bytes_after,
++    size_t max_dex_bytes,
++    size_t max_candidates = 8u);
++
++}  // namespace art HIDDEN
++
++#endif  // ART_RUNTIME_R0DUMP_R0DUMP_NEARBY_SNAPSHOT_H_
+-- 
+2.43.0
+

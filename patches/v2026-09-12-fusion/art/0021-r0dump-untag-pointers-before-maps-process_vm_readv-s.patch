@@ -1,0 +1,133 @@
+From 0557489b44f197e5b8eb261bc3cda5842055306b Mon Sep 17 00:00:00 2001
+From: Ivory <contact@ivory.cafe>
+Date: Sat, 12 Sep 2026 00:58:50 +0800
+Subject: [PATCH 21/21] r0dump: untag pointers before
+ maps/process_vm_readv/span checks
+
+Heap-backed DexFiles (e.g. a packer's InMemoryDexClassLoader over a direct
+ByteBuffer whose bytes come from Scudo) carry an arm64 top-byte pointer tag.
+The CPU ignores the tag on dereference (Top-Byte-Ignore), but /proc/self/maps
+and process_vm_readv operate in the untagged VA space, so passing a tagged
+address to a maps lookup or a remote read makes a perfectly readable DEX look
+unmapped. The result was that every decrypted in-memory business DEX (verified
+on com.icbc.elife / SecNeo: 6 Anonymous DEXs, ~40k class_defs) was dropped at
+the Walk.cookie.dex observation with drop_reason=invalid_range, dex_format=-,
+while the file-mapped base.apk (untagged pointer) was captured normally.
+
+Apply r0dump_UntagAddress at the single choke points that treat a pointer as a
+number: r0dump_IsReadableSpan (covers ValidateDexImage/ValidateStandardDexLayout
+guards), r0dump_CopyLogicalData (overlap math + remote iovec) and
+r0dump_IsBoundedSpan (both operands). Mirror it in r0dump_nearby_snapshot's
+FindNearbyDexCandidates anchor. Actual dereferences (memcpy/hash/copy) are left
+on the original pointer and remain correct under TBI. UntagAddress is moved
+above its first use.
+
+Verified end to end on com.icbc.elife: all 7 cookie DEXs now accepted; device
+export rehydrates the business DEXs byte-identically to the host tool and JADX
+recovers the com.icbc sources.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Change-Id: Ie9fa3a9136c63ac11e3987e18772fcb7c5e3445c
+---
+ runtime/r0dump/r0dump_capture.cc         | 32 ++++++++++++++++--------
+ runtime/r0dump/r0dump_nearby_snapshot.cc |  6 ++++-
+ 2 files changed, 27 insertions(+), 11 deletions(-)
+
+diff --git a/runtime/r0dump/r0dump_capture.cc b/runtime/r0dump/r0dump_capture.cc
+index a5dbf58..8f55667 100644
+--- a/runtime/r0dump/r0dump_capture.cc
++++ b/runtime/r0dump/r0dump_capture.cc
+@@ -155,6 +155,16 @@ class r0dump_RecursionGuard final {
+   const bool entered_;
+ };
+ 
++uintptr_t r0dump_UntagAddress(uintptr_t address) {
++  // Android arm64 user virtual addresses currently use at most 56 bits; strip a possible
++  // top-byte/MTE tag before looking the address up in /proc/self/maps or comparing spans.
++  // ART hands out tagged pointers for heap-backed DexFiles (e.g. InMemoryDexClassLoader over a
++  // direct ByteBuffer, whose bytes come from Scudo).  The CPU ignores the tag on dereference
++  // (Top-Byte-Ignore), but /proc/self/maps and process_vm_readv operate in the untagged space,
++  // so every maps/bounds decision must untag first or a perfectly readable DEX looks unmapped.
++  return address & UINT64_C(0x00ffffffffffffff);
++}
++
+ bool r0dump_IsBoundedSpan(const uint8_t* begin,
+                           size_t size,
+                           const uint8_t* container_begin,
+@@ -162,8 +172,11 @@ bool r0dump_IsBoundedSpan(const uint8_t* begin,
+   if (begin == nullptr || size == 0u || container_begin == nullptr) {
+     return false;
+   }
+-  const uintptr_t begin_value = reinterpret_cast<uintptr_t>(begin);
+-  const uintptr_t container_begin_value = reinterpret_cast<uintptr_t>(container_begin);
++  // Compare spans in the untagged VA space so a tagged header pointer and its (possibly
++  // differently tagged) container are measured consistently.
++  const uintptr_t begin_value = r0dump_UntagAddress(reinterpret_cast<uintptr_t>(begin));
++  const uintptr_t container_begin_value =
++      r0dump_UntagAddress(reinterpret_cast<uintptr_t>(container_begin));
+   if (container_size > UINTPTR_MAX - container_begin_value) {
+     return false;
+   }
+@@ -180,7 +193,10 @@ bool r0dump_IsReadableSpan(const uint8_t* begin, size_t size) {
+   if (begin == nullptr || size == 0u) {
+     return false;
+   }
+-  const uintptr_t start = reinterpret_cast<uintptr_t>(begin);
++  // Untag before every /proc/self/maps lookup: heap-backed DexFiles carry an arm64 top-byte tag
++  // that the CPU ignores on dereference but maps does not, so a tagged-but-readable span would
++  // otherwise be misjudged unmapped.  This is the single choke point for all readability checks.
++  const uintptr_t start = r0dump_UntagAddress(reinterpret_cast<uintptr_t>(begin));
+   if (size > UINTPTR_MAX - start) {
+     return false;
+   }
+@@ -214,12 +230,6 @@ bool r0dump_IsReadableSpan(const uint8_t* begin, size_t size) {
+   return false;
+ }
+ 
+-uintptr_t r0dump_UntagAddress(uintptr_t address) {
+-  // Android arm64 user virtual addresses currently use at most 56 bits; strip a possible
+-  // top-byte/MTE tag before looking the address up in /proc/self/maps.
+-  return address & UINT64_C(0x00ffffffffffffff);
+-}
+-
+ void r0dump_AnnotateLogicalCopy(r0dump_RecordMetadata* metadata,
+                                 bool complete,
+                                 size_t copied_bytes) {
+@@ -252,7 +262,9 @@ std::unique_ptr<uint8_t[]> r0dump_CopyLogicalData(const uint8_t* begin,
+   if (copy == nullptr) {
+     return nullptr;
+   }
+-  const uintptr_t start = reinterpret_cast<uintptr_t>(begin);
++  // Untag: the overlap math against /proc/self/maps and the process_vm_readv remote iovec must
++  // all reference the untagged address, otherwise a tagged heap-backed DEX copies zero bytes.
++  const uintptr_t start = r0dump_UntagAddress(reinterpret_cast<uintptr_t>(begin));
+   const uintptr_t end = start + size;
+   *complete = true;
+   *copied_bytes = 0u;
+diff --git a/runtime/r0dump/r0dump_nearby_snapshot.cc b/runtime/r0dump/r0dump_nearby_snapshot.cc
+index a55492d..0d3a071 100644
+--- a/runtime/r0dump/r0dump_nearby_snapshot.cc
++++ b/runtime/r0dump/r0dump_nearby_snapshot.cc
+@@ -98,6 +98,10 @@ size_t r0dump_Distance(uintptr_t candidate, uintptr_t anchor) {
+                              : static_cast<size_t>(candidate - anchor);
+ }
+ 
++// Strip an arm64 top-byte/MTE tag so an anchor sourced from a heap-backed DexFile (tagged) is
++// scanned in the same untagged VA space that /proc/self/maps reports.
++uintptr_t r0dump_UntagLocal(uintptr_t address) { return address & UINT64_C(0x00ffffffffffffff); }
++
+ }  // namespace
+ 
+ std::vector<r0dump_NearbyDexCandidate> r0dump_FindNearbyDexCandidates(
+@@ -110,7 +114,7 @@ std::vector<r0dump_NearbyDexCandidate> r0dump_FindNearbyDexCandidates(
+   if (anchor == nullptr || max_dex_bytes < kDexHeaderSize || max_candidates == 0u) {
+     return candidates;
+   }
+-  const uintptr_t anchor_value = reinterpret_cast<uintptr_t>(anchor);
++  const uintptr_t anchor_value = r0dump_UntagLocal(reinterpret_cast<uintptr_t>(anchor));
+   if (bytes_before > anchor_value || bytes_after > UINTPTR_MAX - anchor_value) {
+     return candidates;
+   }
+-- 
+2.43.0
+

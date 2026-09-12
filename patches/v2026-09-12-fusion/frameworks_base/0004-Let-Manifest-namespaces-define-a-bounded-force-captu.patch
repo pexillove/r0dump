@@ -1,0 +1,581 @@
+From 6be028b653cf74a71f7273e47362690a6b792c9d Mon Sep 17 00:00:00 2001
+From: Ivory <contact@ivory.cafe>
+Date: Mon, 31 Aug 2026 23:17:00 +0800
+Subject: [PATCH 4/9] Let Manifest namespaces define a bounded force-capture
+ scope
+
+Use manifest-derived namespace prefixes when an exact force selector is absent, preserve explicit selector behavior, and align persisted fallbacks with the accepted Manager defaults.
+
+Constraint: Manifest-scoped capture must remain bounded by class, method, and attempt budgets.
+
+Rejected: Require an exact class and method selector for every force capture | It prevents automatic coverage of manifest-owned namespaces.
+
+Confidence: high
+
+Scope-risk: moderate
+
+Directive: Preserve deterministic namespace ordering and shared validation semantics across Framework, Manager, and ART.
+
+Tested: source contract validation; m -j8 framework-minus-apex; userdebug framework replacement and post-flash validation.
+Change-Id: Ifb1eb177c960b98795a34622caa8b740ca388db9
+---
+ .../android/app/r0dump_ClassLoaderWalk.java   | 205 +++++++++++++++++-
+ .../java/android/app/r0dump_FusionConfig.java |  55 ++---
+ .../android/app/r0dump_FusionConfigTest.java  |  71 ++++--
+ .../app/r0dump_ManifestHelperTest.java        |  47 ++++
+ 4 files changed, 322 insertions(+), 56 deletions(-)
+
+diff --git a/core/java/android/app/r0dump_ClassLoaderWalk.java b/core/java/android/app/r0dump_ClassLoaderWalk.java
+index b79e976b1..db13e1e16 100644
+--- a/core/java/android/app/r0dump_ClassLoaderWalk.java
++++ b/core/java/android/app/r0dump_ClassLoaderWalk.java
+@@ -21,9 +21,14 @@ import dalvik.system.r0dump_Runtime;
+ import java.lang.reflect.Constructor;
+ import java.lang.reflect.Executable;
+ import java.lang.reflect.Method;
++import java.lang.reflect.Modifier;
+ import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.Comparator;
+ import java.util.HashSet;
+ import java.util.IdentityHashMap;
++import java.util.LinkedHashSet;
++import java.util.List;
+ import java.util.concurrent.atomic.AtomicReference;
+ 
+ /** Process-local, bounded ClassLoader inventory for r0dump. */
+@@ -76,6 +81,46 @@ final class r0dump_ClassLoaderWalk {
+     }
+   }
+ 
++  private static final class r0dump_ForceState {
++    final int maxClasses;
++    final int maxExecutables;
++    final int maxAttempts;
++    final List<String> namespacePrefixes;
++    final IdentityHashMap<ClassLoader, HashSet<String>> seenNames = new IdentityHashMap<>();
++    final IdentityHashMap<Class<?>, Boolean> seenClasses = new IdentityHashMap<>();
++    int classCount;
++    int executableCount;
++    int attemptCount;
++
++    r0dump_ForceState(
++        r0dump_FusionConfig config, List<String> namespacePrefixes, int priorAttempts) {
++      maxClasses = (int) config.walkMaxClasses;
++      maxExecutables = (int) config.walkMaxMethods;
++      maxAttempts = (int) config.forceMaxCalls;
++      this.namespacePrefixes = namespacePrefixes;
++      attemptCount = priorAttempts;
++    }
++
++    boolean r0dump_hasBudget() {
++      return classCount < maxClasses
++          && executableCount < maxExecutables
++          && attemptCount < maxAttempts;
++    }
++
++    boolean r0dump_markName(ClassLoader loader, String className) {
++      HashSet<String> names = seenNames.get(loader);
++      if (names == null) {
++        names = new HashSet<>();
++        seenNames.put(loader, names);
++      }
++      if (!names.add(className)) {
++        return false;
++      }
++      classCount++;
++      return true;
++    }
++  }
++
+   private r0dump_ClassLoaderWalk() {}
+ 
+   static void r0dump_prepare(
+@@ -166,7 +211,9 @@ final class r0dump_ClassLoaderWalk {
+         }
+       }
+       if (request.config.forceInvokeEnabled) {
+-        r0dump_forceInvoke(request.config, loaders);
++        final int priorAttempts = r0dump_forceInvokeExact(request.config, loaders);
++        r0dump_forceManifestNamespaces(
++            r0dump_manifest, request.config, applicationLoader, loaders, priorAttempts);
+       }
+     }
+     return true;
+@@ -336,30 +383,166 @@ final class r0dump_ClassLoaderWalk {
+     }
+   }
+ 
+-  private static void r0dump_forceInvoke(
++  private static int r0dump_forceInvokeExact(
+       r0dump_FusionConfig config, ArrayList<ClassLoader> loaders) {
+-    if (!config.forceInvokeEnabled) {
+-      return;
++    if (!config.forceInvokeEnabled
++        || config.forceClass.isEmpty()
++        || config.forceMethod.isEmpty()
++        || config.forceMethodDescriptor.isEmpty()) {
++      return 0;
+     }
+     final IdentityHashMap<Class<?>, Boolean> seenClasses = new IdentityHashMap<>();
+-    int captured = 0;
+     for (ClassLoader loader : loaders) {
+-      if (captured >= config.forceMaxCalls) {
+-        return;
+-      }
+       try {
+         final Class<?> klass = Class.forName(config.forceClass, false, loader);
+         if (seenClasses.put(klass, Boolean.TRUE) != null) {
+           continue;
+         }
+         final Executable executable = r0dump_findForceExecutable(klass, config);
+-        if (executable != null
+-            && r0dump_Runtime.r0dump_ForceInvoke(executable, null, config.forceClass)) {
+-          captured++;
++        if (executable != null) {
++          r0dump_Runtime.r0dump_ForceInvoke(executable, null, config.forceClass);
++          return 1;
+         }
+       } catch (ClassNotFoundException | SecurityException | LinkageError ignored) {
+       }
+     }
++    return 0;
++  }
++
++  private static void r0dump_forceManifestNamespaces(
++      r0dump_ManifestHelper.r0dump_Snapshot snapshot,
++      r0dump_FusionConfig config,
++      ClassLoader applicationLoader,
++      ArrayList<ClassLoader> loaders,
++      int priorAttempts) {
++    final List<String> prefixes = r0dump_manifestNamespacePrefixes(snapshot);
++    if (!config.forceInvokeEnabled || prefixes.isEmpty() || priorAttempts >= config.forceMaxCalls) {
++      return;
++    }
++    final r0dump_ForceState state = new r0dump_ForceState(config, prefixes, priorAttempts);
++    final String[] seedNames = new String[snapshot.seeds.size()];
++    for (int i = 0; i < snapshot.seeds.size(); i++) {
++      seedNames[i] = snapshot.seeds.get(i).className;
++    }
++    r0dump_forceNames(applicationLoader, seedNames, state);
++    for (ClassLoader loader : loaders) {
++      if (!state.r0dump_hasBudget()) {
++        return;
++      }
++      try {
++        final Object[] cookies = r0dump_Runtime.r0dump_GetDexCookies(loader);
++        if (cookies != null) {
++          for (Object cookie : cookies) {
++            if (cookie != null && state.r0dump_hasBudget()) {
++              r0dump_forceNames(loader, r0dump_Runtime.r0dump_GetCookieClassNames(cookie), state);
++            }
++          }
++        }
++      } catch (RuntimeException | LinkageError ignored) {
++      }
++      if (!state.r0dump_hasBudget()) {
++        return;
++      }
++      try {
++        r0dump_forceNames(loader, r0dump_Runtime.r0dump_GetLoadedClassNames(loader), state);
++      } catch (RuntimeException | LinkageError ignored) {
++      }
++    }
++  }
++
++  static List<String> r0dump_manifestNamespacePrefixes(
++      r0dump_ManifestHelper.r0dump_Snapshot snapshot) {
++    if (snapshot == null) {
++      return List.of();
++    }
++    final LinkedHashSet<String> candidates = new LinkedHashSet<>();
++    for (r0dump_ManifestHelper.r0dump_ClassSeed seed : snapshot.seeds) {
++      if (seed == null || seed.className == null) {
++        continue;
++      }
++      final int separator = seed.className.lastIndexOf('.');
++      if (separator > 0) {
++        candidates.add(seed.className.substring(0, separator + 1));
++      }
++    }
++    final ArrayList<String> sorted = new ArrayList<>(candidates);
++    sorted.sort(Comparator.comparingInt(String::length).thenComparing(Comparator.naturalOrder()));
++    final ArrayList<String> minimal = new ArrayList<>();
++    for (String candidate : sorted) {
++      if (!r0dump_matchesNamespace(candidate, minimal)) {
++        minimal.add(candidate);
++      }
++    }
++    return List.copyOf(minimal);
++  }
++
++  static boolean r0dump_matchesNamespace(String className, List<String> prefixes) {
++    if (className == null || prefixes == null) {
++      return false;
++    }
++    for (String prefix : prefixes) {
++      if (prefix != null && !prefix.isEmpty() && className.startsWith(prefix)) {
++        return true;
++      }
++    }
++    return false;
++  }
++
++  private static void r0dump_forceNames(
++      ClassLoader loader, String[] classNames, r0dump_ForceState state) {
++    if (loader == null || classNames == null) {
++      return;
++    }
++    for (String className : classNames) {
++      if (!state.r0dump_hasBudget()) {
++        return;
++      }
++      if (className == null
++          || className.isEmpty()
++          || !r0dump_matchesNamespace(className, state.namespacePrefixes)
++          || !state.r0dump_markName(loader, className)) {
++        continue;
++      }
++      try {
++        final Class<?> klass = Class.forName(className, false, loader);
++        if (state.seenClasses.put(klass, Boolean.TRUE) == null) {
++          r0dump_forceExecutables(klass, className, state);
++        }
++      } catch (ClassNotFoundException | SecurityException | LinkageError ignored) {
++      }
++    }
++  }
++
++  private static void r0dump_forceExecutables(
++      Class<?> klass, String className, r0dump_ForceState state) {
++    final ArrayList<Executable> executables = new ArrayList<>();
++    try {
++      executables.addAll(Arrays.asList(klass.getDeclaredConstructors()));
++      executables.addAll(Arrays.asList(klass.getDeclaredMethods()));
++    } catch (SecurityException | LinkageError e) {
++      return;
++    }
++    executables.sort(Comparator.comparing(r0dump_ClassLoaderWalk::r0dump_executableSortKey));
++    for (Executable executable : executables) {
++      if (!state.r0dump_hasBudget()) {
++        return;
++      }
++      state.executableCount++;
++      final int modifiers = executable.getModifiers();
++      if (Modifier.isAbstract(modifiers) || Modifier.isNative(modifiers)) {
++        continue;
++      }
++      state.attemptCount++;
++      try {
++        r0dump_Runtime.r0dump_ForceInvoke(executable, null, className);
++      } catch (RuntimeException | LinkageError ignored) {
++      }
++    }
++  }
++
++  private static String r0dump_executableSortKey(Executable executable) {
++    final String name = executable instanceof Constructor ? "<init>" : executable.getName();
++    return name + r0dump_descriptor(executable);
+   }
+ 
+   private static Executable r0dump_findForceExecutable(Class<?> klass, r0dump_FusionConfig config) {
+diff --git a/core/java/android/app/r0dump_FusionConfig.java b/core/java/android/app/r0dump_FusionConfig.java
+index d0a5b2f26..94fae46a5 100644
+--- a/core/java/android/app/r0dump_FusionConfig.java
++++ b/core/java/android/app/r0dump_FusionConfig.java
+@@ -18,8 +18,8 @@ package android.app;
+ 
+ import android.content.Context;
+ import android.net.LocalSocket;
+-import android.os.Process;
+ import android.os.ParcelFileDescriptor;
++import android.os.Process;
+ import android.os.RemoteException;
+ import android.os.SystemProperties;
+ import android.os.UserHandle;
+@@ -280,18 +280,18 @@ public final class r0dump_FusionConfig {
+       json.put("target_process", properties.r0dump_get(PROPERTY_PREFIX + "target_process", ""));
+       json.put(
+           "capture_point_mask",
+-          properties.r0dump_get(PROPERTY_PREFIX + "capture_point_mask", "0x0000000000000000"));
++          properties.r0dump_get(PROPERTY_PREFIX + "capture_point_mask", "0x0000020000000028"));
+       json.put("max_records", r0dump_readPropertyLong(properties, "max_records", "512"));
+       json.put("max_artifacts", r0dump_readPropertyLong(properties, "max_artifacts", "128"));
+       json.put(
+-          "max_total_bytes", r0dump_readPropertyLong(properties, "max_total_bytes", "201326592"));
+-      json.put("max_dex_bytes", r0dump_readPropertyLong(properties, "max_dex_bytes", "33554432"));
++          "max_total_bytes", r0dump_readPropertyLong(properties, "max_total_bytes", "1073741824"));
++      json.put("max_dex_bytes", r0dump_readPropertyLong(properties, "max_dex_bytes", "268435456"));
+       json.put(
+           "buffer_pool_bytes",
+-          r0dump_readPropertyLong(properties, "buffer_pool_bytes", "67108864"));
++          r0dump_readPropertyLong(properties, "buffer_pool_bytes", "536870912"));
+       json.put(
+           "max_code_item_bytes",
+-          r0dump_readPropertyLong(properties, "max_code_item_bytes", "1048576"));
++          r0dump_readPropertyLong(properties, "max_code_item_bytes", "4194304"));
+       json.put(
+           "max_frozen_generations",
+           r0dump_readPropertyLong(properties, "max_frozen_generations", "4"));
+@@ -317,18 +317,19 @@ public final class r0dump_FusionConfig {
+       json.put(
+           "manifest_max_attribute_length",
+           r0dump_readPropertyLong(properties, "manifest_max_attribute_length", "1024"));
+-      json.put("walk_enabled", r0dump_readPropertyBoolean(properties, "walk_enabled", "0"));
++      json.put("walk_enabled", r0dump_readPropertyBoolean(properties, "walk_enabled", "1"));
+       json.put(
+           "walk_start",
+           properties.r0dump_get(PROPERTY_PREFIX + "walk_start", "after_application_on_create"));
+       json.put("walk_mode", properties.r0dump_get(PROPERTY_PREFIX + "walk_mode", "loaded_only"));
+       json.put("walk_delay_ms", r0dump_readPropertyLong(properties, "walk_delay_ms", "5000"));
+-      json.put("walk_max_classes", r0dump_readPropertyLong(properties, "walk_max_classes", "2000"));
+       json.put(
+-          "walk_max_methods", r0dump_readPropertyLong(properties, "walk_max_methods", "20000"));
++          "walk_max_classes", r0dump_readPropertyLong(properties, "walk_max_classes", "16384"));
++      json.put(
++          "walk_max_methods", r0dump_readPropertyLong(properties, "walk_max_methods", "65536"));
+       json.put(
+           "force_invoke_enabled",
+-          r0dump_readPropertyBoolean(properties, "force_invoke_enabled", "0"));
++          r0dump_readPropertyBoolean(properties, "force_invoke_enabled", "1"));
+       json.put("force_class", properties.r0dump_get(PROPERTY_PREFIX + "force_class", ""));
+       json.put("force_method", properties.r0dump_get(PROPERTY_PREFIX + "force_method", ""));
+       json.put(
+@@ -337,7 +338,7 @@ public final class r0dump_FusionConfig {
+       json.put("force_max_calls", r0dump_readPropertyLong(properties, "force_max_calls", "1"));
+       json.put(
+           "anr_protection_enabled",
+-          r0dump_readPropertyBoolean(properties, "anr_protection_enabled", "0"));
++          r0dump_readPropertyBoolean(properties, "anr_protection_enabled", "1"));
+     } catch (JSONException e) {
+       throw r0dump_invalid("properties");
+     }
+@@ -362,12 +363,7 @@ public final class r0dump_FusionConfig {
+       String processName,
+       String runId) {
+     return r0dump_validateOutputPreparationForSystemServer(
+-        expectedGeneration,
+-        targetUid,
+-        packageName,
+-        processName,
+-        runId,
+-        SYSTEM_PROPERTIES);
++        expectedGeneration, targetUid, packageName, processName, runId, SYSTEM_PROPERTIES);
+   }
+ 
+   static boolean r0dump_validateOutputPreparationForSystemServer(
+@@ -738,13 +734,13 @@ public final class r0dump_FusionConfig {
+         || maxArtifacts == 0
+         || maxArtifacts > 512
+         || maxArtifacts > maxRecords
+-        || maxTotalBytes > 512L * 1024 * 1024
+-        || maxDexBytes > 128L * 1024 * 1024
++        || maxTotalBytes > 1024L * 1024 * 1024
++        || maxDexBytes > 256L * 1024 * 1024
+         || maxDexBytes > maxTotalBytes
+         || bufferPoolBytes < maxDexBytes
+-        || bufferPoolBytes > 256L * 1024 * 1024
++        || bufferPoolBytes > 512L * 1024 * 1024
+         || maxCodeItemBytes == 0
+-        || maxCodeItemBytes > 1024L * 1024
++        || maxCodeItemBytes > 4L * 1024 * 1024
+         || maxCodeItemBytes > bufferPoolBytes
+         || maxFrozenGenerations == 0
+         || maxFrozenGenerations > 4
+@@ -775,12 +771,17 @@ public final class r0dump_FusionConfig {
+     if (forceMaxCalls == 0 || forceMaxCalls > 8) {
+       throw r0dump_invalid("force_max_calls");
+     }
+-    if (forceInvokeEnabled
+-        && ((capturePointMask & FORCE_INVOKE_NO_EXECUTE_BIT) == 0
+-            || !r0dump_isBinaryClassName(forceClass)
+-            || !r0dump_isMethodName(forceMethod)
+-            || !r0dump_isMethodDescriptor(forceMethodDescriptor))) {
+-      throw r0dump_invalid("force_selector");
++    if (forceInvokeEnabled) {
++      final boolean selectorEmpty =
++          forceClass.isEmpty() && forceMethod.isEmpty() && forceMethodDescriptor.isEmpty();
++      if ((capturePointMask & FORCE_INVOKE_NO_EXECUTE_BIT) == 0
++          || (selectorEmpty && !manifestEnabled)
++          || (!selectorEmpty
++              && (!r0dump_isBinaryClassName(forceClass)
++                  || !r0dump_isMethodName(forceMethod)
++                  || !r0dump_isMethodDescriptor(forceMethodDescriptor)))) {
++        throw r0dump_invalid("force_selector");
++      }
+     }
+   }
+ 
+diff --git a/core/tests/coretests/src/android/app/r0dump_FusionConfigTest.java b/core/tests/coretests/src/android/app/r0dump_FusionConfigTest.java
+index 67623ad75..acca0732c 100644
+--- a/core/tests/coretests/src/android/app/r0dump_FusionConfigTest.java
++++ b/core/tests/coretests/src/android/app/r0dump_FusionConfigTest.java
+@@ -262,6 +262,32 @@ public class r0dump_FusionConfigTest {
+     assertThat(config.forceClass).isEqualTo("bin.mt.plus.Target$Inner");
+   }
+ 
++  @Test
++  public void r0dump_parse_acceptsManifestNamespaceForceWithoutExactSelector() throws Exception {
++    final JSONObject json =
++        r0dump_validJson()
++            .put("capture_point_mask", "0x0000020000000000")
++            .put("manifest_enabled", true)
++            .put("force_invoke_enabled", true);
++
++    final r0dump_FusionConfig config = r0dump_FusionConfig.r0dump_parse(json.toString());
++
++    assertThat(config.forceInvokeEnabled).isTrue();
++    assertThat(config.forceClass).isEmpty();
++  }
++
++  @Test
++  public void r0dump_parse_rejectsForceWithoutManifestOrCompleteExactSelector() throws Exception {
++    final JSONObject noScope =
++        r0dump_validJson()
++            .put("capture_point_mask", "0x0000020000000000")
++            .put("manifest_enabled", false)
++            .put("force_invoke_enabled", true);
++    r0dump_assertInvalid(noScope.toString());
++    r0dump_assertInvalid(
++        noScope.put("manifest_enabled", true).put("force_class", "bin.mt.plus.Target").toString());
++  }
++
+   @Test
+   public void r0dump_parse_accepts128MiBDexAndRejectsLargerValue() throws Exception {
+     final long limit = 128L * 1024 * 1024;
+@@ -315,11 +341,23 @@ public class r0dump_FusionConfigTest {
+     assertThat(actual.forceMaxCalls).isEqualTo(1L);
+     assertThat(actual.anrProtectionEnabled).isTrue();
+     assertThat(
+-            properties.values.get(
+-                r0dump_FusionConfig.PROPERTY_PREFIX + "anr_protection_enabled"))
++            properties.values.get(r0dump_FusionConfig.PROPERTY_PREFIX + "anr_protection_enabled"))
+         .isEqualTo("1");
+   }
+ 
++  @Test
++  public void r0dump_persistedProperties_missingMaskUsesManagerDefaultPoints() throws Exception {
++    final r0dump_FakeProperties properties = new r0dump_FakeProperties();
++    final r0dump_FusionConfig expected =
++        r0dump_FusionConfig.r0dump_parse(r0dump_validJson().toString());
++    assertThat(r0dump_FusionConfig.r0dump_writePersisted(expected, properties)).isTrue();
++    properties.values.remove(r0dump_FusionConfig.PROPERTY_PREFIX + "capture_point_mask");
++
++    final r0dump_FusionConfig actual = r0dump_FusionConfig.r0dump_readPersisted(properties);
++
++    assertThat(actual.capturePointMask).isEqualTo(0x0000020000000028L);
++  }
++
+   @Test
+   public void r0dump_managerWrite_validatesPublishesAndVerifiesCompleteSnapshot() throws Exception {
+     final r0dump_FakeProperties properties = new r0dump_FakeProperties();
+@@ -494,21 +532,11 @@ public class r0dump_FusionConfigTest {
+ 
+     assertThat(
+             r0dump_FusionConfig.r0dump_validateOutputPreparationForSystemServer(
+-                2L,
+-                10001,
+-                PACKAGE_NAME,
+-                PROCESS_NAME,
+-                "20260824T120000Z-a1b2c3d4",
+-                properties))
++                2L, 10001, PACKAGE_NAME, PROCESS_NAME, "20260824T120000Z-a1b2c3d4", properties))
+         .isTrue();
+     assertThat(
+             r0dump_FusionConfig.r0dump_validateOutputPreparationForSystemServer(
+-                4L,
+-                10001,
+-                PACKAGE_NAME,
+-                PROCESS_NAME,
+-                "20260824T120000Z-a1b2c3d4",
+-                properties))
++                4L, 10001, PACKAGE_NAME, PROCESS_NAME, "20260824T120000Z-a1b2c3d4", properties))
+         .isFalse();
+     assertThat(
+             r0dump_FusionConfig.r0dump_validateOutputPreparationForSystemServer(
+@@ -518,13 +546,20 @@ public class r0dump_FusionConfigTest {
+ 
+   @Test
+   public void r0dump_parse_rejectsConfigurableLimitCeilingsAndRelationships() throws Exception {
++    r0dump_FusionConfig.r0dump_parse(
++        r0dump_validJson()
++            .put("max_total_bytes", 1073741824L)
++            .put("max_dex_bytes", 268435456L)
++            .put("buffer_pool_bytes", 536870912L)
++            .put("max_code_item_bytes", 4194304L)
++            .toString());
+     r0dump_assertInvalid(r0dump_validJson().put("max_records", 4097).toString());
+     r0dump_assertInvalid(r0dump_validJson().put("max_artifacts", 513).toString());
+-    r0dump_assertInvalid(r0dump_validJson().put("max_total_bytes", 536870913L).toString());
+-    r0dump_assertInvalid(r0dump_validJson().put("max_dex_bytes", 134217729L).toString());
++    r0dump_assertInvalid(r0dump_validJson().put("max_total_bytes", 1073741825L).toString());
++    r0dump_assertInvalid(r0dump_validJson().put("max_dex_bytes", 268435457L).toString());
+     r0dump_assertInvalid(r0dump_validJson().put("buffer_pool_bytes", 33554431).toString());
+-    r0dump_assertInvalid(r0dump_validJson().put("buffer_pool_bytes", 268435457L).toString());
+-    r0dump_assertInvalid(r0dump_validJson().put("max_code_item_bytes", 1048577).toString());
++    r0dump_assertInvalid(r0dump_validJson().put("buffer_pool_bytes", 536870913L).toString());
++    r0dump_assertInvalid(r0dump_validJson().put("max_code_item_bytes", 4194305L).toString());
+     r0dump_assertInvalid(r0dump_validJson().put("max_frozen_generations", 5).toString());
+     r0dump_assertInvalid(r0dump_validJson().put("flush_idle_ms", 60001).toString());
+     r0dump_assertInvalid(r0dump_validJson().put("manifest_max_components", 16385).toString());
+diff --git a/core/tests/coretests/src/android/app/r0dump_ManifestHelperTest.java b/core/tests/coretests/src/android/app/r0dump_ManifestHelperTest.java
+index 98669cf85..de9cee293 100644
+--- a/core/tests/coretests/src/android/app/r0dump_ManifestHelperTest.java
++++ b/core/tests/coretests/src/android/app/r0dump_ManifestHelperTest.java
+@@ -53,6 +53,53 @@ public class r0dump_ManifestHelperTest {
+   private String mMismatchPath;
+   private String mSplitPath;
+ 
++  @Test
++  public void r0dump_manifestNamespacePrefixes_derivesAndMinimizesPackages() {
++    final r0dump_ManifestHelper.r0dump_Snapshot snapshot =
++        new r0dump_ManifestHelper.r0dump_Snapshot(
++            r0dump_ManifestHelper.r0dump_Status.OK,
++            "com.example.app",
++            List.of(
++                new r0dump_ManifestHelper.r0dump_ClassSeed(
++                    "com.example.app.MainApplication",
++                    r0dump_ManifestHelper.r0dump_SeedKind.APPLICATION,
++                    0),
++                new r0dump_ManifestHelper.r0dump_ClassSeed(
++                    "com.example.app.feature.MainActivity",
++                    r0dump_ManifestHelper.r0dump_SeedKind.ACTIVITY,
++                    0),
++                new r0dump_ManifestHelper.r0dump_ClassSeed(
++                    "vendor.push.MessageReceiver",
++                    r0dump_ManifestHelper.r0dump_SeedKind.RECEIVER,
++                    0)),
++            List.of(),
++            1,
++            1,
++            0,
++            0,
++            r0dump_ManifestHelper.r0dump_LimitKind.NONE);
++
++    assertThat(r0dump_ClassLoaderWalk.r0dump_manifestNamespacePrefixes(snapshot))
++        .containsExactly("com.example.app.", "vendor.push.")
++        .inOrder();
++  }
++
++  @Test
++  public void r0dump_matchesNamespace_requiresPackageBoundaryPrefix() {
++    final List<String> prefixes = List.of("com.example.app.");
++
++    assertThat(r0dump_ClassLoaderWalk.r0dump_matchesNamespace("com.example.app.Target", prefixes))
++        .isTrue();
++    assertThat(
++            r0dump_ClassLoaderWalk.r0dump_matchesNamespace(
++                "com.example.app.feature.Target", prefixes))
++        .isTrue();
++    assertThat(
++            r0dump_ClassLoaderWalk.r0dump_matchesNamespace(
++                "com.example.application.Target", prefixes))
++        .isFalse();
++  }
++
+   @Before
+   public void r0dump_setUp() throws Exception {
+     mContext = InstrumentationRegistry.getInstrumentation().getTargetContext();
+-- 
+2.43.0
+

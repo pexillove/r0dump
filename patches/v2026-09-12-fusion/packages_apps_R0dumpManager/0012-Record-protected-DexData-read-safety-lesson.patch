@@ -1,0 +1,39 @@
+From a5f357bfec2fcf927ff840db331695f1cb18c420 Mon Sep 17 00:00:00 2001
+From: Ivory <contact@ivory.cafe>
+Date: Wed, 2 Sep 2026 06:02:56 +0800
+Subject: [PATCH 12/32] Record protected DexData read safety lesson
+
+Document the com.VCB failure mode where a protected DexFile reported a logical DataSize larger than its contiguous readable mappings. Capture guidance now requires maps validation and process_vm_readv-safe fallback handling, with invalid_range evidence preferred over speculative reads.
+
+Constraint: runtime protection can split or stale DataBegin/DataSize mappings
+Rejected: treating DataSize as a memcpy span | it caused SIGSEGV and obscured the actionable diagnosis
+Confidence: high
+Scope-risk: narrow
+Directive: preserve this lesson when adding segmented or anonymous-map recovery
+Tested: documentation diff check; ART source tests and host unittest suite (18 tests)
+Not-tested: complete protected com.VCB.ui.* DEX reconstruction still lacks runtime table provenance
+---
+ IMPLEMENTATION.md | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/IMPLEMENTATION.md b/IMPLEMENTATION.md
+index b19b015..80630fa 100644
+--- a/IMPLEMENTATION.md
++++ b/IMPLEMENTATION.md
+@@ -1506,6 +1506,13 @@ ART APEX 构建。
+ 或 ART 损坏；先解锁用户（测试机 PIN 为 `2468`），再启动目标应用并检查 `sys.user.0.ce_available`。
+ 捕获完成后应关闭 `persist.sys.r0dump.fusion.enabled`，避免下一次实验继续消耗 512 个 artifact 配额。
+ 
++本轮 `com.VCB` 实验还记录了一个必须保留的安全教训：保护器会把 `DexFile::DataSize()` 改成逻辑长度，
++但该长度未必对应一段连续、可读的虚拟地址。直接按 `DataBegin()+DataSize()` 做 `memcpy` 曾在
++`r0dump_ObserveDexSource` 触发 SIGSEGV；这不是目标应用崩溃，也不是应当放宽边界检查的理由。Fusion
++在回退读取前必须重新检查地址溢出、大小上限和 `/proc/self/maps` 的连续 `r--/rw-` 覆盖，无法证明整段
++可读时只写 `invalid_range` 证据并交由后续逻辑视图/分段恢复处理，禁止猜测性读取。该检查应保持在运行时
++采集路径中，即使未来增加匿名映射扫描，也必须使用 `process_vm_readv` 的短读失败语义作为第二道 TOCTOU 闸门。
++
+ #### 一键导出并修复最新产物
+ 
+ `tools/export_latest.py` 通过普通 `adb shell` 权限读取指定包的 external-files 目录，从包含至少一个 artifact
+-- 
+2.43.0
+

@@ -1,0 +1,38 @@
+From dc17caaf4b7af1bdf25f16e60acacdf91f23513e Mon Sep 17 00:00:00 2001
+From: Ivory <contact@ivory.cafe>
+Date: Wed, 2 Sep 2026 04:14:44 +0800
+Subject: [PATCH 10/32] Record ART frame diagnostic build lesson
+
+Constraint: Document the reproducible bp4a build and LTO frame-warning recovery path for future maintainers.
+Rejected: Treat linker diagnostics as dependency failures | The failure is a scoped frame diagnostic, not a missing module.
+Confidence: high
+Scope-risk: narrow
+Directive: Verify release selection and retain global frame checks before changing build flags.
+Tested: git diff --check; documentation review.
+Not-tested: Device replacement and com.VCB.ui capture after this fresh APEX.
+---
+ IMPLEMENTATION.md | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/IMPLEMENTATION.md b/IMPLEMENTATION.md
+index 74f613e..7f7a1c8 100644
+--- a/IMPLEMENTATION.md
++++ b/IMPLEMENTATION.md
+@@ -1493,6 +1493,14 @@ ART APEX 构建。
+ 先回到正确的 `lunch` 组合并检查生成目录，不要为绕过错误给无关库追加 `vendor_available`，也不要把临时
+ 构建规避改入功能提交。
+ 
++另一个容易误判的失败发生在 ART 的 LTO 链接阶段：`class_linker.cc` 可能报告
++`stack frame size ... exceeds limit`。这不是缺少库或新增依赖，而是当前 clang/LTO 对已有大型运行时函数的
++栈帧诊断变成了 fatal warning；本轮 Fusion 在 `VerifyClass`/`InitializeClass` 增加完成记录后触发了该边界。
++处理原则是只在对应函数周围使用已有 ART 惯例的 `-Wno-frame-larger-than=` 作用域，并保留全局
++`ART_FRAME_SIZE_LIMIT`，禁止通过提高全局上限或关闭所有 frame 检查来“修复”。修改后重新执行 `m nothing -j2`
++确认图稳定，再执行 `m com.android.art -j8`；必须以 `#### build completed successfully` 和新生成的
++`system/apex/com.android.art.capex` 为成功证据。
++
+ #### 一键导出并修复最新产物
+ 
+ `tools/export_latest.py` 通过普通 `adb shell` 权限读取指定包的 external-files 目录，从包含至少一个 artifact
+-- 
+2.43.0
+

@@ -1,0 +1,709 @@
+From ceecd263c4e9b3c28cc4a16ac6bbe604908ed178 Mon Sep 17 00:00:00 2001
+From: Ivory <contact@ivory.cafe>
+Date: Mon, 31 Aug 2026 23:16:59 +0800
+Subject: [PATCH 05/32] Make the accepted capture baseline recoverable from the
+ Manager
+
+Align reset behavior, operational budgets, capture points 03/05/41, validation feedback, and advanced defaults so the UI restores one coherent configuration.
+
+Constraint: The top app-bar reset must restore the full Manager baseline while the budget reset remains budget-only.
+
+Rejected: Keep refresh semantics on the top reset icon | It did not restore user-visible defaults.
+
+Confidence: high
+
+Scope-risk: moderate
+
+Directive: Keep Manager, Framework property fallbacks, and ART hard limits synchronized when changing defaults.
+
+Tested: source contract validation; m -j8 R0dumpManager R0dumpManagerTests framework-minus-apex; device instrumentation; userdebug post-flash validation.
+---
+ IMPLEMENTATION.md                             | 51 +++++++++--------
+ res/values-zh-rCN/strings.xml                 | 15 ++---
+ res/values/strings.xml                        | 15 ++---
+ .../app/R0dumpManagerViewModel.kt             |  8 +++
+ .../data/property/FusionPropertyRepository.kt | 12 ++--
+ .../domain/CapturePointRegistry.kt            |  1 +
+ .../r0dumpmanager/domain/FusionConfigDraft.kt | 20 +++----
+ .../domain/FusionConfigValidator.kt           | 20 ++++---
+ .../r0dumpmanager/ui/R0dumpManagerScreen.kt   | 12 ++--
+ .../app/R0dumpManagerViewModelTest.kt         | 39 +++++++++++++
+ .../property/FusionPropertyRepositoryTest.kt  |  2 +
+ .../domain/FusionConfigContractTest.kt        | 57 +++++++++++++++----
+ tools/validate_source_contracts.sh            | 10 +++-
+ 13 files changed, 184 insertions(+), 78 deletions(-)
+
+diff --git a/IMPLEMENTATION.md b/IMPLEMENTATION.md
+index 782dfd0..4f040c0 100644
+--- a/IMPLEMENTATION.md
++++ b/IMPLEMENTATION.md
+@@ -117,7 +117,7 @@ SELinux domain 决定是否允许写入。
+ 6. 发布后重新读取并逐字段验证设备快照；
+ 7. 支持“发布并启动目标”“只发布”“结束会话”和“奇数 generation 恢复”；
+ 8. 明确展示配置持久化、进程快照和重启语义；
+-9. 默认关闭危险能力，不提供一键全开；
++9. 默认启用 manifest、walk、force-invoke 和 ANR protection；manifest 组件类的包名前缀自动形成有界强制调用范围，完整精确 selector 可选且优先；
+ 10. 在 user 和 userdebug 产品配置中作为正式系统应用预装；
+ 11. 对修改操作增加主用户、设备凭据和活动会话提醒三层保护；
+ 12. 完整支持 Android 16 edge-to-edge、预测返回、大屏自适应和 Material 3 Expressive。
+@@ -560,7 +560,7 @@ secondary user 和 managed profile 只显示“配置仅可由设备主用户管
+ 3. 没有接受外部 JSON/property key 的 exported Intent；
+ 4. Manager 只能写 `r0dump_fusion_prop`；
+ 5. 配置值必须先通过 Framework parser；
+-6. force-invoke 和 ANR protection 默认关闭；
++6. force-invoke 和 ANR protection 默认开启，但不得绕过 Manifest/精确 selector 范围、点位依赖、认证或发布校验；
+ 7. 发布失败后不得把 UI 标记为成功；
+ 8. 奇数 generation 不允许普通发布或启动目标。
+ 9. 非 system user 在 Framework 层也不能激活 capture；
+@@ -583,13 +583,13 @@ data class FusionConfigDraft(
+     val runId: String = "",
+     val targetPackage: String = "",
+     val targetProcess: String = "",
+-    val capturePointMask: ULong = 0u,
++    val capturePointMask: ULong = (1uL shl 3) or (1uL shl 5) or (1uL shl 41),
+     val maxRecords: Long = 512,
+     val maxArtifacts: Long = 128,
+-    val maxTotalBytes: Long = 201_326_592,
+-    val maxDexBytes: Long = 33_554_432,
+-    val bufferPoolBytes: Long = 67_108_864,
+-    val maxCodeItemBytes: Long = 1_048_576,
++    val maxTotalBytes: Long = 1_073_741_824,
++    val maxDexBytes: Long = 268_435_456,
++    val bufferPoolBytes: Long = 536_870_912,
++    val maxCodeItemBytes: Long = 4_194_304,
+     val maxFrozenGenerations: Long = 4,
+     val flushIdleMs: Long = 500,
+     val manifestEnabled: Boolean = true,
+@@ -600,18 +600,18 @@ data class FusionConfigDraft(
+     val manifestMaxTotalEvents: Long = 65536,
+     val manifestMaxXmlDepth: Long = 64,
+     val manifestMaxAttributeLength: Long = 1024,
+-    val walkEnabled: Boolean = false,
++    val walkEnabled: Boolean = true,
+     val walkStart: WalkStart = AFTER_APPLICATION_ON_CREATE,
+     val walkMode: WalkMode = LOADED_ONLY,
+     val walkDelayMs: Long = 5000,
+-    val walkMaxClasses: Long = 2000,
+-    val walkMaxMethods: Long = 20000,
+-    val forceInvokeEnabled: Boolean = false,
++    val walkMaxClasses: Long = 16384,
++    val walkMaxMethods: Long = 65536,
++    val forceInvokeEnabled: Boolean = true,
+     val forceClass: String = "",
+     val forceMethod: String = "",
+     val forceMethodDescriptor: String = "",
+     val forceMaxCalls: Long = 1,
+-    val anrProtectionEnabled: Boolean = false,
++    val anrProtectionEnabled: Boolean = true,
+ )
+ ```
+ 
+@@ -623,10 +623,10 @@ data class FusionConfigDraft(
+ |---|---:|---|
+ | `max_records` | 512 | `1..4096` |
+ | `max_artifacts` | 128 | `1..512` 且 `<= max_records` |
+-| `max_total_bytes` | 201326592 | `1..536870912` |
+-| `max_dex_bytes` | 33554432 | `1..134217728` 且 `<= max_total_bytes` |
+-| `buffer_pool_bytes` | 67108864 | `max_dex_bytes..268435456` |
+-| `max_code_item_bytes` | 1048576 | `1..1048576` 且 `<= buffer_pool_bytes` |
++| `max_total_bytes` | 1073741824 | `1..1073741824` |
++| `max_dex_bytes` | 268435456 | `1..268435456` 且 `<= max_total_bytes` |
++| `buffer_pool_bytes` | 536870912 | `max_dex_bytes..536870912` |
++| `max_code_item_bytes` | 4194304 | `1..4194304` 且 `<= buffer_pool_bytes` |
+ | `max_frozen_generations` | 4 | `1..4` |
+ | `flush_idle_ms` | 500 | `1..60000` |
+ | `manifest_max_components` | 8192 | `1..16384` |
+@@ -636,8 +636,8 @@ data class FusionConfigDraft(
+ | `manifest_max_xml_depth` | 64 | `1..256` |
+ | `manifest_max_attribute_length` | 1024 | `1..4096` |
+ | `walk_delay_ms` | 5000 | `0..4294967295` |
+-| `walk_max_classes` | 2000 | `1..1000000` |
+-| `walk_max_methods` | 20000 | `1..10000000` |
++| `walk_max_classes` | 16384 | `1..1000000` |
++| `walk_max_methods` | 65536 | `1..10000000` |
+ | `force_max_calls` | 1 | `1..8` |
+ 
+ 所有字符串必须小于等于 `SystemProperties.PROP_VALUE_MAX` UTF-8 bytes。`run_id` 额外限制为 1 到 64 个
+@@ -726,8 +726,9 @@ mask 序列化固定为 `0x` 加 16 个小写 hex digits。bits 42..63 必须为
+ 
+ ### 7.2 `Defaults`
+ 
+-恢复 Framework 默认预算、manifest 开启、walk/force/ANR 关闭、mask 清空。该 profile 不能直接发布 enabled 配置，
+-因为有效启动必须至少选择一个点位。
++恢复 1024 MiB 总容量、256 MiB 单 DEX、512 MiB 缓冲池、4 MiB CodeItem，启用 manifest、walk、force 和
++ANR，并预选 force 所需 bit 41。Manifest 解析出的组件类会按其直接包名生成带点边界的命名空间前缀，去除被更短
++前缀覆盖的重复项后，作为自动强制调用范围；精确 class/method/descriptor 留空即可使用该范围，完整填写时优先尝试。
+ 
+ ### 7.3 `Custom`
+ 
+@@ -982,7 +983,8 @@ TalkBack 语义。点位 row 的 checkbox、名称和说明共同组成一个点
+ - UI 可显示 MiB，序列化时使用 bytes；
+ - 输入框下方显示默认值、绝对上限和关系错误；
+ - 依赖字段同时高亮，例如 `max_dex_bytes > max_total_bytes`；
+-- 提供 `恢复默认预算`，不影响其它页面草稿。
++- 最顶部标题栏的 reset 图标恢复完整默认配置，并保留当前目标包、目标进程和 Manager 管理的 run ID；预算与高级页的默认项必须一起恢复。
++- 预算页标题行的 reset 图标只恢复预算默认值，不影响其它页面草稿。
+ 
+ 预算字段分为“容量限制”和“数量与刷新”两个可折叠区域，首次进入时全部闭合。折叠不是新页面，校验错误会自动展开并滚动到
+ 对应字段。
+@@ -991,7 +993,7 @@ TalkBack 语义。点位 row 的 checkbox、名称和说明共同组成一个点
+ 
+ 分为三个无嵌套区域：
+ 
+-- Manifest：enabled、include splits 和六个限制；
++- Manifest：enabled、include splits 和六个限制；enabled 同时控制组件类包名前缀是否加入自动强制调用范围；
+ - Walk：enabled、start、mode、delay、class/method 上限；
+ - Force/ANR：force selector、max calls、ANR protection。
+ 
+@@ -1002,7 +1004,8 @@ Walk 的 start 与 mode 使用全宽 Material 3 下拉选择框，收起时直
+ 点位分类、预算分组和高级分组使用 150–250ms 的 Material 展开/收起动画；动画只表达可见性变化，
+ 并遵循系统动画缩放或“移除动画”设置。Material 下拉菜单使用组件自带的展开/收起过渡。
+ 
+-开启 force-invoke 时自动选择 bit 41，但关闭 force-invoke 不自动取消 bit 41，避免隐式删除用户选择。
++开启 force-invoke 时自动选择 bit 41，但关闭 force-invoke 不自动取消 bit 41，避免隐式删除用户选择。启用
++Manifest 时，精确 selector 是可选覆盖：三项均为空表示使用 Manifest 命名空间范围，任一项非空则三项必须完整有效。
+ 
+ ANR protection 和“所有进程”需要确认 sheet。确认文字必须说明精确影响，不使用泛化的“有风险”文案。
+ 
+@@ -1529,7 +1532,7 @@ R0dump Manager 合格必须同时满足：
+ - 发布成功必须经过 read-back verification；
+ - 新配置只在目标重启后宣称生效；
+ - 结束会话同时终止目标并发布 disabled；
+-- force-invoke、all-process 和 ANR protection 默认关闭并有精确确认；
++- force-invoke 和 ANR protection 默认开启；Manifest/完整精确 selector 范围、bit 41、认证及发布校验仍保持强制，all-process 默认关闭；
+ - Android 16 edge-to-edge、predictive back、IME、large screen 和 freeform window 验收通过；
+ - Material 3 Expressive API 集中封装，动态色、深色、高对比度和 reduced motion 完整；
+ - 无承载 payload 的 Broker、数据库、私有产物 reader 或任意路径 root 服务；
+diff --git a/res/values-zh-rCN/strings.xml b/res/values-zh-rCN/strings.xml
+index b0e1299..151725c 100644
+--- a/res/values-zh-rCN/strings.xml
++++ b/res/values-zh-rCN/strings.xml
+@@ -8,7 +8,6 @@
+     <string name="language_system">跟随系统</string>
+     <string name="language_chinese">简体中文</string>
+     <string name="language_english">English</string>
+-    <string name="refresh_device_state">刷新设备状态</string>
+     <string name="nav_session">应用</string>
+     <string name="nav_capture">点位</string>
+     <string name="nav_limits">预算</string>
+@@ -111,15 +110,16 @@
+     <string name="max_code_item_bytes">最大 CodeItem 大小</string>
+     <string name="frozen_generations">冻结 generation 数</string>
+     <string name="flush_idle_ms">空闲刷新时间（毫秒）</string>
++    <string name="restore_default_settings">恢复默认设置</string>
+     <string name="restore_default_budgets">恢复默认预算</string>
+     <string name="budget_capacity_group">容量限制</string>
+     <string name="budget_records_group">数量与刷新</string>
+     <string name="settings_count">%1$d 项设置</string>
+ 
+     <string name="advanced_title">高级</string>
+-    <string name="advanced_subtitle">配置 Manifest、遍历、强制调用和 ANR 保护。</string>
++    <string name="advanced_subtitle">配置 Manifest 命名空间范围、遍历、强制调用和 ANR 保护。</string>
+     <string name="manifest">Manifest</string>
+-    <string name="enable_manifest">启用 Manifest</string>
++    <string name="enable_manifest">使用 Manifest 命名空间范围</string>
+     <string name="include_splits">包含拆分包</string>
+     <string name="max_components">最大组件数</string>
+     <string name="max_splits">最大拆分包数</string>
+@@ -145,13 +145,13 @@
+     <string name="expand_settings_group">展开%1$s设置</string>
+     <string name="collapse_settings_group">收起%1$s设置</string>
+     <string name="enable_force_invoke">启用强制调用</string>
+-    <string name="force_class">强制调用类</string>
+-    <string name="force_method">强制调用方法</string>
+-    <string name="method_descriptor">方法描述符</string>
++    <string name="force_class">精确类（启用 Manifest 时可选）</string>
++    <string name="force_method">精确方法（启用 Manifest 时可选）</string>
++    <string name="method_descriptor">精确描述符（启用 Manifest 时可选）</string>
+     <string name="maximum_force_calls">最大强制调用次数</string>
+     <string name="enable_anr_protection">启用 ANR 保护</string>
+     <string name="confirm_force_invoke">启用强制调用？</string>
+-    <string name="confirm_force_invoke_detail">捕获期间，目标进程可能调用所配置的类方法。系统会同时启用 bit 41，确保发现阶段在运行时合同允许前不会执行该方法。</string>
++    <string name="confirm_force_invoke_detail">物化 CodeItem 时目标进程可能初始化类。启用 Manifest 后，组件类的包名前缀会自动加入有界强制调用范围；完整的精确 selector 优先。bit 41 会阻止所选方法体真正执行。</string>
+     <string name="confirm_anr_protection">启用 ANR 保护？</string>
+     <string name="confirm_anr_protection_detail">启用的快照与目标精确匹配时，system_server 不会通过所配置的 ANR 路径终止该主用户进程；其它 ANR 处理不受影响。</string>
+ 
+@@ -204,6 +204,7 @@
+     <string name="validation_buffer_pool">最大 CodeItem 大小不得超过缓冲池容量</string>
+     <string name="validation_events_per_source">不得小于每个来源的事件数</string>
+     <string name="validation_force_bit">强制调用需要启用 ForceInvoke.no_execute</string>
++    <string name="validation_force_scope">请启用 Manifest 范围，或完整填写精确类、方法和描述符</string>
+     <string name="validation_binary_class">请使用二进制类名</string>
+     <string name="validation_method_name">方法名无效</string>
+     <string name="validation_method_descriptor">JVM 描述符无效</string>
+diff --git a/res/values/strings.xml b/res/values/strings.xml
+index c769e79..5a3b450 100644
+--- a/res/values/strings.xml
++++ b/res/values/strings.xml
+@@ -8,7 +8,6 @@
+     <string name="language_system">Follow system</string>
+     <string name="language_chinese">Simplified Chinese</string>
+     <string name="language_english">English</string>
+-    <string name="refresh_device_state">Refresh device state</string>
+     <string name="nav_session">Apps</string>
+     <string name="nav_capture">Capture</string>
+     <string name="nav_limits">Budgets</string>
+@@ -111,15 +110,16 @@
+     <string name="max_code_item_bytes">Maximum CodeItem size</string>
+     <string name="frozen_generations">Frozen generations</string>
+     <string name="flush_idle_ms">Flush idle (ms)</string>
++    <string name="restore_default_settings">Restore default settings</string>
+     <string name="restore_default_budgets">Restore default budgets</string>
+     <string name="budget_capacity_group">Capacity limits</string>
+     <string name="budget_records_group">Records and flushing</string>
+     <string name="settings_count">%1$d settings</string>
+ 
+     <string name="advanced_title">Advanced</string>
+-    <string name="advanced_subtitle">Manifest, walk, force invoke and ANR protection.</string>
++    <string name="advanced_subtitle">Manifest namespace scope, walk, force invoke and ANR protection.</string>
+     <string name="manifest">Manifest</string>
+-    <string name="enable_manifest">Enable manifest</string>
++    <string name="enable_manifest">Use manifest namespace scope</string>
+     <string name="include_splits">Include splits</string>
+     <string name="max_components">Max components</string>
+     <string name="max_splits">Max splits</string>
+@@ -145,13 +145,13 @@
+     <string name="expand_settings_group">Expand %1$s settings</string>
+     <string name="collapse_settings_group">Collapse %1$s settings</string>
+     <string name="enable_force_invoke">Enable force invoke</string>
+-    <string name="force_class">Force class</string>
+-    <string name="force_method">Force method</string>
+-    <string name="method_descriptor">Method descriptor</string>
++    <string name="force_class">Exact class (optional with manifest)</string>
++    <string name="force_method">Exact method (optional with manifest)</string>
++    <string name="method_descriptor">Exact descriptor (optional with manifest)</string>
+     <string name="maximum_force_calls">Maximum force calls</string>
+     <string name="enable_anr_protection">Enable ANR protection</string>
+     <string name="confirm_force_invoke">Enable force invoke?</string>
+-    <string name="confirm_force_invoke_detail">The target process may invoke the configured class method during capture. Bit 41 will be enabled so discovery does not execute the method until the runtime contract permits it.</string>
++    <string name="confirm_force_invoke_detail">The target process may initialize classes while materializing code items. With Manifest enabled, component package prefixes are added to the bounded force scope; a complete exact selector takes priority. Bit 41 prevents the selected method body from executing.</string>
+     <string name="confirm_anr_protection">Enable ANR protection?</string>
+     <string name="confirm_anr_protection_detail">While this enabled snapshot matches the target, system_server will not kill that exact owner-user process through the configured ANR path. Other ANR handling remains unchanged.</string>
+ 
+@@ -204,6 +204,7 @@
+     <string name="validation_buffer_pool">Maximum CodeItem size must not exceed buffer pool capacity</string>
+     <string name="validation_events_per_source">Must be at least events per source</string>
+     <string name="validation_force_bit">Force invoke requires ForceInvoke.no_execute</string>
++    <string name="validation_force_scope">Enable Manifest scope or provide the complete exact class, method and descriptor</string>
+     <string name="validation_binary_class">Use a binary class name</string>
+     <string name="validation_method_name">Invalid method name</string>
+     <string name="validation_method_descriptor">Invalid JVM descriptor</string>
+diff --git a/src/com/android/r0dumpmanager/app/R0dumpManagerViewModel.kt b/src/com/android/r0dumpmanager/app/R0dumpManagerViewModel.kt
+index e49926d..3cb0d71 100644
+--- a/src/com/android/r0dumpmanager/app/R0dumpManagerViewModel.kt
++++ b/src/com/android/r0dumpmanager/app/R0dumpManagerViewModel.kt
+@@ -167,6 +167,14 @@ class R0dumpManagerViewModel(
+             state.withUserDraft(draft, profile)
+         }
+     }
++    fun restoreDefaults() {
++        if (_uiState.value.canEdit) _uiState.update { state ->
++            val profile = ProfileId.DEFAULTS
++            val draft = ensureManagedRunId(ProfileRegistry.apply(profile, state.draft), profile)
++            saveDraft(draft, state.deviceSnapshot.generationOrNull() ?: 0L, profile)
++            state.copy(draftNoticeShown = false).withUserDraft(draft, profile)
++        }
++    }
+     fun restoreDefaultBudgets() = updateDraft(FusionConfigSchema::restoreDefaultBudgets)
+     fun toggleCapturePoint(bit: Int) = updateDraft { it.copy(capturePointMask = CapturePointRegistry.toggle(it.capturePointMask, bit)) }
+     fun setForeground(foreground: Boolean) { _uiState.update { it.copy(isForeground = foreground) } }
+diff --git a/src/com/android/r0dumpmanager/data/property/FusionPropertyRepository.kt b/src/com/android/r0dumpmanager/data/property/FusionPropertyRepository.kt
+index d9fae2a..76ac70e 100644
+--- a/src/com/android/r0dumpmanager/data/property/FusionPropertyRepository.kt
++++ b/src/com/android/r0dumpmanager/data/property/FusionPropertyRepository.kt
+@@ -71,15 +71,15 @@ class FusionPropertyRepository(
+     private fun generation(): Long? = properties.get("${FusionConfigSchema.PROPERTY_PREFIX}generation", "0").toLongOrNull()?.takeIf { it >= 0L }
+     private fun readDraft(): FusionConfigDraft = FusionConfigDraft(
+         schema = int("schema", "1"), enabled = bool("enabled", "0"), runId = string("run_id", ""),
+-        targetPackage = string("target_package", ""), targetProcess = string("target_process", ""), capturePointMask = mask("capture_point_mask", "0x0000000000000000"),
+-        maxRecords = long("max_records", "512"), maxArtifacts = long("max_artifacts", "128"), maxTotalBytes = long("max_total_bytes", "201326592"),
+-        maxDexBytes = long("max_dex_bytes", "33554432"), bufferPoolBytes = long("buffer_pool_bytes", "67108864"), maxCodeItemBytes = long("max_code_item_bytes", "1048576"),
++        targetPackage = string("target_package", ""), targetProcess = string("target_process", ""), capturePointMask = mask("capture_point_mask", "0x0000020000000028"),
++        maxRecords = long("max_records", "512"), maxArtifacts = long("max_artifacts", "128"), maxTotalBytes = long("max_total_bytes", "1073741824"),
++        maxDexBytes = long("max_dex_bytes", "268435456"), bufferPoolBytes = long("buffer_pool_bytes", "536870912"), maxCodeItemBytes = long("max_code_item_bytes", "4194304"),
+         maxFrozenGenerations = long("max_frozen_generations", "4"), flushIdleMs = long("flush_idle_ms", "500"), manifestEnabled = bool("manifest_enabled", "1"), manifestIncludeSplits = bool("manifest_include_splits", "1"),
+         manifestMaxComponents = long("manifest_max_components", "8192"), manifestMaxSplits = long("manifest_max_splits", "32"), manifestMaxEventsPerSource = long("manifest_max_events_per_source", "16384"), manifestMaxTotalEvents = long("manifest_max_total_events", "65536"),
+-        manifestMaxXmlDepth = long("manifest_max_xml_depth", "64"), manifestMaxAttributeLength = long("manifest_max_attribute_length", "1024"), walkEnabled = bool("walk_enabled", "0"),
++        manifestMaxXmlDepth = long("manifest_max_xml_depth", "64"), manifestMaxAttributeLength = long("manifest_max_attribute_length", "1024"), walkEnabled = bool("walk_enabled", "1"),
+         walkStart = WalkStart.entries.first { it.propertyValue == string("walk_start", "after_application_on_create") }, walkMode = WalkMode.entries.first { it.propertyValue == string("walk_mode", "loaded_only") },
+-        walkDelayMs = long("walk_delay_ms", "5000"), walkMaxClasses = long("walk_max_classes", "2000"), walkMaxMethods = long("walk_max_methods", "20000"), forceInvokeEnabled = bool("force_invoke_enabled", "0"),
+-        forceClass = string("force_class", ""), forceMethod = string("force_method", ""), forceMethodDescriptor = string("force_method_descriptor", ""), forceMaxCalls = long("force_max_calls", "1"), anrProtectionEnabled = bool("anr_protection_enabled", "0"),
++        walkDelayMs = long("walk_delay_ms", "5000"), walkMaxClasses = long("walk_max_classes", "16384"), walkMaxMethods = long("walk_max_methods", "65536"), forceInvokeEnabled = bool("force_invoke_enabled", "1"),
++        forceClass = string("force_class", ""), forceMethod = string("force_method", ""), forceMethodDescriptor = string("force_method_descriptor", ""), forceMaxCalls = long("force_max_calls", "1"), anrProtectionEnabled = bool("anr_protection_enabled", "1"),
+     )
+     private fun string(field: String, default: String) = properties.get(FusionConfigSchema.PROPERTY_PREFIX + field, default)
+     private fun long(field: String, default: String) = string(field, default).toLong()
+diff --git a/src/com/android/r0dumpmanager/domain/CapturePointRegistry.kt b/src/com/android/r0dumpmanager/domain/CapturePointRegistry.kt
+index e616790..c5d774d 100644
+--- a/src/com/android/r0dumpmanager/domain/CapturePointRegistry.kt
++++ b/src/com/android/r0dumpmanager/domain/CapturePointRegistry.kt
+@@ -12,6 +12,7 @@ object CapturePointRegistry {
+     val definedMask: ULong = (1uL shl pointCount) - 1uL
+     val undefinedMask: ULong = definedMask.inv()
+     val forceNoExecuteMask: ULong = 1uL shl 41
++    val defaultMask: ULong = (1uL shl 3) or (1uL shl 5) or forceNoExecuteMask
+     val points = listOf(
+         CapturePoint(0, "Cookie.result.dex", "CreateCookieFromOatFileManagerResult", "DEX snapshot"),
+         CapturePoint(1, "InMemory.buffer.copied", "DexFile_openInMemoryDexFilesNative", "raw buffer"),
+diff --git a/src/com/android/r0dumpmanager/domain/FusionConfigDraft.kt b/src/com/android/r0dumpmanager/domain/FusionConfigDraft.kt
+index e57b148..7414fb0 100644
+--- a/src/com/android/r0dumpmanager/domain/FusionConfigDraft.kt
++++ b/src/com/android/r0dumpmanager/domain/FusionConfigDraft.kt
+@@ -7,13 +7,13 @@ data class FusionConfigDraft(
+     val runId: String = "",
+     val targetPackage: String = "",
+     val targetProcess: String = "",
+-    val capturePointMask: ULong = 0u,
++    val capturePointMask: ULong = CapturePointRegistry.defaultMask,
+     val maxRecords: Long = 512,
+     val maxArtifacts: Long = 128,
+-    val maxTotalBytes: Long = 201_326_592,
+-    val maxDexBytes: Long = 33_554_432,
+-    val bufferPoolBytes: Long = 67_108_864,
+-    val maxCodeItemBytes: Long = 1_048_576,
++    val maxTotalBytes: Long = 1_073_741_824,
++    val maxDexBytes: Long = 268_435_456,
++    val bufferPoolBytes: Long = 536_870_912,
++    val maxCodeItemBytes: Long = 4_194_304,
+     val maxFrozenGenerations: Long = 4,
+     val flushIdleMs: Long = 500,
+     val manifestEnabled: Boolean = true,
+@@ -24,18 +24,18 @@ data class FusionConfigDraft(
+     val manifestMaxTotalEvents: Long = 65536,
+     val manifestMaxXmlDepth: Long = 64,
+     val manifestMaxAttributeLength: Long = 1024,
+-    val walkEnabled: Boolean = false,
++    val walkEnabled: Boolean = true,
+     val walkStart: WalkStart = WalkStart.AFTER_APPLICATION_ON_CREATE,
+     val walkMode: WalkMode = WalkMode.LOADED_ONLY,
+     val walkDelayMs: Long = 5000,
+-    val walkMaxClasses: Long = 2000,
+-    val walkMaxMethods: Long = 20000,
+-    val forceInvokeEnabled: Boolean = false,
++    val walkMaxClasses: Long = 16_384,
++    val walkMaxMethods: Long = 65_536,
++    val forceInvokeEnabled: Boolean = true,
+     val forceClass: String = "",
+     val forceMethod: String = "",
+     val forceMethodDescriptor: String = "",
+     val forceMaxCalls: Long = 1,
+-    val anrProtectionEnabled: Boolean = false,
++    val anrProtectionEnabled: Boolean = true,
+ )
+ 
+ enum class WalkStart(val propertyValue: String) {
+diff --git a/src/com/android/r0dumpmanager/domain/FusionConfigValidator.kt b/src/com/android/r0dumpmanager/domain/FusionConfigValidator.kt
+index beda0bd..26b9e94 100644
+--- a/src/com/android/r0dumpmanager/domain/FusionConfigValidator.kt
++++ b/src/com/android/r0dumpmanager/domain/FusionConfigValidator.kt
+@@ -14,6 +14,7 @@ enum class FusionValidationErrorCode {
+     EXCEEDS_BUFFER_POOL,
+     BELOW_EVENTS_PER_SOURCE,
+     FORCE_BIT_REQUIRED,
++    FORCE_SCOPE_REQUIRED,
+     INVALID_BINARY_CLASS,
+     INVALID_METHOD_NAME,
+     INVALID_METHOD_DESCRIPTOR,
+@@ -33,10 +34,10 @@ data class FusionValidationResult(val errors: Map<String, FusionValidationError>
+ object FusionConfigValidator {
+     const val MAX_RECORDS = 4096L
+     const val MAX_ARTIFACTS = 512L
+-    const val MAX_TOTAL_BYTES = 512L * 1024 * 1024
+-    const val MAX_DEX_BYTES = 128L * 1024 * 1024
+-    const val MAX_BUFFER_POOL_BYTES = 256L * 1024 * 1024
+-    const val MAX_CODE_ITEM_BYTES = 1024L * 1024
++    const val MAX_TOTAL_BYTES = 1024L * 1024 * 1024
++    const val MAX_DEX_BYTES = 256L * 1024 * 1024
++    const val MAX_BUFFER_POOL_BYTES = 512L * 1024 * 1024
++    const val MAX_CODE_ITEM_BYTES = 4L * 1024 * 1024
+     const val MAX_FROZEN_GENERATIONS = 4L
+     const val MAX_FLUSH_IDLE_MS = 60_000L
+     private val runId = Regex("[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+@@ -88,9 +89,14 @@ object FusionConfigValidator {
+         if (draft.manifestMaxTotalEvents < draft.manifestMaxEventsPerSource) error("manifest_max_total_events", FusionValidationErrorCode.BELOW_EVENTS_PER_SOURCE)
+         if (draft.forceInvokeEnabled) {
+             if ((draft.capturePointMask and CapturePointRegistry.forceNoExecuteMask) == 0uL) error("capture_point_mask", FusionValidationErrorCode.FORCE_BIT_REQUIRED)
+-            if (!binaryClass.matches(draft.forceClass)) error("force_class", FusionValidationErrorCode.INVALID_BINARY_CLASS)
+-            if (!methodName.matches(draft.forceMethod)) error("force_method", FusionValidationErrorCode.INVALID_METHOD_NAME)
+-            if (!isMethodDescriptor(draft.forceMethodDescriptor)) error("force_method_descriptor", FusionValidationErrorCode.INVALID_METHOD_DESCRIPTOR)
++            val selectorEmpty = draft.forceClass.isEmpty() && draft.forceMethod.isEmpty() && draft.forceMethodDescriptor.isEmpty()
++            if (selectorEmpty) {
++                if (!draft.manifestEnabled) error("force_class", FusionValidationErrorCode.FORCE_SCOPE_REQUIRED)
++            } else {
++                if (!binaryClass.matches(draft.forceClass)) error("force_class", FusionValidationErrorCode.INVALID_BINARY_CLASS)
++                if (!methodName.matches(draft.forceMethod)) error("force_method", FusionValidationErrorCode.INVALID_METHOD_NAME)
++                if (!isMethodDescriptor(draft.forceMethodDescriptor)) error("force_method_descriptor", FusionValidationErrorCode.INVALID_METHOD_DESCRIPTOR)
++            }
+         }
+         listOf("run_id" to draft.runId, "target_package" to draft.targetPackage, "target_process" to draft.targetProcess,
+             "force_class" to draft.forceClass, "force_method" to draft.forceMethod, "force_method_descriptor" to draft.forceMethodDescriptor)
+diff --git a/src/com/android/r0dumpmanager/ui/R0dumpManagerScreen.kt b/src/com/android/r0dumpmanager/ui/R0dumpManagerScreen.kt
+index 8f09f57..31d09cc 100644
+--- a/src/com/android/r0dumpmanager/ui/R0dumpManagerScreen.kt
++++ b/src/com/android/r0dumpmanager/ui/R0dumpManagerScreen.kt
+@@ -49,7 +49,6 @@ import androidx.compose.material.icons.filled.ExpandMore
+ import androidx.compose.material.icons.filled.Info
+ import androidx.compose.material.icons.filled.Language
+ import androidx.compose.material.icons.filled.PlayArrow
+-import androidx.compose.material.icons.filled.Refresh
+ import androidx.compose.material.icons.filled.Restore
+ import androidx.compose.material.icons.filled.Search
+ import androidx.compose.material.icons.filled.Settings
+@@ -210,7 +209,7 @@ fun R0dumpManagerScreen(
+         topBar = {
+             TopAppBar(title = { Text(stringResource(R.string.app_name)) }, actions = {
+                 LanguageMenu()
+-                RefreshToolButton(viewModel::refresh)
++                ResetToolButton(state.canEdit, viewModel::restoreDefaults)
+                 if (shouldShowDraftPublishAction(state)) {
+                     DraftPublishButton(viewModel::publish)
+                 }
+@@ -411,6 +410,7 @@ private fun validationMessage(error: FusionValidationError): String = when (erro
+     FusionValidationErrorCode.EXCEEDS_BUFFER_POOL -> stringResource(R.string.validation_buffer_pool)
+     FusionValidationErrorCode.BELOW_EVENTS_PER_SOURCE -> stringResource(R.string.validation_events_per_source)
+     FusionValidationErrorCode.FORCE_BIT_REQUIRED -> stringResource(R.string.validation_force_bit)
++    FusionValidationErrorCode.FORCE_SCOPE_REQUIRED -> stringResource(R.string.validation_force_scope)
+     FusionValidationErrorCode.INVALID_BINARY_CLASS -> stringResource(R.string.validation_binary_class)
+     FusionValidationErrorCode.INVALID_METHOD_NAME -> stringResource(R.string.validation_method_name)
+     FusionValidationErrorCode.INVALID_METHOD_DESCRIPTOR -> stringResource(R.string.validation_method_descriptor)
+@@ -1580,16 +1580,16 @@ private const val MAX_VISIBLE_VALIDATION_ISSUES = 3
+ 
+ @OptIn(ExperimentalMaterial3Api::class)
+ @Composable
+-private fun RefreshToolButton(onRefresh: () -> Unit) {
++private fun ResetToolButton(enabled: Boolean, onReset: () -> Unit) {
+     val tooltipState = rememberTooltipState()
+-    val description = stringResource(R.string.refresh_device_state)
++    val description = stringResource(R.string.restore_default_settings)
+     TooltipBox(
+         positionProvider = TooltipDefaults.rememberTooltipPositionProvider(),
+         tooltip = { PlainTooltip { Text(description) } },
+         state = tooltipState,
+     ) {
+-        IconButton(onClick = onRefresh) {
+-            Icon(Icons.Default.Refresh, description)
++        IconButton(onClick = onReset, enabled = enabled) {
++            Icon(Icons.Default.Restore, description)
+         }
+     }
+ }
+diff --git a/tests/src/com/android/r0dumpmanager/app/R0dumpManagerViewModelTest.kt b/tests/src/com/android/r0dumpmanager/app/R0dumpManagerViewModelTest.kt
+index 4810f87..c38705e 100644
+--- a/tests/src/com/android/r0dumpmanager/app/R0dumpManagerViewModelTest.kt
++++ b/tests/src/com/android/r0dumpmanager/app/R0dumpManagerViewModelTest.kt
+@@ -175,6 +175,44 @@ class R0dumpManagerViewModelTest {
+         assertTrue(secureState.copy(deviceSnapshot = FusionDeviceSnapshot.Unconfigured).canEdit)
+     }
+ 
++    @Test
++    fun resetRestoresCompleteDefaultsWhilePreservingTargetIdentity() {
++        val dependencies = FakeDependencies()
++        val viewModel = configuredViewModel(dependencies)
++        val custom = validDraft().copy(
++            maxTotalBytes = 536_870_912,
++            maxDexBytes = 134_217_728,
++            bufferPoolBytes = 268_435_456,
++            maxCodeItemBytes = 1_048_576,
++            manifestEnabled = false,
++            walkEnabled = false,
++            walkMaxClasses = 500,
++            walkMaxMethods = 2_000,
++            forceInvokeEnabled = false,
++            anrProtectionEnabled = false,
++        )
++        viewModel.setDraft(custom)
++
++        viewModel.restoreDefaults()
++
++        val reset = viewModel.uiState.value.draft
++        val defaults = FusionConfigSchema.defaults()
++        assertEquals(custom.runId, reset.runId)
++        assertEquals(custom.targetPackage, reset.targetPackage)
++        assertEquals(custom.targetProcess, reset.targetProcess)
++        assertEquals(defaults.maxTotalBytes, reset.maxTotalBytes)
++        assertEquals(defaults.maxDexBytes, reset.maxDexBytes)
++        assertEquals(defaults.bufferPoolBytes, reset.bufferPoolBytes)
++        assertEquals(defaults.maxCodeItemBytes, reset.maxCodeItemBytes)
++        assertEquals(defaults.manifestEnabled, reset.manifestEnabled)
++        assertEquals(defaults.walkEnabled, reset.walkEnabled)
++        assertEquals(defaults.walkMaxClasses, reset.walkMaxClasses)
++        assertEquals(defaults.walkMaxMethods, reset.walkMaxMethods)
++        assertEquals(defaults.forceInvokeEnabled, reset.forceInvokeEnabled)
++        assertEquals(defaults.anrProtectionEnabled, reset.anrProtectionEnabled)
++        assertEquals(ProfileId.DEFAULTS, viewModel.uiState.value.selectedProfile)
++    }
++
+     private fun configuredViewModel(dependencies: FakeDependencies): R0dumpManagerViewModel {
+         val viewModel = R0dumpManagerViewModel(
+             application = application,
+@@ -195,6 +233,7 @@ class R0dumpManagerViewModelTest {
+         targetPackage = "com.example.target",
+         targetProcess = "com.example.target",
+         capturePointMask = 1uL shl 39,
++        forceInvokeEnabled = false,
+     )
+ }
+ 
+diff --git a/tests/src/com/android/r0dumpmanager/data/property/FusionPropertyRepositoryTest.kt b/tests/src/com/android/r0dumpmanager/data/property/FusionPropertyRepositoryTest.kt
+index 1febc9a..e753226 100644
+--- a/tests/src/com/android/r0dumpmanager/data/property/FusionPropertyRepositoryTest.kt
++++ b/tests/src/com/android/r0dumpmanager/data/property/FusionPropertyRepositoryTest.kt
+@@ -22,6 +22,7 @@ class FusionPropertyRepositoryTest {
+                 targetPackage = "com.example.target",
+                 targetProcess = "com.example.target",
+                 capturePointMask = 1uL shl 39,
++                forceInvokeEnabled = false,
+             )
+             val published = repository.publish(draft, 0L)
+             assertTrue(published is FusionDeviceSnapshot.Enabled)
+@@ -165,6 +166,7 @@ private fun validDraft() = FusionConfigSchema.defaults().copy(
+     targetPackage = "com.example.target",
+     targetProcess = "com.example.target",
+     capturePointMask = 1uL shl 39,
++    forceInvokeEnabled = false,
+ )
+ 
+ private class FakePropertyStore : PropertyAccess, ManagerPropertyWriter {
+diff --git a/tests/src/com/android/r0dumpmanager/domain/FusionConfigContractTest.kt b/tests/src/com/android/r0dumpmanager/domain/FusionConfigContractTest.kt
+index 536ba4d..485c462 100644
+--- a/tests/src/com/android/r0dumpmanager/domain/FusionConfigContractTest.kt
++++ b/tests/src/com/android/r0dumpmanager/domain/FusionConfigContractTest.kt
+@@ -11,7 +11,25 @@ class FusionConfigContractTest {
+         val json = JSONObject(FusionConfigSchema.toJson(FusionConfigSchema.defaults()))
+         assertEquals(FusionConfigSchema.FIELD_COUNT, json.length())
+         assertEquals(FusionConfigSchema.fields.toSet(), json.keys().asSequence().toSet())
+-        assertEquals("0x0000000000000000", json.getString("capture_point_mask"))
++        assertEquals("0x0000020000000028", json.getString("capture_point_mask"))
++    }
++    @Test fun defaultsMatchTheManagerOperationalBaseline() {
++        val defaults = FusionConfigSchema.defaults()
++        assertEquals(1_073_741_824L, defaults.maxTotalBytes)
++        assertEquals(268_435_456L, defaults.maxDexBytes)
++        assertEquals(536_870_912L, defaults.bufferPoolBytes)
++        assertEquals(4_194_304L, defaults.maxCodeItemBytes)
++        assertTrue(defaults.manifestEnabled)
++        assertTrue(defaults.walkEnabled)
++        assertEquals(16_384L, defaults.walkMaxClasses)
++        assertEquals(65_536L, defaults.walkMaxMethods)
++        assertTrue(defaults.forceInvokeEnabled)
++        assertTrue(defaults.anrProtectionEnabled)
++        assertEquals(
++            setOf(3, 5, 41),
++            CapturePointRegistry.points.filter { CapturePointRegistry.contains(defaults.capturePointMask, it.bit) }
++                .mapTo(mutableSetOf()) { it.bit },
++        )
+     }
+     @Test fun schemaSavedStateRoundTripPreservesEveryDraftField() {
+         val original = FusionConfigSchema.defaults().copy(
+@@ -31,18 +49,35 @@ class FusionConfigContractTest {
+         assertTrue(FusionConfigValidator.validate(FusionConfigSchema.defaults().copy(enabled = true, runId = "x", targetPackage = "com.example.app", targetProcess = "com.example.app", capturePointMask = 1uL shl 42)).errors.containsKey("capture_point_mask"))
+     }
+     @Test fun forceInvokeRequiresNoExecuteAndStrictDescriptor() {
+-        val base = FusionConfigSchema.defaults().copy(enabled = true, runId = "run-1", targetPackage = "com.example.app", targetProcess = "com.example.app", forceInvokeEnabled = true, forceClass = "com.example.Target", forceMethod = "run", forceMethodDescriptor = "(Ljava/lang/String;I)V")
++        val base = FusionConfigSchema.defaults().copy(enabled = true, runId = "run-1", targetPackage = "com.example.app", targetProcess = "com.example.app", capturePointMask = 0uL, forceInvokeEnabled = true, forceClass = "com.example.Target", forceMethod = "run", forceMethodDescriptor = "(Ljava/lang/String;I)V")
+         assertTrue(FusionConfigValidator.validate(base).errors.containsKey("capture_point_mask"))
+         assertFalse(FusionConfigValidator.validate(base.copy(capturePointMask = CapturePointRegistry.forceNoExecuteMask)).errors.containsKey("force_method_descriptor"))
+         assertTrue(FusionConfigValidator.validate(base.copy(capturePointMask = CapturePointRegistry.forceNoExecuteMask, forceMethodDescriptor = "(Ljava.lang.String;)V")).errors.containsKey("force_method_descriptor"))
+     }
++    @Test fun forceInvokeUsesManifestNamespacesWhenExactSelectorIsEmpty() {
++        val manifestScope = FusionConfigSchema.defaults().copy(
++            enabled = true,
++            runId = "run-1",
++            targetPackage = "com.example.app",
++            targetProcess = "com.example.app",
++        )
++        assertTrue(FusionConfigValidator.validate(manifestScope).isValid)
++        assertEquals(
++            FusionValidationErrorCode.FORCE_SCOPE_REQUIRED,
++            FusionConfigValidator.validate(manifestScope.copy(manifestEnabled = false)).errors["force_class"]?.code,
++        )
++        assertEquals(
++            FusionValidationErrorCode.INVALID_METHOD_NAME,
++            FusionConfigValidator.validate(manifestScope.copy(forceClass = "com.example.Target")).errors["force_method"]?.code,
++        )
++    }
+     @Test fun targetProcessMustBePackageOrSuffix() {
+-        val draft = FusionConfigSchema.defaults().copy(enabled = true, runId = "r", targetPackage = "com.example.app", targetProcess = "com.example.app:worker", capturePointMask = 1uL)
++        val draft = FusionConfigSchema.defaults().copy(enabled = true, runId = "r", targetPackage = "com.example.app", targetProcess = "com.example.app:worker", capturePointMask = 1uL, forceInvokeEnabled = false)
+         assertTrue(FusionConfigValidator.validate(draft).isValid)
+         assertTrue(FusionConfigValidator.validate(draft.copy(targetProcess = "com.example.application")).errors.containsKey("target_process"))
+     }
+ 
+-    @Test fun profilesPreserveTargetAndKeepDangerousCapabilitiesDisabled() {
++    @Test fun profilesPreserveTargetAndApplyTheirDocumentedCapabilityDefaults() {
+         val source = FusionConfigSchema.defaults().copy(
+             targetPackage = "com.example.app",
+             targetProcess = "com.example.app:worker",
+@@ -56,8 +91,9 @@ class FusionConfigContractTest {
+         val defaults = ProfileRegistry.apply(ProfileId.DEFAULTS, source)
+         assertEquals(source.targetPackage, defaults.targetPackage)
+         assertEquals(source.targetProcess, defaults.targetProcess)
+-        assertFalse(defaults.forceInvokeEnabled)
+-        assertFalse(defaults.anrProtectionEnabled)
++        assertTrue(defaults.forceInvokeEnabled)
++        assertTrue(defaults.anrProtectionEnabled)
++        assertTrue(defaults.walkEnabled)
+ 
+         val coolApk = ProfileRegistry.apply(ProfileId.COOLAPK_COOKIE_WALK, source)
+         assertEquals(1uL shl 39, coolApk.capturePointMask)
+@@ -76,6 +112,7 @@ class FusionConfigContractTest {
+             targetPackage = "com.example.app",
+             targetProcess = "com.example.app",
+             capturePointMask = 1uL,
++            forceInvokeEnabled = false,
+             maxRecords = 8,
+             maxArtifacts = 8,
+             maxTotalBytes = 1024,
+@@ -101,10 +138,10 @@ class FusionConfigContractTest {
+     @Test fun budgetAbsoluteLimitsAreSharedWithTheUiContract() {
+         assertEquals(4096L, FusionConfigValidator.MAX_RECORDS)
+         assertEquals(512L, FusionConfigValidator.MAX_ARTIFACTS)
+-        assertEquals(512L * 1024 * 1024, FusionConfigValidator.MAX_TOTAL_BYTES)
+-        assertEquals(128L * 1024 * 1024, FusionConfigValidator.MAX_DEX_BYTES)
+-        assertEquals(256L * 1024 * 1024, FusionConfigValidator.MAX_BUFFER_POOL_BYTES)
+-        assertEquals(1024L * 1024, FusionConfigValidator.MAX_CODE_ITEM_BYTES)
++        assertEquals(1024L * 1024 * 1024, FusionConfigValidator.MAX_TOTAL_BYTES)
++        assertEquals(256L * 1024 * 1024, FusionConfigValidator.MAX_DEX_BYTES)
++        assertEquals(512L * 1024 * 1024, FusionConfigValidator.MAX_BUFFER_POOL_BYTES)
++        assertEquals(4L * 1024 * 1024, FusionConfigValidator.MAX_CODE_ITEM_BYTES)
+         assertEquals(4L, FusionConfigValidator.MAX_FROZEN_GENERATIONS)
+         assertEquals(60_000L, FusionConfigValidator.MAX_FLUSH_IDLE_MS)
+     }
+diff --git a/tools/validate_source_contracts.sh b/tools/validate_source_contracts.sh
+index 2e96b72..1874795 100755
+--- a/tools/validate_source_contracts.sh
++++ b/tools/validate_source_contracts.sh
+@@ -62,6 +62,10 @@ if manager_point_names != art_point_names:
+     errors.append("Manager capture point IDs must exactly match ART descriptors")
+ if "kForceInvokeNoExecute = 41" not in points or "forceNoExecuteMask: ULong = 1uL shl 41" not in registry:
+     errors.append("force no-execute bit must remain 41")
++if "defaultMask: ULong = (1uL shl 3) or (1uL shl 5) or forceNoExecuteMask" not in registry:
++    errors.append("Manager default capture points must remain bits 3, 5, and 41")
++if "0x0000020000000028" not in repository or "0x0000020000000028" not in framework:
++    errors.append("Manager and Framework default capture mask must remain bits 3, 5, and 41")
+ 
+ production = "\n".join(path.read_text(errors="ignore") for path in (app / "src").rglob("*.kt"))
+ for forbidden in (
+@@ -81,7 +85,7 @@ for required in (
+ for required in ("SystemProperties.get", "r0dump_writePersistedForManager", "Mutex", "readStable"):
+     if required not in repository:
+         errors.append(f"property repository contract missing: {required}")
+-for required in ("publishAndLaunch", "endSession", "recoverInterrupted", "restoreDefaultBudgets", "MutationAuthenticator"):
++for required in ("publishAndLaunch", "endSession", "recoverInterrupted", "restoreDefaults", "restoreDefaultBudgets", "MutationAuthenticator"):
+     if required not in view_model:
+         errors.append(f"ViewModel workflow missing: {required}")
+ for required in ("SavedStateHandle", "DRAFT_PROFILE_KEY", "createRunId", "activeTarget"):
+@@ -97,6 +101,10 @@ for required in (
+ ):
+     if required not in manager_screen:
+         errors.append(f"Android 16 UI/i18n contract missing: {required}")
++if "ResetToolButton(state.canEdit, viewModel::restoreDefaults)" not in manager_screen:
++    errors.append("top app-bar reset must restore the complete default profile")
++if "onClick = viewModel::restoreDefaultBudgets" not in manager_screen:
++    errors.append("budget-page reset must remain budget-only")
+ if "ACTION_LOCKED_BOOT_COMPLETED" not in boot_receiver or "createDeviceProtectedStorageContext" not in boot_receiver:
+     errors.append("direct-boot notification recovery contract missing")
+ 
+-- 
+2.43.0
+

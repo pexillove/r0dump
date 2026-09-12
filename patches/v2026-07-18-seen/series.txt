@@ -1,0 +1,7 @@
+patches/0001-art.patch
+patches/0002-build_soong.patch
+patches/0003-frameworks_base.patch
+patches/0004-libcore.patch
+patches/0005-packages_apps_Settings.patch
+patches/0006-vendor_lineage.patch
+new-projects/0007-packages_apps_R0DUMPManager-full-add.patch

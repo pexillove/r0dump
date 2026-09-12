@@ -1,0 +1,84 @@
+From 4212cb0f6c364e6c917e3fed6279cf397aa39b12 Mon Sep 17 00:00:00 2001
+From: Ivory <contact@ivory.cafe>
+Date: Wed, 2 Sep 2026 09:55:01 +0800
+Subject: [PATCH 17/32] Avoid historical scan for explicit export runs
+
+Use a validated direct run path so manager exports remain responsive on devices with large run histories. Add regression coverage for run-id validation and direct-path behavior.\n\nConstraint: Preserve the existing exporter CLI and remote storage layout.\nRejected: Enumerating all historical runs for --run-id | It causes unnecessary shell globbing and can hang on large histories.\nConfidence: high\nScope-risk: narrow\nDirective: Keep explicit run-id inputs strictly validated before constructing adb paths.\nTested: python3 tools/test_export_latest.py -q (8 passed)\nNot-tested: Device-side export after this commit
+---
+ tools/export_latest.py      | 31 ++++++++++++++++++++++++++++++-
+ tools/test_export_latest.py | 10 ++++++++++
+ 2 files changed, 40 insertions(+), 1 deletion(-)
+
+diff --git a/tools/export_latest.py b/tools/export_latest.py
+index 8041413..c593cb4 100755
+--- a/tools/export_latest.py
++++ b/tools/export_latest.py
+@@ -121,6 +121,13 @@ exit 0
+ """.strip()
+ 
+ 
++def run_path(root: str, run_id: str) -> str:
++    """Return a validated device run path without enumerating historical runs."""
++    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", run_id):
++        raise ExportError(f"无效 run id：{run_id!r}")
++    return f"{root}/{run_id}"
++
++
+ def parse_candidates(output: str, root: str) -> list[RunCandidate]:
+     expected_parent = PurePosixPath(root)
+     candidates: list[RunCandidate] = []
+@@ -310,7 +317,29 @@ def export_latest(args: argparse.Namespace) -> Path:
+     client = AdbClient(args.adb, args.serial, args.verbose)
+     serial = client.ensure_device()
+     root = remote_runs_root(package)
+-    candidate = select_run(parse_candidates(client.shell(candidate_script(root)), root), args.run_id)
++    if args.run_id is None:
++        candidate = select_run(parse_candidates(client.shell(candidate_script(root)), root), None)
++    else:
++        remote_path = run_path(root, args.run_id)
++        candidate = RunCandidate(latest_artifact_mtime=0, artifact_count=1, remote_path=remote_path)
++        # Validate the explicitly requested run before adb pull. This avoids a shell glob over all
++        # historical runs and produces a focused error for a missing/empty run.
++        probe = client.shell(
++            f"run={shlex.quote(remote_path)}; "
++            "[ -d \"$run\" ] || { echo missing >&2; exit 1; }; "
++            "count=0; for process in \"$run\"/process-*; do "
++            "[ -f \"$process/session.json\" ] || continue; "
++            "for artifact in \"$process\"/artifacts/*; do [ -f \"$artifact\" ] && count=$((count + 1)); done; "
++            "done; [ \"$count\" -gt 0 ] || { echo empty >&2; exit 1; }; printf '%s\\n' \"$count\""
++        ).strip()
++        try:
++            candidate = RunCandidate(
++                latest_artifact_mtime=0,
++                artifact_count=int(probe),
++                remote_path=remote_path,
++            )
++        except ValueError as exc:
++            raise ExportError(f"设备返回了无效的 run 统计：{probe!r}") from exc
+     dexdump = None if args.no_repair else resolve_optional_tool(args.dexdump, "dexdump")
+     jadx = None if args.no_repair else resolve_optional_tool(args.jadx, "jadx")
+ 
+diff --git a/tools/test_export_latest.py b/tools/test_export_latest.py
+index 86b68eb..aaa2dba 100755
+--- a/tools/test_export_latest.py
++++ b/tools/test_export_latest.py
+@@ -32,6 +32,16 @@ class ExportLatestTest(unittest.TestCase):
+         with self.assertRaises(export_latest.ExportError):
+             export_latest.parse_candidates("1\t1\t/sdcard/other/run\n", root)
+ 
++    def test_explicit_run_path_is_validated_without_history_scan(self) -> None:
++        root = "/sdcard/Android/data/com.example.app/files/r0dump-fusion/runs"
++        self.assertEqual(
++            f"{root}/20260902TVCB-ui-targeted",
++            export_latest.run_path(root, "20260902TVCB-ui-targeted"),
++        )
++        for run_id in ("../escape", "run/child", "", "x" * 129):
++            with self.assertRaises(export_latest.ExportError):
++                export_latest.run_path(root, run_id)
++
+     def test_repairs_each_process_with_existing_host_repair(self) -> None:
+         with tempfile.TemporaryDirectory() as directory:
+             run = Path(directory) / "run"
+-- 
+2.43.0
+

@@ -1,0 +1,63 @@
+From 8aa1aadf41b2da612a633380bb69c073eedacfea Mon Sep 17 00:00:00 2001
+From: Ivory <contact@ivory.cafe>
+Date: Wed, 2 Sep 2026 04:14:44 +0800
+Subject: [PATCH 12/21] Keep Fusion ART links within frame diagnostics
+
+Constraint: Preserve ART_FRAME_SIZE_LIMIT while making the instrumented runtime linkable with current clang/LTO.
+Rejected: Raise or disable the global frame limit | It would weaken stack-safety checks for unrelated runtime code.
+Confidence: high
+Scope-risk: narrow
+Directive: Keep frame-warning suppressions scoped to documented large-frame entry points.
+Tested: m nothing -j2; m com.android.art -j8; Python r0dump unittest suite (18 tests).
+Not-tested: Device replacement and com.VCB.ui capture after this fresh APEX.
+Change-Id: I4e5452ddc823af56270095f509396294edfd72f2
+---
+ runtime/class_linker.cc | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/runtime/class_linker.cc b/runtime/class_linker.cc
+index 2142ebf..806eae7 100644
+--- a/runtime/class_linker.cc
++++ b/runtime/class_linker.cc
+@@ -5236,6 +5236,13 @@ bool ClassLinker::AttemptSupertypeVerification(Thread* self,
+   return false;
+ }
+ 
++// Fusion's completion metadata keeps this hot verifier path just above ART's
++// conservative device frame-size warning under the current LTO toolchain. The
++// existing ART implementation already uses this scoped suppression for other
++// unavoidable large-frame runtime paths; keep it local to the instrumented
++// entry points instead of weakening the global limit.
++#pragma GCC diagnostic push
++#pragma GCC diagnostic ignored "-Wframe-larger-than="
+ verifier::FailureKind ClassLinker::VerifyClass(Thread* self,
+                                                verifier::VerifierDeps* verifier_deps,
+                                                Handle<mirror::Class> klass,
+@@ -5445,6 +5452,7 @@ verifier::FailureKind ClassLinker::VerifyClass(Thread* self,
+   }
+   return verifier_failure;
+ }
++#pragma GCC diagnostic pop
+ 
+ verifier::FailureKind ClassLinker::PerformClassVerification(Thread* self,
+                                                             verifier::VerifierDeps* verifier_deps,
+@@ -5933,6 +5941,8 @@ bool ClassLinker::CanWeInitializeClass(ObjPtr<mirror::Class> klass,
+   return can_init_parents && CanWeInitializeClass(super_class, can_init_statics, can_init_parents);
+ }
+ 
++#pragma GCC diagnostic push
++#pragma GCC diagnostic ignored "-Wframe-larger-than="
+ bool ClassLinker::InitializeClass(Thread* self,
+                                   Handle<mirror::Class> klass,
+                                   bool can_init_statics,
+@@ -6264,6 +6274,7 @@ bool ClassLinker::InitializeClass(Thread* self,
+   }
+   return success;
+ }
++#pragma GCC diagnostic pop
+ 
+ // We recursively run down the tree of interfaces. We need to do this in the order they are declared
+ // and perform the initialization only on those interfaces that contain default methods.
+-- 
+2.43.0
+

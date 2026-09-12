@@ -1,0 +1,613 @@
+From 4db1b342c986fa03dac41999021272acf5c02d3b Mon Sep 17 00:00:00 2001
+From: Ivory <contact@ivory.cafe>
+Date: Mon, 31 Aug 2026 12:27:02 +0800
+Subject: [PATCH 3/9] Authenticate output preparation before granting target
+ filesystem authority
+
+Bind preparation requests to Binder identity, ProcessRecord state, PackageManager ownership, and one stable enabled generation, then transport the verified O_PATH capability through a one-shot socket envelope.
+
+Constraint: Binder cannot directly serialize the required O_PATH directory descriptor
+Rejected: Returning an ordinary external-storage directory FD | it would require system_server read access forbidden by platform storage neverallows
+Confidence: high
+Scope-risk: moderate
+Directive: Preserve all four identity checks and fail closed before native configuration publication
+Tested: framework-minus-apex and services production targets; device Binder/SCM_RIGHTS cold-start path
+Not-tested: complete Framework test suite remains blocked by unrelated LockPattern test signature drift
+Change-Id: I4b48d934e28bb8bc65deae8d9371e8dab0958e18
+---
+ core/java/android/app/IActivityManager.aidl   |   4 +
+ .../java/android/app/r0dump_FusionConfig.java | 128 ++++++++++++--
+ .../android/app/r0dump_FusionConfigTest.java  |  38 ++++-
+ .../server/am/ActivityManagerService.java     |  42 +++++
+ .../am/r0dump_FilePreparationBridge.java      | 156 ++++++++++++++++++
+ .../am/r0dump_FilePreparationBridgeTest.java  |  59 +++++++
+ 6 files changed, 414 insertions(+), 13 deletions(-)
+ create mode 100644 services/core/java/com/android/server/am/r0dump_FilePreparationBridge.java
+ create mode 100644 services/tests/servicestests/src/com/android/server/am/r0dump_FilePreparationBridgeTest.java
+
+diff --git a/core/java/android/app/IActivityManager.aidl b/core/java/android/app/IActivityManager.aidl
+index 7a6ace796..f5c3b8f58 100644
+--- a/core/java/android/app/IActivityManager.aidl
++++ b/core/java/android/app/IActivityManager.aidl
+@@ -702,6 +702,10 @@ interface IActivityManager {
+      */
+     List<String> getDelegatedShellPermissions();
+ 
++    /** @hide Creates the trusted r0dump output tree and returns its process directory. */
++    ParcelFileDescriptor r0dump_prepareOutput(
++            String packageName, String processName, String runId, long generation);
++
+     /** Returns a file descriptor that'll be closed when the system server process dies. */
+     ParcelFileDescriptor getLifeMonitor();
+ 
+diff --git a/core/java/android/app/r0dump_FusionConfig.java b/core/java/android/app/r0dump_FusionConfig.java
+index eb4681310..d0a5b2f26 100644
+--- a/core/java/android/app/r0dump_FusionConfig.java
++++ b/core/java/android/app/r0dump_FusionConfig.java
+@@ -17,7 +17,10 @@
+ package android.app;
+ 
+ import android.content.Context;
++import android.net.LocalSocket;
+ import android.os.Process;
++import android.os.ParcelFileDescriptor;
++import android.os.RemoteException;
+ import android.os.SystemProperties;
+ import android.os.UserHandle;
+ import android.util.JsonReader;
+@@ -25,6 +28,7 @@ import android.util.JsonToken;
+ import android.util.Slog;
+ import dalvik.system.r0dump_Runtime;
+ import java.io.File;
++import java.io.FileDescriptor;
+ import java.io.IOException;
+ import java.io.StringReader;
+ import java.nio.charset.StandardCharsets;
+@@ -137,6 +141,7 @@ public final class r0dump_FusionConfig {
+   final String forceMethodDescriptor;
+   final long forceMaxCalls;
+   final boolean anrProtectionEnabled;
++  private long persistedGeneration = -1L;
+ 
+   private r0dump_FusionConfig(JSONObject json) throws JSONException {
+     schema = r0dump_requireInt(json, "schema");
+@@ -200,18 +205,58 @@ public final class r0dump_FusionConfig {
+       Slog.w(TAG, "Application external files directory is unavailable");
+       return null;
+     }
+-    if (!r0dump_publishIfEnabled(
+-        config,
+-        packageName,
+-        processName,
+-        outputParent,
+-        r0dump_FusionConfig::r0dump_publishNative)) {
+-      Slog.w(TAG, "Native process configuration was rejected");
++    try (ParcelFileDescriptor deliveryChannel =
++        ActivityManager.getService()
++            .r0dump_prepareOutput(
++                packageName, processName, config.runId, config.persistedGeneration)) {
++      if (deliveryChannel == null) {
++        Slog.w(TAG, "Output directory preparation was rejected");
++        return null;
++      }
++      try (ParcelFileDescriptor preparedDirectory =
++          r0dump_receivePreparedDirectory(deliveryChannel)) {
++        if (!r0dump_publishIfEnabled(
++            config,
++            packageName,
++            processName,
++            outputParent,
++            preparedDirectory.getFd(),
++            r0dump_FusionConfig::r0dump_publishNative)) {
++          Slog.w(TAG, "Native process configuration was rejected");
++          return null;
++        }
++      }
++    } catch (IOException | RemoteException e) {
++      Slog.w(TAG, "Unable to prepare the output directory", e);
+       return null;
+     }
+     return config;
+   }
+ 
++  private static ParcelFileDescriptor r0dump_receivePreparedDirectory(
++      ParcelFileDescriptor deliveryChannel) throws IOException {
++    final LocalSocket socket = new LocalSocket(deliveryChannel.getFileDescriptor());
++    if (socket.getInputStream().read() != 1) {
++      throw new IOException("invalid directory delivery response");
++    }
++    final FileDescriptor[] received = socket.getAncillaryFileDescriptors();
++    try {
++      if (received == null || received.length != 1) {
++        throw new IOException("invalid directory descriptor count");
++      }
++      return ParcelFileDescriptor.dup(received[0]);
++    } finally {
++      if (received != null) {
++        for (FileDescriptor descriptor : received) {
++          try {
++            android.system.Os.close(descriptor);
++          } catch (android.system.ErrnoException ignored) {
++          }
++        }
++      }
++    }
++  }
++
+   static r0dump_FusionConfig r0dump_readPersisted(r0dump_PropertyAccess properties) {
+     final long generationBefore = r0dump_readGeneration(properties);
+     if ((generationBefore & 1L) != 0L) {
+@@ -299,7 +344,57 @@ public final class r0dump_FusionConfig {
+     if (generationBefore != r0dump_readGeneration(properties)) {
+       throw r0dump_invalid("generation_changed");
+     }
+-    return r0dump_parse(json.toString());
++    final r0dump_FusionConfig config = r0dump_parse(json.toString());
++    config.persistedGeneration = generationBefore;
++    return config;
++  }
++
++  /**
++   * Revalidates a target process output-preparation request against one stable property snapshot.
++   * This is called only by system_server after it has independently verified Binder identity.
++   *
++   * @hide
++   */
++  public static boolean r0dump_validateOutputPreparationForSystemServer(
++      long expectedGeneration,
++      int targetUid,
++      String packageName,
++      String processName,
++      String runId) {
++    return r0dump_validateOutputPreparationForSystemServer(
++        expectedGeneration,
++        targetUid,
++        packageName,
++        processName,
++        runId,
++        SYSTEM_PROPERTIES);
++  }
++
++  static boolean r0dump_validateOutputPreparationForSystemServer(
++      long expectedGeneration,
++      int targetUid,
++      String packageName,
++      String processName,
++      String runId,
++      r0dump_PropertyAccess properties) {
++    if (expectedGeneration < 0L
++        || (expectedGeneration & 1L) != 0L
++        || !r0dump_isSystemUserUid(targetUid)
++        || packageName == null
++        || processName == null
++        || runId == null) {
++      return false;
++    }
++    try {
++      final r0dump_FusionConfig config = r0dump_readPersisted(properties);
++      return config != null
++          && config.persistedGeneration == expectedGeneration
++          && config.enabled
++          && config.runId.equals(runId)
++          && config.r0dump_matchesProcess(packageName, processName);
++    } catch (RuntimeException e) {
++      return false;
++    }
+   }
+ 
+   static boolean r0dump_writePersisted(
+@@ -543,7 +638,7 @@ public final class r0dump_FusionConfig {
+       String outputParent,
+       r0dump_Publisher publisher) {
+     return r0dump_publishIfEnabled(
+-        r0dump_parse(rawConfig), packageName, processName, outputParent, publisher);
++        r0dump_parse(rawConfig), packageName, processName, outputParent, -1, publisher);
+   }
+ 
+   private static boolean r0dump_publishIfEnabled(
+@@ -551,6 +646,7 @@ public final class r0dump_FusionConfig {
+       String packageName,
+       String processName,
+       String outputParent,
++      int preparedDirectoryFd,
+       r0dump_Publisher publisher) {
+     if (packageName == null
+         || processName == null
+@@ -561,11 +657,14 @@ public final class r0dump_FusionConfig {
+     if (!r0dump_isTrustedOutputParent(outputParent, packageName)) {
+       throw r0dump_invalid("output_parent");
+     }
+-    return publisher.r0dump_publish(config, processName, outputParent);
++    return publisher.r0dump_publish(config, processName, outputParent, preparedDirectoryFd);
+   }
+ 
+   private static boolean r0dump_publishNative(
+-      r0dump_FusionConfig config, String processName, String outputParent) {
++      r0dump_FusionConfig config,
++      String processName,
++      String outputParent,
++      int preparedDirectoryFd) {
+     return r0dump_Runtime.r0dump_configure(
+         config.schema,
+         config.enabled,
+@@ -574,6 +673,7 @@ public final class r0dump_FusionConfig {
+         config.targetProcess,
+         processName,
+         outputParent,
++        preparedDirectoryFd,
+         config.capturePointMask,
+         config.maxRecords,
+         config.maxArtifacts,
+@@ -1054,7 +1154,11 @@ public final class r0dump_FusionConfig {
+   }
+ 
+   interface r0dump_Publisher {
+-    boolean r0dump_publish(r0dump_FusionConfig config, String processName, String outputParent);
++    boolean r0dump_publish(
++        r0dump_FusionConfig config,
++        String processName,
++        String outputParent,
++        int preparedDirectoryFd);
+   }
+ 
+   interface r0dump_PropertyAccess {
+diff --git a/core/tests/coretests/src/android/app/r0dump_FusionConfigTest.java b/core/tests/coretests/src/android/app/r0dump_FusionConfigTest.java
+index cfa7f9100..67623ad75 100644
+--- a/core/tests/coretests/src/android/app/r0dump_FusionConfigTest.java
++++ b/core/tests/coretests/src/android/app/r0dump_FusionConfigTest.java
+@@ -485,6 +485,37 @@ public class r0dump_FusionConfigTest {
+     assertThat(r0dump_FusionConfig.r0dump_readPersisted(properties)).isNull();
+   }
+ 
++  @Test
++  public void r0dump_outputPreparation_revalidatesStableGenerationAndIdentity() throws Exception {
++    final r0dump_FakeProperties properties = new r0dump_FakeProperties();
++    final r0dump_FusionConfig config =
++        r0dump_FusionConfig.r0dump_parse(r0dump_validJson().toString());
++    assertThat(r0dump_FusionConfig.r0dump_writePersisted(config, properties)).isTrue();
++
++    assertThat(
++            r0dump_FusionConfig.r0dump_validateOutputPreparationForSystemServer(
++                2L,
++                10001,
++                PACKAGE_NAME,
++                PROCESS_NAME,
++                "20260824T120000Z-a1b2c3d4",
++                properties))
++        .isTrue();
++    assertThat(
++            r0dump_FusionConfig.r0dump_validateOutputPreparationForSystemServer(
++                4L,
++                10001,
++                PACKAGE_NAME,
++                PROCESS_NAME,
++                "20260824T120000Z-a1b2c3d4",
++                properties))
++        .isFalse();
++    assertThat(
++            r0dump_FusionConfig.r0dump_validateOutputPreparationForSystemServer(
++                2L, 10001, PACKAGE_NAME, PROCESS_NAME, "other-run", properties))
++        .isFalse();
++  }
++
+   @Test
+   public void r0dump_parse_rejectsConfigurableLimitCeilingsAndRelationships() throws Exception {
+     r0dump_assertInvalid(r0dump_validJson().put("max_records", 4097).toString());
+@@ -560,14 +591,19 @@ public class r0dump_FusionConfigTest {
+     r0dump_FusionConfig config;
+     String processName;
+     String outputParent;
++    int preparedDirectoryFd;
+ 
+     @Override
+     public boolean r0dump_publish(
+-        r0dump_FusionConfig config, String processName, String outputParent) {
++        r0dump_FusionConfig config,
++        String processName,
++        String outputParent,
++        int preparedDirectoryFd) {
+       callCount++;
+       this.config = config;
+       this.processName = processName;
+       this.outputParent = outputParent;
++      this.preparedDirectoryFd = preparedDirectoryFd;
+       return true;
+     }
+   }
+diff --git a/services/core/java/com/android/server/am/ActivityManagerService.java b/services/core/java/com/android/server/am/ActivityManagerService.java
+index 143294982..d7b019636 100644
+--- a/services/core/java/com/android/server/am/ActivityManagerService.java
++++ b/services/core/java/com/android/server/am/ActivityManagerService.java
+@@ -264,6 +264,7 @@ import android.app.PendingIntent;
+ import android.app.PendingIntentStats;
+ import android.app.ProcessMemoryState;
+ import android.app.ProfilerInfo;
++import android.app.r0dump_FusionConfig;
+ import android.app.ServiceStartNotAllowedException;
+ import android.app.WaitResult;
+ import android.app.assist.ActivityId;
+@@ -1621,6 +1622,9 @@ public class ActivityManagerService extends IActivityManager.Stub
+     @GuardedBy("mProcLock")
+     private ParcelFileDescriptor[] mLifeMonitorFds;
+ 
++    private final r0dump_FilePreparationBridge mR0dumpFilePreparationBridge =
++            new r0dump_FilePreparationBridge();
++
+     static final HostingRecord sNullHostingRecord =
+             new HostingRecord(HostingRecord.HOSTING_TYPE_EMPTY);
+     /**
+@@ -19326,6 +19330,44 @@ public class ActivityManagerService extends IActivityManager.Stub
+         }
+     }
+ 
++    @Override
++    public ParcelFileDescriptor r0dump_prepareOutput(
++            String packageName, String processName, String runId, long generation) {
++        final int callingUid = Binder.getCallingUid();
++        final int callingPid = Binder.getCallingPid();
++        if (packageName == null || processName == null || runId == null
++                || UserHandle.getUserId(callingUid) != UserHandle.USER_SYSTEM) {
++            return null;
++        }
++
++        synchronized (this) {
++            synchronized (mPidsSelfLocked) {
++                final ProcessRecord process = mPidsSelfLocked.get(callingPid);
++                if (process == null
++                        || process.uid != callingUid
++                        || !processName.equals(process.processName)
++                        || !process.getPkgList().containsKey(packageName)) {
++                    return null;
++                }
++            }
++        }
++        if (mPackageManagerInt.getPackageUid(packageName, 0, UserHandle.USER_SYSTEM)
++                != callingUid) {
++            return null;
++        }
++        if (!r0dump_FusionConfig.r0dump_validateOutputPreparationForSystemServer(
++                generation, callingUid, packageName, processName, runId)) {
++            return null;
++        }
++        try {
++            return mR0dumpFilePreparationBridge.prepare(
++                    callingUid, callingPid, packageName, processName, runId, generation);
++        } catch (IOException e) {
++            Slog.w(TAG, "Unable to prepare r0dump output", e);
++            return null;
++        }
++    }
++
+     @Override
+     public ParcelFileDescriptor getLifeMonitor() {
+         if (!isCallerShell()) {
+diff --git a/services/core/java/com/android/server/am/r0dump_FilePreparationBridge.java b/services/core/java/com/android/server/am/r0dump_FilePreparationBridge.java
+new file mode 100644
+index 000000000..25936ad0a
+--- /dev/null
++++ b/services/core/java/com/android/server/am/r0dump_FilePreparationBridge.java
+@@ -0,0 +1,156 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ */
++
++package com.android.server.am;
++
++import static android.system.OsConstants.SOCK_SEQPACKET;
++
++import android.net.LocalSocket;
++import android.net.LocalSocketAddress;
++import android.os.ParcelFileDescriptor;
++import android.system.ErrnoException;
++import android.system.Os;
++import java.io.FileDescriptor;
++import java.io.IOException;
++import java.io.InputStream;
++import java.nio.ByteBuffer;
++import java.nio.ByteOrder;
++import java.nio.charset.StandardCharsets;
++
++/** Fixed-protocol client for the init-owned r0dump file helper. */
++final class r0dump_FilePreparationBridge {
++  private static final int MAGIC = 0x52304648;
++  private static final short VERSION = 1;
++  private static final int PACKAGE_BYTES = 96;
++  private static final int PROCESS_BYTES = 96;
++  private static final int RUN_ID_BYTES = 65;
++  private static final int REQUEST_BYTES = 285;
++  private static final int RESPONSE_BYTES = 12;
++  private static final int STATUS_OK = 0;
++  private static final int TIMEOUT_MS = 2000;
++
++  ParcelFileDescriptor prepare(
++      int targetUid,
++      int targetPid,
++      String packageName,
++      String processName,
++      String runId,
++      long generation)
++      throws IOException {
++    final byte[] request =
++        encodeRequest(targetUid, targetPid, packageName, processName, runId, generation);
++    try (LocalSocket socket = new LocalSocket(LocalSocket.SOCKET_SEQPACKET)) {
++      socket.connect(
++          new LocalSocketAddress("r0dump_file_helper", LocalSocketAddress.Namespace.RESERVED));
++      // LocalSocket creates its native fd lazily. Socket options are only valid after connect().
++      socket.setSoTimeout(TIMEOUT_MS);
++      socket.getOutputStream().write(request);
++      socket.getOutputStream().flush();
++
++      final byte[] response = new byte[RESPONSE_BYTES];
++      readExactly(socket.getInputStream(), response);
++      final FileDescriptor[] received = socket.getAncillaryFileDescriptors();
++      try {
++        final ByteBuffer buffer = ByteBuffer.wrap(response).order(ByteOrder.LITTLE_ENDIAN);
++        if (buffer.getInt() != MAGIC
++            || buffer.getShort() != VERSION
++            || Short.toUnsignedInt(buffer.getShort()) != RESPONSE_BYTES
++            || buffer.getInt() != STATUS_OK
++            || received == null
++            || received.length != 1) {
++          return null;
++        }
++        return createDeliveryChannel(received);
++      } finally {
++        closeDescriptors(received);
++      }
++    }
++  }
++
++  private static ParcelFileDescriptor createDeliveryChannel(FileDescriptor[] directoryDescriptors)
++      throws IOException {
++    final ParcelFileDescriptor[] channel =
++        ParcelFileDescriptor.createSocketPair(SOCK_SEQPACKET);
++    try (ParcelFileDescriptor sender = channel[0]) {
++      final LocalSocket socket = new LocalSocket(sender.getFileDescriptor());
++      socket.setFileDescriptorsForSend(directoryDescriptors);
++      socket.getOutputStream().write(1);
++      socket.getOutputStream().flush();
++      final ParcelFileDescriptor receiver = channel[1];
++      channel[1] = null;
++      return receiver;
++    } finally {
++      if (channel[1] != null) {
++        channel[1].close();
++      }
++    }
++  }
++
++  static byte[] encodeRequest(
++      int targetUid,
++      int targetPid,
++      String packageName,
++      String processName,
++      String runId,
++      long generation)
++      throws IOException {
++    if (targetUid < 10000 || targetPid <= 0 || generation < 0 || (generation & 1L) != 0L) {
++      throw new IOException("invalid request identity");
++    }
++    final ByteBuffer buffer = ByteBuffer.allocate(REQUEST_BYTES).order(ByteOrder.LITTLE_ENDIAN);
++    buffer.putInt(MAGIC);
++    buffer.putShort(VERSION);
++    buffer.putShort((short) REQUEST_BYTES);
++    buffer.putLong(generation);
++    buffer.putInt(0); // Owner user only.
++    buffer.putInt(targetUid);
++    buffer.putInt(targetPid);
++    putFixedString(buffer, packageName, PACKAGE_BYTES);
++    putFixedString(buffer, processName, PROCESS_BYTES);
++    putFixedString(buffer, runId, RUN_ID_BYTES);
++    return buffer.array();
++  }
++
++  private static void putFixedString(ByteBuffer buffer, String value, int capacity)
++      throws IOException {
++    if (value == null) {
++      throw new IOException("missing request field");
++    }
++    final byte[] encoded = value.getBytes(StandardCharsets.UTF_8);
++    if (encoded.length == 0 || encoded.length >= capacity) {
++      throw new IOException("request field too long");
++    }
++    buffer.put(encoded);
++    buffer.position(buffer.position() + capacity - encoded.length);
++  }
++
++  private static void readExactly(InputStream input, byte[] destination) throws IOException {
++    int offset = 0;
++    while (offset < destination.length) {
++      final int read = input.read(destination, offset, destination.length - offset);
++      if (read < 0) {
++        throw new IOException("short helper response");
++      }
++      offset += read;
++    }
++  }
++
++  private static void closeDescriptors(FileDescriptor[] descriptors) {
++    if (descriptors == null) {
++      return;
++    }
++    for (FileDescriptor descriptor : descriptors) {
++      try {
++        Os.close(descriptor);
++      } catch (ErrnoException ignored) {
++      }
++    }
++  }
++}
+diff --git a/services/tests/servicestests/src/com/android/server/am/r0dump_FilePreparationBridgeTest.java b/services/tests/servicestests/src/com/android/server/am/r0dump_FilePreparationBridgeTest.java
+new file mode 100644
+index 000000000..fb25dca32
+--- /dev/null
++++ b/services/tests/servicestests/src/com/android/server/am/r0dump_FilePreparationBridgeTest.java
+@@ -0,0 +1,59 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ */
++
++package com.android.server.am;
++
++import static com.google.common.truth.Truth.assertThat;
++import static org.junit.Assert.assertThrows;
++
++import java.io.IOException;
++import java.nio.ByteBuffer;
++import java.nio.ByteOrder;
++import java.nio.charset.StandardCharsets;
++import org.junit.Test;
++
++public class r0dump_FilePreparationBridgeTest {
++  @Test
++  public void encodeRequest_hasStableLittleEndianLayoutAndZeroPadding() throws Exception {
++    final byte[] request =
++        r0dump_FilePreparationBridge.encodeRequest(
++            10198, 2468, "com.coolapk.market", "com.coolapk.market:push", "run-1", 278L);
++
++    assertThat(request).hasLength(285);
++    final ByteBuffer buffer = ByteBuffer.wrap(request).order(ByteOrder.LITTLE_ENDIAN);
++    assertThat(buffer.getInt()).isEqualTo(0x52304648);
++    assertThat(buffer.getShort()).isEqualTo((short) 1);
++    assertThat(Short.toUnsignedInt(buffer.getShort())).isEqualTo(285);
++    assertThat(buffer.getLong()).isEqualTo(278L);
++    assertThat(buffer.getInt()).isEqualTo(0);
++    assertThat(buffer.getInt()).isEqualTo(10198);
++    assertThat(buffer.getInt()).isEqualTo(2468);
++
++    final byte[] packageBytes = new byte[96];
++    buffer.get(packageBytes);
++    assertThat(new String(packageBytes, 0, "com.coolapk.market".length(), StandardCharsets.UTF_8))
++        .isEqualTo("com.coolapk.market");
++    assertThat(packageBytes["com.coolapk.market".length()]).isEqualTo((byte) 0);
++  }
++
++  @Test
++  public void encodeRequest_rejectsOddGenerationAndOversizedField() {
++    assertThrows(
++        IOException.class,
++        () ->
++            r0dump_FilePreparationBridge.encodeRequest(
++                10198, 2468, "com.coolapk.market", "com.coolapk.market", "run", 3L));
++    assertThrows(
++        IOException.class,
++        () ->
++            r0dump_FilePreparationBridge.encodeRequest(
++                10198, 2468, "a".repeat(96), "process", "run", 4L));
++  }
++}
+-- 
+2.43.0
+

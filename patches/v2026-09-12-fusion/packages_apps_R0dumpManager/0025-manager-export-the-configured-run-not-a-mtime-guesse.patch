@@ -1,0 +1,163 @@
+From eb049632c525269192abb1d0114c25f540ca2d15 Mon Sep 17 00:00:00 2001
+From: Ivory <contact@ivory.cafe>
+Date: Thu, 10 Sep 2026 23:07:31 +0800
+Subject: [PATCH 25/32] manager: export the configured run, not a mtime-guessed
+ latest
+
+---
+ helper/r0dump_export_core.cpp | 111 +++++++++++++++++++++++++---------
+ 1 file changed, 81 insertions(+), 30 deletions(-)
+
+diff --git a/helper/r0dump_export_core.cpp b/helper/r0dump_export_core.cpp
+index 8a305e7..0611440 100644
+--- a/helper/r0dump_export_core.cpp
++++ b/helper/r0dump_export_core.cpp
+@@ -5,6 +5,9 @@
+ #include <fcntl.h>
+ #include <openssl/sha.h>
+ #include <sys/stat.h>
++#if defined(__ANDROID__)
++#include <sys/system_properties.h>
++#endif
+ #include <unistd.h>
+ #include <ziparchive/zip_archive.h>
+ #include <ziparchive/zip_writer.h>
+@@ -1307,6 +1310,46 @@ ProcessSummary RepairProcess(const fs::path &process, const fs::path &output) {
+   return summary;
+ }
+ 
++// Count captured artifacts across the run's process-* directories and report the
++// newest artifact mtime. Shared by the configured-run and latest-run selectors.
++bool ScanRunArtifacts(const fs::path &run_path, uint32_t *artifact_count,
++                      fs::file_time_type *newest) {
++  std::error_code error;
++  uint32_t count = 0u;
++  fs::file_time_type latest = fs::file_time_type::min();
++  for (const fs::directory_entry &process :
++       fs::directory_iterator(run_path, error)) {
++    if (error || !process.is_directory(error) || process.is_symlink(error) ||
++        process.path().filename().string().rfind("process-", 0u) != 0u ||
++        !fs::is_regular_file(process.path() / "session.json", error)) {
++      error.clear();
++      continue;
++    }
++    const fs::path artifacts = process.path() / "artifacts";
++    if (!fs::is_directory(artifacts, error)) {
++      error.clear();
++      continue;
++    }
++    for (const fs::directory_entry &artifact :
++         fs::directory_iterator(artifacts, error)) {
++      if (error || !artifact.is_regular_file(error) ||
++          artifact.is_symlink(error)) {
++        error.clear();
++        continue;
++      }
++      ++count;
++      const fs::file_time_type modified = artifact.last_write_time(error);
++      if (!error && modified > latest) {
++        latest = modified;
++      }
++      error.clear();
++    }
++  }
++  *artifact_count = count;
++  *newest = latest;
++  return count != 0u;
++}
++
+ std::optional<RunCandidate> FindLatestRun(const fs::path &runs) {
+   std::error_code error;
+   if (!fs::is_directory(runs, error)) {
+@@ -1321,35 +1364,7 @@ std::optional<RunCandidate> FindLatestRun(const fs::path &runs) {
+     }
+     uint32_t artifact_count = 0u;
+     fs::file_time_type newest = fs::file_time_type::min();
+-    for (const fs::directory_entry &process :
+-         fs::directory_iterator(run.path(), error)) {
+-      if (error || !process.is_directory(error) || process.is_symlink(error) ||
+-          process.path().filename().string().rfind("process-", 0u) != 0u ||
+-          !fs::is_regular_file(process.path() / "session.json", error)) {
+-        error.clear();
+-        continue;
+-      }
+-      const fs::path artifacts = process.path() / "artifacts";
+-      if (!fs::is_directory(artifacts, error)) {
+-        error.clear();
+-        continue;
+-      }
+-      for (const fs::directory_entry &artifact :
+-           fs::directory_iterator(artifacts, error)) {
+-        if (error || !artifact.is_regular_file(error) ||
+-            artifact.is_symlink(error)) {
+-          error.clear();
+-          continue;
+-        }
+-        ++artifact_count;
+-        const fs::file_time_type modified = artifact.last_write_time(error);
+-        if (!error && modified > newest) {
+-          newest = modified;
+-        }
+-        error.clear();
+-      }
+-    }
+-    if (artifact_count == 0u) {
++    if (!ScanRunArtifacts(run.path(), &artifact_count, &newest)) {
+       continue;
+     }
+     RunCandidate candidate{run.path(), run.path().filename().string(), newest,
+@@ -1363,6 +1378,39 @@ std::optional<RunCandidate> FindLatestRun(const fs::path &runs) {
+   return selected;
+ }
+ 
++// Prefer the run the Manager most recently configured
++// (persist.sys.r0dump.fusion.run_id) so export targets the capture the operator
++// just made, rather than guessing by artifact mtime -- which is unreliable across
++// sessions and a skewed device clock, and in practice selected a stale earlier run.
++// Returns nullopt (falling back to FindLatestRun) when the property is unset or its
++// run directory holds no artifacts.
++std::optional<RunCandidate> FindConfiguredRun(const fs::path &runs) {
++#if defined(__ANDROID__)
++  char value[PROP_VALUE_MAX] = {};
++  if (__system_property_get("persist.sys.r0dump.fusion.run_id", value) <= 0) {
++    return std::nullopt;
++  }
++  const std::string run_id(value);
++  if (run_id.empty() || !IsValidRunId(run_id)) {
++    return std::nullopt;
++  }
++  std::error_code error;
++  const fs::path run_path = runs / run_id;
++  if (!fs::is_directory(run_path, error) || fs::is_symlink(run_path, error)) {
++    return std::nullopt;
++  }
++  uint32_t artifact_count = 0u;
++  fs::file_time_type newest = fs::file_time_type::min();
++  if (!ScanRunArtifacts(run_path, &artifact_count, &newest)) {
++    return std::nullopt;
++  }
++  return RunCandidate{run_path, run_id, newest, artifact_count};
++#else
++  (void)runs;
++  return std::nullopt;
++#endif
++}
++
+ bool CopyTree(const fs::path &source, const fs::path &destination,
+               std::string *detail) {
+   std::error_code error;
+@@ -1611,7 +1659,10 @@ Status ExportLatest(const fs::path &storage_root,
+   const fs::path runs = storage_root / "Android" / "data" /
+                         std::string(package_name) / "files" / "r0dump-fusion" /
+                         "runs";
+-  const auto candidate = FindLatestRun(runs);
++  auto candidate = FindConfiguredRun(runs);
++  if (!candidate.has_value()) {
++    candidate = FindLatestRun(runs);
++  }
+   if (!candidate.has_value()) {
+     summary->detail = "no_run_with_artifacts";
+     return Status::kNoRuns;
+-- 
+2.43.0
+

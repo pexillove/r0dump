@@ -1,0 +1,544 @@
+From 41ae9ea6822a095d1f9bba6d528b0228a06d2d6f Mon Sep 17 00:00:00 2001
+From: Ivory <contact@ivory.cafe>
+Date: Mon, 31 Aug 2026 12:27:23 +0800
+Subject: [PATCH 03/21] Publish capture artifacts through a verified shared
+ directory
+
+Consume the prepared directory capability, reopen O_PATH as the same verified inode for directory fsync, and atomically publish setgid-inherited 0660 files without recreating trusted subdirectories.
+
+Constraint: Canonical files must be immediately writable by ext_data_rw while remaining non-world-accessible
+Rejected: Fsync directly on O_PATH | the kernel returns EBADF after rename and falsely degrades the run
+Confidence: high
+Scope-risk: moderate
+Directive: Verify owner, group, mode, device, and inode before retaining any prepared directory FD
+Tested: r0dump_FileTest 25/25; art_runtime_tests and com.android.art builds; Coolapk produced 11 artifacts and 50 records without run_degraded
+Not-tested: no full platform build was required
+Change-Id: Ia5703a2d1d92222b9322ee85e9945812cbce2bd7
+---
+ .../native/dalvik_system_r0dump_Runtime.cc    |  17 ++-
+ runtime/r0dump/r0dump_config.cc               |   7 +-
+ runtime/r0dump/r0dump_config.h                |   1 +
+ runtime/r0dump/r0dump_file.cc                 | 121 +++++++++++++++---
+ runtime/r0dump/r0dump_file.h                  |   5 +
+ runtime/r0dump/r0dump_file_test.cc            | 121 ++++++++++++++----
+ 6 files changed, 232 insertions(+), 40 deletions(-)
+
+diff --git a/runtime/native/dalvik_system_r0dump_Runtime.cc b/runtime/native/dalvik_system_r0dump_Runtime.cc
+index f22d3a1..ee7a11d 100644
+--- a/runtime/native/dalvik_system_r0dump_Runtime.cc
++++ b/runtime/native/dalvik_system_r0dump_Runtime.cc
+@@ -16,6 +16,7 @@
+ 
+ #include "dalvik_system_r0dump_Runtime.h"
+ 
++#include <fcntl.h>
+ #include <unistd.h>
+ 
+ #include <algorithm>
+@@ -46,6 +47,7 @@
+ #include "nativehelper/scoped_utf_chars.h"
+ #include "r0dump/r0dump_capture.h"
+ #include "r0dump/r0dump_config.h"
++#include "r0dump/r0dump_file.h"
+ #include "r0dump/r0dump_force_invoke.h"
+ #include "r0dump/r0dump_log.h"
+ #include "runtime.h"
+@@ -181,6 +183,7 @@ static jboolean r0dump_Runtime_r0dump_configureNative(JNIEnv* env,
+                                                       jstring java_target_process,
+                                                       jstring java_process_name,
+                                                       jstring java_output_parent,
++                                                      jint prepared_directory_fd,
+                                                       jlong capture_point_mask,
+                                                       jlong max_records,
+                                                       jlong max_artifacts,
+@@ -280,8 +283,20 @@ static jboolean r0dump_Runtime_r0dump_configureNative(JNIEnv* env,
+     return JNI_FALSE;
+   }
+ 
++  if (!r0dump_IsPreparedRunDirectory(prepared_directory_fd)) {
++    r0dump_LogRejected("prepared_directory_fd");
++    return JNI_FALSE;
++  }
++  const int owned_directory_fd = fcntl(prepared_directory_fd, F_DUPFD_CLOEXEC, 0);
++  if (owned_directory_fd < 0) {
++    r0dump_LogRejected("prepared_directory_fd");
++    return JNI_FALSE;
++  }
++  config.prepared_run_fd = owned_directory_fd;
++
+   r0dump_ConfigError error;
+   if (!r0dump_ConfigureCaptureProcessOnce(std::move(config), &error)) {
++    close(owned_directory_fd);
+     r0dump_LogRejected(error.field == nullptr ? "config" : error.field);
+     return JNI_FALSE;
+   }
+@@ -737,7 +752,7 @@ static JNINativeMethod gMethods[] = {
+     NATIVE_METHOD(r0dump_Runtime,
+                   r0dump_configureNative,
+                   "(IZLjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;"
+-                  "Ljava/lang/String;JJJJJJJJJZZJJJJJJZIIJJJZLjava/lang/String;Ljava/lang/String;"
++                  "Ljava/lang/String;IJJJJJJJJJZZJJJJJJZIIJJJZLjava/lang/String;Ljava/lang/String;"
+                   "Ljava/lang/String;J)Z"),
+     NATIVE_METHOD(r0dump_Runtime, r0dump_GetRegisteredClassLoaders, "()[Ljava/lang/ClassLoader;"),
+     NATIVE_METHOD(
+diff --git a/runtime/r0dump/r0dump_config.cc b/runtime/r0dump/r0dump_config.cc
+index 8bb0de7..9f48e22 100644
+--- a/runtime/r0dump/r0dump_config.cc
++++ b/runtime/r0dump/r0dump_config.cc
+@@ -314,7 +314,12 @@ bool r0dump_ValidateConfig(const r0dump_ProcessConfig& config, r0dump_ConfigErro
+   return true;
+ }
+ 
+-r0dump_ConfigStore::~r0dump_ConfigStore() { published_.store(nullptr, std::memory_order_release); }
++r0dump_ConfigStore::~r0dump_ConfigStore() {
++  published_.store(nullptr, std::memory_order_release);
++  if (owned_ != nullptr && owned_->prepared_run_fd >= 0) {
++    close(owned_->prepared_run_fd);
++  }
++}
+ 
+ bool r0dump_ConfigStore::r0dump_ConfigureOnce(r0dump_ProcessConfig config,
+                                               r0dump_ConfigError* error) {
+diff --git a/runtime/r0dump/r0dump_config.h b/runtime/r0dump/r0dump_config.h
+index a35602e..be0cd52 100644
+--- a/runtime/r0dump/r0dump_config.h
++++ b/runtime/r0dump/r0dump_config.h
+@@ -93,6 +93,7 @@ struct r0dump_ProcessConfig {
+   std::string target_process;
+   std::string process_name;
+   std::string output_parent;
++  int prepared_run_fd = -1;
+   uint64_t capture_point_mask = 0u;
+ 
+   uint32_t max_records = 512u;
+diff --git a/runtime/r0dump/r0dump_file.cc b/runtime/r0dump/r0dump_file.cc
+index 33bc31c..2b5c4ce 100644
+--- a/runtime/r0dump/r0dump_file.cc
++++ b/runtime/r0dump/r0dump_file.cc
+@@ -46,6 +46,9 @@ namespace {
+ 
+ using android::base::unique_fd;
+ 
++constexpr mode_t kR0dumpDirectoryMode = 02770;
++constexpr mode_t kR0dumpFileMode = 0660;
++
+ ssize_t r0dump_Write(int fd, const void* data, size_t size) { return write(fd, data, size); }
+ 
+ int r0dump_Fsync(int fd) { return fsync(fd); }
+@@ -82,6 +85,20 @@ bool r0dump_IsDirectory(int fd) {
+   return fstat(fd, &status) == 0 && S_ISDIR(status.st_mode);
+ }
+ 
++gid_t r0dump_ExpectedSharedGid() {
++#if defined(__ANDROID__)
++  return 1078;  // AID_EXT_DATA_RW
++#else
++  return getegid();
++#endif
++}
++
++bool r0dump_IsPreparedDirectory(int fd, uid_t expected_uid, gid_t expected_gid) {
++  struct stat status = {};
++  return fstat(fd, &status) == 0 && S_ISDIR(status.st_mode) && status.st_uid == expected_uid &&
++         status.st_gid == expected_gid && (status.st_mode & 02777) == kR0dumpDirectoryMode;
++}
++
+ bool r0dump_SetSharedStorageMode(int fd, mode_t mode) {
+   if (fchmod(fd, mode) == 0) {
+     return true;
+@@ -91,7 +108,7 @@ bool r0dump_SetSharedStorageMode(int fd, mode_t mode) {
+ 
+ unique_fd r0dump_OpenPrivateDirectory(int parent_fd, std::string_view name) {
+   const std::string component(name);
+-  if (mkdirat(parent_fd, component.c_str(), 0700) != 0 && errno != EEXIST) {
++  if (mkdirat(parent_fd, component.c_str(), kR0dumpDirectoryMode) != 0 && errno != EEXIST) {
+     return {};
+   }
+ 
+@@ -100,7 +117,27 @@ unique_fd r0dump_OpenPrivateDirectory(int parent_fd, std::string_view name) {
+   if (directory.get() < 0) {
+     return {};
+   }
+-  if (!r0dump_SetSharedStorageMode(directory.get(), 0700) || !r0dump_IsDirectory(directory.get())) {
++  if (!r0dump_SetSharedStorageMode(directory.get(), kR0dumpDirectoryMode) ||
++      !r0dump_IsDirectory(directory.get())) {
++    errno = EACCES;
++    return {};
++  }
++  return directory;
++}
++
++unique_fd r0dump_OpenPreparedDirectory(int parent_fd, std::string_view name) {
++  struct stat parent_status = {};
++  if (fstat(parent_fd, &parent_status) != 0 || !S_ISDIR(parent_status.st_mode)) {
++    errno = EINVAL;
++    return {};
++  }
++  const std::string component(name);
++  unique_fd directory(
++      openat(parent_fd, component.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
++  if (directory.get() < 0) {
++    return {};
++  }
++  if (!r0dump_IsPreparedDirectory(directory.get(), parent_status.st_uid, parent_status.st_gid)) {
+     errno = EACCES;
+     return {};
+   }
+@@ -117,16 +154,27 @@ unique_fd r0dump_OpenUniqueTemporary(int run_fd, std::string* temporary_name) {
+       errno = EOVERFLOW;
+       return {};
+     }
+-    unique_fd temporary(
+-        openat(run_fd, name, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600));
++    unique_fd temporary(openat(
++        run_fd, name, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, kR0dumpFileMode));
+     if (temporary.get() >= 0) {
+-      if (!r0dump_SetSharedStorageMode(temporary.get(), 0600)) {
++      if (!r0dump_SetSharedStorageMode(temporary.get(), kR0dumpFileMode)) {
+         const int error = errno;
+         temporary.reset();
+         unlinkat(run_fd, name, 0);
+         errno = error;
+         return {};
+       }
++      struct stat parent_status = {};
++      struct stat file_status = {};
++      if (fstat(run_fd, &parent_status) != 0 || fstat(temporary.get(), &file_status) != 0 ||
++          !S_ISREG(file_status.st_mode) || file_status.st_gid != parent_status.st_gid ||
++          (file_status.st_mode & 0777) != kR0dumpFileMode) {
++        const int error = errno == 0 ? EACCES : errno;
++        temporary.reset();
++        unlinkat(run_fd, name, 0);
++        errno = error;
++        return {};
++      }
+       *temporary_name = name;
+       return temporary;
+     }
+@@ -718,12 +766,14 @@ bool r0dump_EnsureRunOpenLocked(const r0dump_ProcessConfig& config) {
+   if (g_r0dump_manifest_status.empty()) {
+     g_r0dump_manifest_status = config.manifest_enabled ? "pending" : "disabled";
+   }
+-  const std::string process_pid = config.process_name + "-" + std::to_string(getpid());
+-  const r0dump_FileResult opened =
+-      r0dump_OpenRunDirectory(config.output_parent, config.run_id, process_pid, &g_r0dump_run_fd);
+-  if (!opened.ok) {
++  if (config.prepared_run_fd < 0) {
++    return false;
++  }
++  int run_fd = -1;
++  if (!r0dump_OpenPreparedRunDirectory(config.prepared_run_fd, &run_fd).ok) {
+     return false;
+   }
++  g_r0dump_run_fd = run_fd;
+   if (g_r0dump_writer_state == nullptr) {
+     g_r0dump_writer_state = std::make_unique<r0dump_WriterState>();
+   }
+@@ -737,6 +787,39 @@ bool r0dump_EnsureRunOpenLocked(const r0dump_ProcessConfig& config) {
+ 
+ }  // namespace
+ 
++bool r0dump_IsPreparedRunDirectory(int fd) {
++  return fd >= 0 && r0dump_IsPreparedDirectory(fd, geteuid(), r0dump_ExpectedSharedGid());
++}
++
++r0dump_FileResult r0dump_OpenPreparedRunDirectory(int prepared_fd, int* out_run_fd) {
++  if (prepared_fd < 0 || out_run_fd == nullptr) {
++    return r0dump_Failure("validate_prepared_run", EINVAL);
++  }
++  *out_run_fd = -1;
++
++  struct stat prepared_status = {};
++  if (fstat(prepared_fd, &prepared_status) != 0 || !r0dump_IsPreparedRunDirectory(prepared_fd)) {
++    return r0dump_Failure("validate_prepared_run", errno == 0 ? EACCES : errno);
++  }
++
++  unique_fd directory(
++      openat(prepared_fd, ".", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
++  if (directory.get() < 0) {
++    return r0dump_Failure("open_prepared_run", errno);
++  }
++
++  struct stat directory_status = {};
++  if (fstat(directory.get(), &directory_status) != 0 ||
++      directory_status.st_dev != prepared_status.st_dev ||
++      directory_status.st_ino != prepared_status.st_ino ||
++      !r0dump_IsPreparedRunDirectory(directory.get())) {
++    return r0dump_Failure("validate_reopened_run", errno == 0 ? EACCES : errno);
++  }
++
++  *out_run_fd = directory.release();
++  return r0dump_Success();
++}
++
+ bool r0dump_IsSafeFileComponent(std::string_view component) {
+   if (component.empty() || component.size() > NAME_MAX || component == "." || component == "..") {
+     return false;
+@@ -771,7 +854,7 @@ r0dump_FileResult r0dump_OpenRunDirectoryAt(int output_parent_fd,
+     return r0dump_Failure("open_run", errno);
+   }
+   const std::string process_component(process_pid);
+-  if (mkdirat(run_directory.get(), process_component.c_str(), 0700) != 0) {
++  if (mkdirat(run_directory.get(), process_component.c_str(), kR0dumpDirectoryMode) != 0) {
+     return r0dump_Failure("create_process", errno);
+   }
+   unique_fd process_directory(openat(run_directory.get(),
+@@ -783,10 +866,16 @@ r0dump_FileResult r0dump_OpenRunDirectoryAt(int output_parent_fd,
+     errno = error;
+     return r0dump_Failure("open_process", errno);
+   }
+-  if (!r0dump_SetSharedStorageMode(process_directory.get(), 0700) ||
++  if (!r0dump_SetSharedStorageMode(process_directory.get(), kR0dumpDirectoryMode) ||
+       !r0dump_IsDirectory(process_directory.get())) {
+     return r0dump_Failure("validate_process", EACCES);
+   }
++  for (std::string_view directory_name : {"metadata", "artifacts", "records", "methods"}) {
++    unique_fd directory = r0dump_OpenPrivateDirectory(process_directory.get(), directory_name);
++    if (directory.get() < 0) {
++      return r0dump_Failure("prepare_fixed_directory", errno);
++    }
++  }
+   *out_run_fd = process_directory.release();
+   return r0dump_Success();
+ }
+@@ -917,7 +1006,7 @@ r0dump_FileResult r0dump_WriteManifestFile(int run_fd, const r0dump_ManifestSnap
+       return r0dump_Failure("validate_manifest_source", EINVAL);
+     }
+   }
+-  unique_fd metadata_directory = r0dump_OpenPrivateDirectory(run_fd, "metadata");
++  unique_fd metadata_directory = r0dump_OpenPreparedDirectory(run_fd, "metadata");
+   if (metadata_directory.get() < 0) {
+     return r0dump_Failure("open_metadata", errno);
+   }
+@@ -1014,15 +1103,15 @@ r0dump_GenerationWriteResult r0dump_WriteFrozenGeneration(int run_fd,
+     previous_sequence = record->sequence;
+   }
+ 
+-  unique_fd artifacts_directory = r0dump_OpenPrivateDirectory(run_fd, "artifacts");
++  unique_fd artifacts_directory = r0dump_OpenPreparedDirectory(run_fd, "artifacts");
+   if (artifacts_directory.get() < 0) {
+     return r0dump_degrade("open_artifacts", errno);
+   }
+-  unique_fd records_directory = r0dump_OpenPrivateDirectory(run_fd, "records");
++  unique_fd records_directory = r0dump_OpenPreparedDirectory(run_fd, "records");
+   if (records_directory.get() < 0) {
+     return r0dump_degrade("open_records", errno);
+   }
+-  unique_fd methods_directory = r0dump_OpenPrivateDirectory(run_fd, "methods");
++  unique_fd methods_directory = r0dump_OpenPreparedDirectory(run_fd, "methods");
+   if (methods_directory.get() < 0) {
+     return r0dump_degrade("open_methods", errno);
+   }
+@@ -1319,7 +1408,7 @@ void r0dump_FinalizeFlushRun(const r0dump_ProcessConfig& config,
+   if (!incomplete && !summary_available) {
+     r0dump_MarkFlushDegradedLocked();
+   } else if (summary_available && r0dump_EnsureRunOpenLocked(config)) {
+-    unique_fd methods_directory = r0dump_OpenPrivateDirectory(g_r0dump_run_fd, "methods");
++    unique_fd methods_directory = r0dump_OpenPreparedDirectory(g_r0dump_run_fd, "methods");
+     const r0dump_FileResult methods_written =
+         methods_directory.get() < 0
+             ? r0dump_Failure("open_methods", errno)
+diff --git a/runtime/r0dump/r0dump_file.h b/runtime/r0dump/r0dump_file.h
+index 1773e40..97f78e7 100644
+--- a/runtime/r0dump/r0dump_file.h
++++ b/runtime/r0dump/r0dump_file.h
+@@ -205,6 +205,11 @@ void r0dump_FinalizeFlushRun(const r0dump_ProcessConfig& config,
+                              bool try_lock);
+ 
+ bool r0dump_IsSafeFileComponent(std::string_view component);
++bool r0dump_IsPreparedRunDirectory(int fd);
++
++// Reopens the verified framework-delivered O_PATH descriptor as the same ordinary directory.
++// The returned descriptor supports directory fsync; the caller owns it.
++r0dump_FileResult r0dump_OpenPreparedRunDirectory(int prepared_fd, int* out_run_fd);
+ 
+ // Test-only syscall seam. The supplied table must remain alive until reset, and callers must only
+ // change it while no production write is active.
+diff --git a/runtime/r0dump/r0dump_file_test.cc b/runtime/r0dump/r0dump_file_test.cc
+index d4290cd..a9b1e9b 100644
+--- a/runtime/r0dump/r0dump_file_test.cc
++++ b/runtime/r0dump/r0dump_file_test.cc
+@@ -220,7 +220,7 @@ TEST_F(r0dump_FileTest, RejectsUnsafeAndOversizedComponents) {
+   EXPECT_FALSE(r0dump_WriteAtomicFile(-1, "../record", "x", 1u).ok);
+ }
+ 
+-TEST_F(r0dump_FileTest, CreatesPrivateTreeAndWritesSegmentsAtomically) {
++TEST_F(r0dump_FileTest, CreatesGroupAccessibleTreeAndWritesSegmentsAtomically) {
+   ASSERT_EQ(mkdir((output_parent_ + "/r0dump-fusion").c_str(), 0777), 0);
+   ASSERT_EQ(chmod((output_parent_ + "/r0dump-fusion").c_str(), 0777), 0);
+ 
+@@ -236,12 +236,15 @@ TEST_F(r0dump_FileTest, CreatesPrivateTreeAndWritesSegmentsAtomically) {
+   EXPECT_EQ(r0dump_ReadFileAt(run_fd, "session.json"), "replacement");
+   EXPECT_EQ(r0dump_CountTemporaryFiles(run_fd), 0u);
+   struct stat file_status = {};
++  struct stat run_status = {};
++  ASSERT_EQ(fstat(run_fd, &run_status), 0);
+   ASSERT_EQ(fstatat(run_fd, "session.json", &file_status, AT_SYMLINK_NOFOLLOW), 0);
+-  EXPECT_EQ(file_status.st_mode & 0777, 0600);
+-  EXPECT_EQ(r0dump_Mode(output_parent_ + "/r0dump-fusion"), 0700);
+-  EXPECT_EQ(r0dump_Mode(output_parent_ + "/r0dump-fusion/runs"), 0700);
+-  EXPECT_EQ(r0dump_Mode(output_parent_ + "/r0dump-fusion/runs/run"), 0700);
+-  EXPECT_EQ(r0dump_Mode(output_parent_ + "/r0dump-fusion/runs/run/process-123"), 0700);
++  EXPECT_EQ(file_status.st_mode & 0777, 0660);
++  EXPECT_EQ(file_status.st_gid, run_status.st_gid);
++  EXPECT_EQ(r0dump_Mode(output_parent_ + "/r0dump-fusion"), 0770);
++  EXPECT_EQ(r0dump_Mode(output_parent_ + "/r0dump-fusion/runs"), 0770);
++  EXPECT_EQ(r0dump_Mode(output_parent_ + "/r0dump-fusion/runs/run"), 0770);
++  EXPECT_EQ(r0dump_Mode(output_parent_ + "/r0dump-fusion/runs/run/process-123"), 0770);
+   close(run_fd);
+ }
+ 
+@@ -264,24 +267,32 @@ TEST_F(r0dump_FileTest, SharedOutputParentDoesNotNeedProcessOwnership) {
+   close(output_parent_fd);
+ 
+   const std::string run_path = "/tmp/r0dump-fusion/runs/" + run_id;
+-  ASSERT_EQ(rmdir((run_path + "/" + std::string(kProcess)).c_str()), 0);
++  const std::string process_path = run_path + "/" + std::string(kProcess);
++  for (std::string_view directory_name : {"metadata", "artifacts", "records", "methods"}) {
++    ASSERT_EQ(rmdir((process_path + "/" + std::string(directory_name)).c_str()), 0);
++  }
++  ASSERT_EQ(rmdir(process_path.c_str()), 0);
+   ASSERT_EQ(rmdir(run_path.c_str()), 0);
+   rmdir("/tmp/r0dump-fusion/runs");
+   rmdir("/tmp/r0dump-fusion");
+ }
+ 
+-TEST_F(r0dump_FileTest, SharedDirectoryDescriptorDoesNotNeedProcessOwnership) {
+-  const int shared_fd = open("/tmp", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+-  ASSERT_GE(shared_fd, 0);
+-  struct stat parent_status = {};
+-  ASSERT_EQ(fstat(shared_fd, &parent_status), 0);
+-  ASSERT_NE(parent_status.st_uid, geteuid());
++TEST_F(r0dump_FileTest, PreparedDirectoryDescriptorPreservesGroupContract) {
++  const int run_fd = r0dump_OpenRun();
++  ASSERT_GE(run_fd, 0);
++  const int artifacts_fd = r0dump_OpenDirectoryAt(run_fd, "artifacts");
++  ASSERT_GE(artifacts_fd, 0);
+ 
+-  const std::string file_name = "r0dump-shared-directory-" + std::to_string(getpid()) + ".json";
+-  ASSERT_TRUE(r0dump_WriteAtomicFile(shared_fd, file_name, "x", 1u).ok);
+-  EXPECT_EQ(r0dump_ReadFileAt(shared_fd, file_name), "x");
+-  EXPECT_EQ(unlinkat(shared_fd, file_name.c_str(), 0), 0);
+-  close(shared_fd);
++  ASSERT_TRUE(r0dump_WriteAtomicFile(artifacts_fd, "artifact.json", "x", 1u).ok);
++  EXPECT_EQ(r0dump_ReadFileAt(artifacts_fd, "artifact.json"), "x");
++  struct stat directory_status = {};
++  struct stat file_status = {};
++  ASSERT_EQ(fstat(artifacts_fd, &directory_status), 0);
++  ASSERT_EQ(fstatat(artifacts_fd, "artifact.json", &file_status, AT_SYMLINK_NOFOLLOW), 0);
++  EXPECT_EQ(file_status.st_gid, directory_status.st_gid);
++  EXPECT_EQ(file_status.st_mode & 0777, 0660);
++  close(artifacts_fd);
++  close(run_fd);
+ }
+ 
+ TEST_F(r0dump_FileTest, WritesTruthfulSessionSnapshot) {
+@@ -342,10 +353,64 @@ TEST_F(r0dump_FileTest, WritesBoundedManifestSnapshotWithoutRawSources) {
+   EXPECT_NE(manifest.find("\"class_name\":\"bin.mt.plus.SplitService\""), std::string::npos);
+   EXPECT_EQ(manifest.find("/data/app"), std::string::npos);
+   EXPECT_EQ(manifest.find("intent-filter"), std::string::npos);
++  EXPECT_EQ(r0dump_Mode(output_parent_ + "/r0dump-fusion/runs/run/process-123/metadata"), 0770);
++  EXPECT_EQ(
++      r0dump_Mode(output_parent_ + "/r0dump-fusion/runs/run/process-123/metadata/manifest.json"),
++      0660);
+   close(metadata_fd);
+   close(run_fd);
+ }
+ 
++TEST_F(r0dump_FileTest, DoesNotRecreateMissingPreparedDirectory) {
++  const int run_fd = r0dump_OpenRun();
++  ASSERT_GE(run_fd, 0);
++  ASSERT_EQ(unlinkat(run_fd, "metadata", AT_REMOVEDIR), 0);
++  r0dump_ManifestSnapshot snapshot = {
++      .status = "OK",
++      .package_name = "bin.mt.plus",
++  };
++
++  const r0dump_FileResult result = r0dump_WriteManifestFile(run_fd, snapshot);
++  EXPECT_FALSE(result.ok);
++  EXPECT_EQ(faccessat(run_fd, "metadata", F_OK, AT_SYMLINK_NOFOLLOW), -1);
++  close(run_fd);
++}
++
++TEST_F(r0dump_FileTest, PreparedRunDirectoryRequiresSetgidOwnershipContract) {
++  const int run_fd = r0dump_OpenRun();
++  ASSERT_GE(run_fd, 0);
++  EXPECT_TRUE(r0dump_IsPreparedRunDirectory(run_fd));
++  ASSERT_EQ(fchmod(run_fd, 0770), 0);
++  EXPECT_FALSE(r0dump_IsPreparedRunDirectory(run_fd));
++  close(run_fd);
++}
++
++TEST_F(r0dump_FileTest, ReopensPreparedOPathDescriptorForDirectoryFsync) {
++  const int run_fd = r0dump_OpenRun();
++  ASSERT_GE(run_fd, 0);
++  const int path_fd = openat(run_fd, ".", O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
++  ASSERT_GE(path_fd, 0);
++  ASSERT_NE(fcntl(path_fd, F_GETFL) & O_PATH, 0);
++
++  int reopened_fd = -1;
++  const r0dump_FileResult reopened = r0dump_OpenPreparedRunDirectory(path_fd, &reopened_fd);
++  ASSERT_TRUE(reopened.ok) << reopened.operation << ": " << reopened.error;
++  ASSERT_GE(reopened_fd, 0);
++  EXPECT_EQ(fcntl(reopened_fd, F_GETFL) & O_PATH, 0);
++  EXPECT_EQ(fsync(reopened_fd), 0);
++
++  struct stat path_status = {};
++  struct stat reopened_status = {};
++  ASSERT_EQ(fstat(path_fd, &path_status), 0);
++  ASSERT_EQ(fstat(reopened_fd, &reopened_status), 0);
++  EXPECT_EQ(reopened_status.st_dev, path_status.st_dev);
++  EXPECT_EQ(reopened_status.st_ino, path_status.st_ino);
++
++  close(reopened_fd);
++  close(path_fd);
++  close(run_fd);
++}
++
+ TEST_F(r0dump_FileTest, RejectsSymlinkedIntermediateDirectory) {
+   ASSERT_EQ(symlink(output_parent_.c_str(), (output_parent_ + "/r0dump-fusion").c_str()), 0);
+   int run_fd = -1;
+@@ -496,8 +561,13 @@ TEST_F(r0dump_FileTest, WritesArtifactBeforeIndependentRecords) {
+   EXPECT_NE(duplicate.find("\"status\":\"duplicate\""), std::string::npos);
+   EXPECT_NE(duplicate.find("\"duplicate_of\":1"), std::string::npos);
+   EXPECT_NE(duplicate.find("\"site\":\"duplicate\""), std::string::npos);
+-  EXPECT_EQ(r0dump_Mode(output_parent_ + "/r0dump-fusion/runs/run/process-123/artifacts"), 0700);
+-  EXPECT_EQ(r0dump_Mode(output_parent_ + "/r0dump-fusion/runs/run/process-123/records"), 0700);
++  EXPECT_EQ(r0dump_Mode(output_parent_ + "/r0dump-fusion/runs/run/process-123/artifacts"), 0770);
++  EXPECT_EQ(r0dump_Mode(output_parent_ + "/r0dump-fusion/runs/run/process-123/records"), 0770);
++  EXPECT_EQ(
++      r0dump_Mode(output_parent_ + "/r0dump-fusion/runs/run/process-123/artifacts/000001.dex.raw"),
++      0660);
++  EXPECT_EQ(r0dump_Mode(output_parent_ + "/r0dump-fusion/runs/run/process-123/records/000001.json"),
++            0660);
+   EXPECT_TRUE(staging.r0dump_ReleaseFrozen(frozen.generation->generation_id));
+   close(records_fd);
+   close(artifacts_fd);
+@@ -604,6 +674,10 @@ TEST_F(r0dump_FileTest, UsesDocumentedArtifactExtensions) {
+   EXPECT_NE(methods.find("\"capture_kind\":\"codeitem\""), std::string::npos);
+   EXPECT_NE(methods.find("\"artifact_relative_path\":\"artifacts/000004.codeitem.raw\""),
+             std::string::npos);
++  EXPECT_EQ(r0dump_Mode(output_parent_ + "/r0dump-fusion/runs/run/process-123/methods"), 0770);
++  EXPECT_EQ(
++      r0dump_Mode(output_parent_ + "/r0dump-fusion/runs/run/process-123/methods/methods.jsonl"),
++      0660);
+   close(methods_fd);
+   close(records_fd);
+   close(artifacts_fd);
+@@ -689,8 +763,11 @@ TEST_F(r0dump_FileTest, RejectsDuplicateRecordSequenceBeforeWritingArtifact) {
+   EXPECT_FALSE(result.ok);
+   EXPECT_EQ(result.operation, "validate_record");
+   EXPECT_TRUE(writer.r0dump_IsDegraded());
+-  EXPECT_EQ(
+-      access((output_parent_ + "/r0dump-fusion/runs/run/process-123/artifacts").c_str(), F_OK), -1);
++  EXPECT_EQ(access((output_parent_ +
++                    "/r0dump-fusion/runs/run/process-123/artifacts/000001.dex.raw")
++                       .c_str(),
++                   F_OK),
++            -1);
+   close(run_fd);
+ }
+ 
+-- 
+2.43.0
+

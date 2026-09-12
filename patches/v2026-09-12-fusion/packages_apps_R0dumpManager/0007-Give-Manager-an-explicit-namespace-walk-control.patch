@@ -1,0 +1,301 @@
+From d27758f82110cedd0e0b82db892e35d090383439 Mon Sep 17 00:00:00 2001
+From: Ivory <contact@ivory.cafe>
+Date: Tue, 1 Sep 2026 19:27:49 +0800
+Subject: [PATCH 07/32] Give Manager an explicit namespace walk control
+
+Persist and validate the namespace prefix used to target DexCache-backed class discovery, expose it in Advanced settings, and keep the schema and tests aligned with Framework and ART.
+
+Constraint: Preserve exhaustive configuration serialization and fail-closed validation.
+Rejected: Reusing force_class as an implicit namespace selector | It conflates exact method selection with discovery scope.
+Confidence: high
+Scope-risk: moderate
+Directive: Keep namespace prefixes segment-bounded and retain the trailing dot invariant.
+Tested: r0dump_f7_class_loader_walk_source_test.py; r0dump_config_boundary_source_test.py; git diff --check.
+Not-tested: Full Manager/AOSP build; lunch release configuration is unavailable in this checkout.
+---
+ IMPLEMENTATION.md                                  | 12 +++++++-----
+ res/values-zh-rCN/strings.xml                      |  2 ++
+ res/values/strings.xml                             |  2 ++
+ .../data/property/FusionPropertyRepository.kt      |  2 +-
+ .../r0dumpmanager/domain/FusionConfigDraft.kt      |  1 +
+ .../r0dumpmanager/domain/FusionConfigSchema.kt     |  6 ++++--
+ .../r0dumpmanager/domain/FusionConfigValidator.kt  |  8 +++++++-
+ .../r0dumpmanager/ui/R0dumpManagerScreen.kt        |  3 +++
+ .../domain/FusionConfigContractTest.kt             | 14 ++++++++++++++
+ 9 files changed, 41 insertions(+), 9 deletions(-)
+
+diff --git a/IMPLEMENTATION.md b/IMPLEMENTATION.md
+index d3cf0ac..1cbc868 100644
+--- a/IMPLEMENTATION.md
++++ b/IMPLEMENTATION.md
+@@ -40,14 +40,14 @@ Manager 完成证据和范围边界见 [STATUS.md](STATUS.md)。该状态只标
+ 
+ ### 1.1 当前运行时合同
+ 
+-当前 fusion 实现已经使用 34 个配置字段和一个独立的 `generation` 字段。Framework 在应用 bind 时读取一次完整快照，
++当前 fusion 实现已经使用 35 个配置字段和一个独立的 `generation` 字段。Framework 在应用 bind 时读取一次完整快照，
+ 目标进程内配置随后保持不可变。SystemServer 的 ANR kill gate 会按需重新读取持久快照。
+ 
+ 属性通过奇偶 generation 发布：
+ 
+ 1. 稳定快照的 generation 必须是偶数；
+ 2. 发布者先写 `generation = g + 1`，表示写入中；
+-3. 发布者写完全部 34 个字段；
++3. 发布者写完全部 35 个字段；
+ 4. 发布者最后写 `generation = g + 2`，提交新快照；
+ 5. 读取者发现奇数 generation 或前后 generation 不一致时必须 fail closed。
+ 
+@@ -260,7 +260,7 @@ public static long r0dump_recoverDisabledPersistedForManager();
+ 
+ - `write` 先用现有 strict JSON parser 和 `r0dump_validate()` 校验；
+ - `write` 要求当前 generation 等于 `expectedGeneration` 且为偶数；
+-- `write` 按 `odd -> 34 fields -> even` 发布，并返回提交后的偶数 generation；
++- `write` 按 `odd -> 35 fields -> even` 发布，并返回提交后的偶数 generation；
+ - `disable` 不接受不完整草稿，只在 generation 事务内将 `enabled=0`；
+ - `recover` 仅用于奇数 generation，将 `enabled=0` 后推进到下一个偶数；
+ - 所有入口在 property write 失败时抛出稳定分类异常，不吞掉失败；
+@@ -639,6 +639,7 @@ data class FusionConfigDraft(
+     val walkEnabled: Boolean = true,
+     val walkStart: WalkStart = AFTER_APPLICATION_ON_CREATE,
+     val walkMode: WalkMode = LOADED_ONLY,
++    val walkNamespacePrefix: String = "",
+     val walkDelayMs: Long = 5000,
+     val walkMaxClasses: Long = 16384,
+     val walkMaxMethods: Long = 65536,
+@@ -651,7 +652,7 @@ data class FusionConfigDraft(
+ )
+ ```
+ 
+-`generation` 不属于草稿，由 Repository 单独管理。JSON 序列化必须总是输出全部 34 个字段，不省略默认值，不接受未知字段。
++`generation` 不属于草稿，由 Repository 单独管理。JSON 序列化必须总是输出全部 35 个字段，不省略默认值，不接受未知字段。
+ 
+ ### 6.2 属性上限
+ 
+@@ -674,6 +675,7 @@ data class FusionConfigDraft(
+ | `walk_delay_ms` | 5000 | `0..4294967295` |
+ | `walk_max_classes` | 16384 | `1..1000000` |
+ | `walk_max_methods` | 65536 | `1..10000000` |
++| `walk_namespace_prefix` | 空 | 为空或以点结尾的 Java 命名空间前缀，例如 `com.example.ui.` |
+ | `force_max_calls` | 1 | `1..8` |
+ 
+ 所有字符串必须小于等于 `SystemProperties.PROP_VALUE_MAX` UTF-8 bytes。`run_id` 额外限制为 1 到 64 个
+@@ -1231,7 +1233,7 @@ read back even generation and enabled=0
+ 
+ 源码契约脚本必须比较：
+ 
+-- Manager 34 个字段名与 Framework `FIELDS`；
++- Manager 35 个字段名与 Framework `FIELDS`；
+ - 默认值；
+ - 18 个绝对上限和字段关系；
+ - 42 个 bit/name；
+diff --git a/res/values-zh-rCN/strings.xml b/res/values-zh-rCN/strings.xml
+index 2ec618e..1450806 100644
+--- a/res/values-zh-rCN/strings.xml
++++ b/res/values-zh-rCN/strings.xml
+@@ -147,6 +147,7 @@
+     <string name="walk_start_activity">首个 Activity.onCreate 之后</string>
+     <string name="walk_mode_loaded_only">仅已加载项</string>
+     <string name="walk_mode_dex_names">DEX 名称</string>
++    <string name="walk_namespace_prefix">命名空间前缀（可选）</string>
+     <string name="force_anr">强制调用 / ANR</string>
+     <string name="setting_enabled">已启用</string>
+     <string name="setting_disabled">已停用</string>
+@@ -215,6 +216,7 @@
+     <string name="validation_force_bit">强制调用需要启用 ForceInvoke.no_execute</string>
+     <string name="validation_force_scope">请启用 Manifest 范围，或完整填写精确类、方法和描述符</string>
+     <string name="validation_binary_class">请使用二进制类名</string>
++    <string name="validation_namespace_prefix">请输入以点结尾的命名空间前缀，例如 com.example.ui.</string>
+     <string name="validation_method_name">方法名无效</string>
+     <string name="validation_method_descriptor">JVM 描述符无效</string>
+     <string name="validation_property_too_long">属性值过长</string>
+diff --git a/res/values/strings.xml b/res/values/strings.xml
+index c19d792..cb8d3c3 100644
+--- a/res/values/strings.xml
++++ b/res/values/strings.xml
+@@ -147,6 +147,7 @@
+     <string name="walk_start_activity">After first Activity.onCreate</string>
+     <string name="walk_mode_loaded_only">Loaded only</string>
+     <string name="walk_mode_dex_names">DEX names</string>
++    <string name="walk_namespace_prefix">Namespace prefix (optional)</string>
+     <string name="force_anr">Force / ANR</string>
+     <string name="setting_enabled">Enabled</string>
+     <string name="setting_disabled">Disabled</string>
+@@ -215,6 +216,7 @@
+     <string name="validation_force_bit">Force invoke requires ForceInvoke.no_execute</string>
+     <string name="validation_force_scope">Enable Manifest scope or provide the complete exact class, method and descriptor</string>
+     <string name="validation_binary_class">Use a binary class name</string>
++    <string name="validation_namespace_prefix">Use a dot-terminated namespace prefix, for example com.example.ui.</string>
+     <string name="validation_method_name">Invalid method name</string>
+     <string name="validation_method_descriptor">Invalid JVM descriptor</string>
+     <string name="validation_property_too_long">Property value is too long</string>
+diff --git a/src/com/android/r0dumpmanager/data/property/FusionPropertyRepository.kt b/src/com/android/r0dumpmanager/data/property/FusionPropertyRepository.kt
+index 76ac70e..105163c 100644
+--- a/src/com/android/r0dumpmanager/data/property/FusionPropertyRepository.kt
++++ b/src/com/android/r0dumpmanager/data/property/FusionPropertyRepository.kt
+@@ -77,7 +77,7 @@ class FusionPropertyRepository(
+         maxFrozenGenerations = long("max_frozen_generations", "4"), flushIdleMs = long("flush_idle_ms", "500"), manifestEnabled = bool("manifest_enabled", "1"), manifestIncludeSplits = bool("manifest_include_splits", "1"),
+         manifestMaxComponents = long("manifest_max_components", "8192"), manifestMaxSplits = long("manifest_max_splits", "32"), manifestMaxEventsPerSource = long("manifest_max_events_per_source", "16384"), manifestMaxTotalEvents = long("manifest_max_total_events", "65536"),
+         manifestMaxXmlDepth = long("manifest_max_xml_depth", "64"), manifestMaxAttributeLength = long("manifest_max_attribute_length", "1024"), walkEnabled = bool("walk_enabled", "1"),
+-        walkStart = WalkStart.entries.first { it.propertyValue == string("walk_start", "after_application_on_create") }, walkMode = WalkMode.entries.first { it.propertyValue == string("walk_mode", "loaded_only") },
++        walkStart = WalkStart.entries.first { it.propertyValue == string("walk_start", "after_application_on_create") }, walkMode = WalkMode.entries.first { it.propertyValue == string("walk_mode", "loaded_only") }, walkNamespacePrefix = string("walk_namespace_prefix", ""),
+         walkDelayMs = long("walk_delay_ms", "5000"), walkMaxClasses = long("walk_max_classes", "16384"), walkMaxMethods = long("walk_max_methods", "65536"), forceInvokeEnabled = bool("force_invoke_enabled", "1"),
+         forceClass = string("force_class", ""), forceMethod = string("force_method", ""), forceMethodDescriptor = string("force_method_descriptor", ""), forceMaxCalls = long("force_max_calls", "1"), anrProtectionEnabled = bool("anr_protection_enabled", "1"),
+     )
+diff --git a/src/com/android/r0dumpmanager/domain/FusionConfigDraft.kt b/src/com/android/r0dumpmanager/domain/FusionConfigDraft.kt
+index 7414fb0..a7dfb16 100644
+--- a/src/com/android/r0dumpmanager/domain/FusionConfigDraft.kt
++++ b/src/com/android/r0dumpmanager/domain/FusionConfigDraft.kt
+@@ -27,6 +27,7 @@ data class FusionConfigDraft(
+     val walkEnabled: Boolean = true,
+     val walkStart: WalkStart = WalkStart.AFTER_APPLICATION_ON_CREATE,
+     val walkMode: WalkMode = WalkMode.LOADED_ONLY,
++    val walkNamespacePrefix: String = "",
+     val walkDelayMs: Long = 5000,
+     val walkMaxClasses: Long = 16_384,
+     val walkMaxMethods: Long = 65_536,
+diff --git a/src/com/android/r0dumpmanager/domain/FusionConfigSchema.kt b/src/com/android/r0dumpmanager/domain/FusionConfigSchema.kt
+index 1362eef..884b75d 100644
+--- a/src/com/android/r0dumpmanager/domain/FusionConfigSchema.kt
++++ b/src/com/android/r0dumpmanager/domain/FusionConfigSchema.kt
+@@ -6,7 +6,7 @@ object FusionConfigSchema {
+     const val SCHEMA_VERSION = 1
+     const val PROPERTY_PREFIX = "persist.sys.r0dump.fusion."
+     const val PROPERTY_VALUE_MAX_UTF8_BYTES = 91
+-    const val FIELD_COUNT = 34
++    const val FIELD_COUNT = 35
+ 
+     val fields = listOf(
+         "schema", "enabled", "run_id", "target_package", "target_process", "capture_point_mask",
+@@ -14,7 +14,7 @@ object FusionConfigSchema {
+         "max_code_item_bytes", "max_frozen_generations", "flush_idle_ms", "manifest_enabled",
+         "manifest_include_splits", "manifest_max_components", "manifest_max_splits",
+         "manifest_max_events_per_source", "manifest_max_total_events", "manifest_max_xml_depth",
+-        "manifest_max_attribute_length", "walk_enabled", "walk_start", "walk_mode", "walk_delay_ms",
++        "manifest_max_attribute_length", "walk_enabled", "walk_start", "walk_mode", "walk_namespace_prefix", "walk_delay_ms",
+         "walk_max_classes", "walk_max_methods", "force_invoke_enabled", "force_class", "force_method",
+         "force_method_descriptor", "force_max_calls", "anr_protection_enabled",
+     )
+@@ -58,6 +58,7 @@ object FusionConfigSchema {
+             walkEnabled = json.getBoolean("walk_enabled"),
+             walkStart = WalkStart.entries.first { it.propertyValue == json.getString("walk_start") },
+             walkMode = WalkMode.entries.first { it.propertyValue == json.getString("walk_mode") },
++            walkNamespacePrefix = json.getString("walk_namespace_prefix"),
+             walkDelayMs = json.getLong("walk_delay_ms"), walkMaxClasses = json.getLong("walk_max_classes"),
+             walkMaxMethods = json.getLong("walk_max_methods"), forceInvokeEnabled = json.getBoolean("force_invoke_enabled"),
+             forceClass = json.getString("force_class"), forceMethod = json.getString("force_method"),
+@@ -80,6 +81,7 @@ object FusionConfigSchema {
+         put("manifest_max_total_events", draft.manifestMaxTotalEvents); put("manifest_max_xml_depth", draft.manifestMaxXmlDepth)
+         put("manifest_max_attribute_length", draft.manifestMaxAttributeLength); put("walk_enabled", draft.walkEnabled)
+         put("walk_start", draft.walkStart.propertyValue); put("walk_mode", draft.walkMode.propertyValue)
++        put("walk_namespace_prefix", draft.walkNamespacePrefix)
+         put("walk_delay_ms", draft.walkDelayMs); put("walk_max_classes", draft.walkMaxClasses)
+         put("walk_max_methods", draft.walkMaxMethods); put("force_invoke_enabled", draft.forceInvokeEnabled)
+         put("force_class", draft.forceClass); put("force_method", draft.forceMethod)
+diff --git a/src/com/android/r0dumpmanager/domain/FusionConfigValidator.kt b/src/com/android/r0dumpmanager/domain/FusionConfigValidator.kt
+index 26b9e94..4fea3c6 100644
+--- a/src/com/android/r0dumpmanager/domain/FusionConfigValidator.kt
++++ b/src/com/android/r0dumpmanager/domain/FusionConfigValidator.kt
+@@ -16,6 +16,7 @@ enum class FusionValidationErrorCode {
+     FORCE_BIT_REQUIRED,
+     FORCE_SCOPE_REQUIRED,
+     INVALID_BINARY_CLASS,
++    INVALID_NAMESPACE_PREFIX,
+     INVALID_METHOD_NAME,
+     INVALID_METHOD_DESCRIPTOR,
+     PROPERTY_VALUE_TOO_LONG,
+@@ -43,6 +44,7 @@ object FusionConfigValidator {
+     private val runId = Regex("[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+     private val packageName = Regex("[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)+")
+     private val binaryClass = Regex("[A-Za-z_$][A-Za-z0-9_$]*(\\.[A-Za-z_$][A-Za-z0-9_$]*)*")
++    private val namespacePrefix = Regex("[A-Za-z_$][A-Za-z0-9_$]*(\\.[A-Za-z_$][A-Za-z0-9_$]*)*\\.")
+     private val methodName = Regex("[A-Za-z_$][A-Za-z0-9_$]*|<init>|<clinit>")
+ 
+     fun isValidRunId(value: String): Boolean = runId.matches(value)
+@@ -73,6 +75,9 @@ object FusionConfigValidator {
+         range("manifest_max_xml_depth", draft.manifestMaxXmlDepth, 1, 256); range("manifest_max_attribute_length", draft.manifestMaxAttributeLength, 1, 4096)
+         range("walk_delay_ms", draft.walkDelayMs, 0, 0xffff_ffffL); range("walk_max_classes", draft.walkMaxClasses, 1, 1_000_000)
+         range("walk_max_methods", draft.walkMaxMethods, 1, 10_000_000); range("force_max_calls", draft.forceMaxCalls, 1, 8)
++        if (draft.walkNamespacePrefix.isNotEmpty() && !namespacePrefix.matches(draft.walkNamespacePrefix)) {
++            error("walk_namespace_prefix", FusionValidationErrorCode.INVALID_NAMESPACE_PREFIX)
++        }
+         if (draft.maxArtifacts > draft.maxRecords) error("max_artifacts", FusionValidationErrorCode.EXCEEDS_MAX_RECORDS)
+         if (draft.maxDexBytes > draft.maxTotalBytes) {
+             error("max_total_bytes", FusionValidationErrorCode.EXCEEDS_TOTAL_BYTES)
+@@ -99,7 +104,8 @@ object FusionConfigValidator {
+             }
+         }
+         listOf("run_id" to draft.runId, "target_package" to draft.targetPackage, "target_process" to draft.targetProcess,
+-            "force_class" to draft.forceClass, "force_method" to draft.forceMethod, "force_method_descriptor" to draft.forceMethodDescriptor)
++            "force_class" to draft.forceClass, "force_method" to draft.forceMethod, "force_method_descriptor" to draft.forceMethodDescriptor,
++            "walk_namespace_prefix" to draft.walkNamespacePrefix)
+             .filter { it.second.toByteArray(Charsets.UTF_8).size > FusionConfigSchema.PROPERTY_VALUE_MAX_UTF8_BYTES }
+             .forEach { error(it.first, FusionValidationErrorCode.PROPERTY_VALUE_TOO_LONG) }
+         return FusionValidationResult(e)
+diff --git a/src/com/android/r0dumpmanager/ui/R0dumpManagerScreen.kt b/src/com/android/r0dumpmanager/ui/R0dumpManagerScreen.kt
+index 4a906ba..cbb5c78 100644
+--- a/src/com/android/r0dumpmanager/ui/R0dumpManagerScreen.kt
++++ b/src/com/android/r0dumpmanager/ui/R0dumpManagerScreen.kt
+@@ -415,6 +415,7 @@ private fun validationMessage(error: FusionValidationError): String = when (erro
+     FusionValidationErrorCode.FORCE_BIT_REQUIRED -> stringResource(R.string.validation_force_bit)
+     FusionValidationErrorCode.FORCE_SCOPE_REQUIRED -> stringResource(R.string.validation_force_scope)
+     FusionValidationErrorCode.INVALID_BINARY_CLASS -> stringResource(R.string.validation_binary_class)
++    FusionValidationErrorCode.INVALID_NAMESPACE_PREFIX -> stringResource(R.string.validation_namespace_prefix)
+     FusionValidationErrorCode.INVALID_METHOD_NAME -> stringResource(R.string.validation_method_name)
+     FusionValidationErrorCode.INVALID_METHOD_DESCRIPTOR -> stringResource(R.string.validation_method_descriptor)
+     FusionValidationErrorCode.PROPERTY_VALUE_TOO_LONG -> stringResource(R.string.validation_property_too_long)
+@@ -443,6 +444,7 @@ private fun validationFieldLabel(field: String): String = stringResource(
+         "manifest_max_xml_depth" -> R.string.xml_depth
+         "manifest_max_attribute_length" -> R.string.attribute_length
+         "walk_delay_ms" -> R.string.walk_delay_ms
++        "walk_namespace_prefix" -> R.string.walk_namespace_prefix
+         "walk_max_classes" -> R.string.walk_max_classes
+         "walk_max_methods" -> R.string.walk_max_methods
+         "force_class" -> R.string.force_class
+@@ -1240,6 +1242,7 @@ private fun AdvancedScreen(
+                 Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                     EnumDropdownSelector(stringResource(R.string.walk_start), WalkStart.entries.toList(), state.draft.walkStart, state.canEdit) { viewModel.updateDraft { draft -> draft.copy(walkStart = it) } }
+                     EnumDropdownSelector(stringResource(R.string.walk_mode), WalkMode.entries.toList(), state.draft.walkMode, state.canEdit) { viewModel.updateDraft { draft -> draft.copy(walkMode = it) } }
++                    DraftText(stringResource(R.string.walk_namespace_prefix), state.draft.walkNamespacePrefix, state.validation.errors["walk_namespace_prefix"], state, viewModel) { state.draft.copy(walkNamespacePrefix = it) }
+                     NumberField(stringResource(R.string.walk_delay_ms), "walk_delay_ms", state.draft.walkDelayMs, state, viewModel) { value -> state.draft.copy(walkDelayMs = value) }
+                     NumberField(stringResource(R.string.walk_max_classes), "walk_max_classes", state.draft.walkMaxClasses, state, viewModel) { value -> state.draft.copy(walkMaxClasses = value) }
+                     NumberField(stringResource(R.string.walk_max_methods), "walk_max_methods", state.draft.walkMaxMethods, state, viewModel) { value -> state.draft.copy(walkMaxMethods = value) }
+diff --git a/tests/src/com/android/r0dumpmanager/domain/FusionConfigContractTest.kt b/tests/src/com/android/r0dumpmanager/domain/FusionConfigContractTest.kt
+index 485c462..26636a6 100644
+--- a/tests/src/com/android/r0dumpmanager/domain/FusionConfigContractTest.kt
++++ b/tests/src/com/android/r0dumpmanager/domain/FusionConfigContractTest.kt
+@@ -12,6 +12,7 @@ class FusionConfigContractTest {
+         assertEquals(FusionConfigSchema.FIELD_COUNT, json.length())
+         assertEquals(FusionConfigSchema.fields.toSet(), json.keys().asSequence().toSet())
+         assertEquals("0x0000020000000028", json.getString("capture_point_mask"))
++        assertEquals("", json.getString("walk_namespace_prefix"))
+     }
+     @Test fun defaultsMatchTheManagerOperationalBaseline() {
+         val defaults = FusionConfigSchema.defaults()
+@@ -36,11 +37,24 @@ class FusionConfigContractTest {
+             enabled = true, runId = "run-1", targetPackage = "com.example.app",
+             targetProcess = "com.example.app:worker", capturePointMask = CapturePointRegistry.forceNoExecuteMask,
+             walkEnabled = true, walkStart = WalkStart.AFTER_FIRST_ACTIVITY_ON_CREATE, walkMode = WalkMode.DEX_NAMES,
++            walkNamespacePrefix = "com.example.ui.",
+             forceInvokeEnabled = true, forceClass = "com.example.Target", forceMethod = "run",
+             forceMethodDescriptor = "()V", anrProtectionEnabled = true,
+         )
+         assertEquals(original, FusionConfigSchema.fromJson(FusionConfigSchema.toJson(original)))
+     }
++
++    @Test fun namespacePrefixRequiresTrailingSegmentBoundary() {
++        val base = FusionConfigSchema.defaults().copy(
++            enabled = true, runId = "run-1", targetPackage = "com.example.app",
++            targetProcess = "com.example.app", capturePointMask = 1uL, forceInvokeEnabled = false,
++        )
++        assertTrue(FusionConfigValidator.validate(base.copy(walkNamespacePrefix = "com.example.ui.")).isValid)
++        assertEquals(
++            FusionValidationErrorCode.INVALID_NAMESPACE_PREFIX,
++            FusionConfigValidator.validate(base.copy(walkNamespacePrefix = "com.example.ui")).errors["walk_namespace_prefix"]?.code,
++        )
++    }
+     @Test fun captureRegistryIsTheFortyTwoBitArtContract() {
+         assertEquals(42, CapturePointRegistry.points.size)
+         assertEquals((0..41).toList(), CapturePointRegistry.points.map { it.bit })
+-- 
+2.43.0
+

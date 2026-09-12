@@ -1,0 +1,56 @@
+From a26f70269a289582ec91b7056262db20b3d217a2 Mon Sep 17 00:00:00 2001
+From: Ivory <contact@ivory.cafe>
+Date: Tue, 1 Sep 2026 09:28:37 +0800
+Subject: [PATCH 3/4] =?UTF-8?q?=E5=85=81=E8=AE=B8=20helper=20=E5=8F=97?=
+ =?UTF-8?q?=E6=8E=A7=E8=AF=BB=E5=86=99=E5=AF=BC=E5=87=BA=E5=AD=98=E5=82=A8?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+为 root helper 补齐带应用 MCS 类别的捕获文件读取与固定 Downloads 输出权限，使导出流程在 Enforcing 模式下可完成。\n\nConstraint: 访问仍限定在专用 helper 域，目录和文件权限合同保持 02770/0660。\nRejected: 放宽为 permissive 或授予通配 appdomain 权限 | 会隐藏策略缺陷并扩大访问面。\nConfidence: high\nScope-risk: narrow\nDirective: 后续策略变更必须重新运行 neverallow、兼容性和 context 检查。\nTested: m -j8 selinux_policy；真机 Enforcing 导出无 helper AVC。\nNot-tested: 本次 checksum/UI 调整未在设备上重新装机验证。
+
+Change-Id: I18dbd7e61d2957e865002234678471321cadd226
+---
+ private/r0dump_file_helper.te | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/private/r0dump_file_helper.te b/private/r0dump_file_helper.te
+index a5126ec..166eba0 100644
+--- a/private/r0dump_file_helper.te
++++ b/private/r0dump_file_helper.te
+@@ -1,6 +1,11 @@
+ type r0dump_file_helper, domain, coredomain;
+ init_daemon_domain(r0dump_file_helper)
+ 
++# Captured app artifacts inherit the target app's MCS categories. The helper is
++# a platform daemon that validates and confines every request to the package
++# selected by system_server, so it must be able to cross those categories.
++typeattribute r0dump_file_helper mlstrustedsubject;
++
+ get_prop(r0dump_file_helper, r0dump_fusion_prop)
+ 
+ allow r0dump_file_helper self:capability { chown fowner fsetid setuid };
+@@ -12,6 +17,7 @@ allow r0dump_file_helper mnt_user_file:dir search;
+ # The emulated-storage FUSE daemon performs checks against the backing
+ # media_rw data label while the helper walks and prepares app external files.
+ allow r0dump_file_helper media_rw_data_file:dir create_dir_perms;
++allow r0dump_file_helper media_rw_data_file:file create_file_perms;
+ 
+ # The helper performs only fd-relative directory preparation below app external files.
+ allow r0dump_file_helper fuse:dir {
+@@ -26,6 +32,12 @@ allow r0dump_file_helper fuse:dir {
+   setattr
+   write
+ };
++allow r0dump_file_helper fuse:file create_file_perms;
++
++# system_server opens the installed base/split APKs after validating the
++# Manager caller and passes only those read-only descriptors to the helper.
++allow r0dump_file_helper system_server:fd use;
++allow r0dump_file_helper apk_data_file:file { getattr read };
+ 
+ allow system_server r0dump_file_helper_socket:sock_file write;
+ allow system_server r0dump_file_helper:unix_stream_socket connectto;
+-- 
+2.43.0
+

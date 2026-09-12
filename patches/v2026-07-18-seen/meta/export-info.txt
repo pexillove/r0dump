@@ -1,0 +1,4 @@
+Exported: 2026-07-21T22:58:51+08:00
+Source tree: /home/ivory/lineageOS-23.2
+Base intent: original LineageOS 23.2 checkout / manifest revisions, with current R0DUMP changes as patches
+Notes: packages/apps/R0DUMPManager is exported as a full new-directory patch because it is a local/new app outside the upstream Lineage manifest.

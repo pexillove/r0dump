@@ -1,0 +1,30 @@
+From e6fe536e1d17d24ffc16eed1784419d6adf579e8 Mon Sep 17 00:00:00 2001
+From: Ivory <contact@ivory.cafe>
+Date: Thu, 10 Sep 2026 22:03:23 +0800
+Subject: [PATCH 23/32] manager: align force_max_calls validation cap with the
+ method budget
+
+Match the framework/native cap change (8 -> 10,000,000) so the manager
+does not reject configs the device would accept.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ src/com/android/r0dumpmanager/domain/FusionConfigValidator.kt | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/com/android/r0dumpmanager/domain/FusionConfigValidator.kt b/src/com/android/r0dumpmanager/domain/FusionConfigValidator.kt
+index 4fea3c6..ae7c704 100644
+--- a/src/com/android/r0dumpmanager/domain/FusionConfigValidator.kt
++++ b/src/com/android/r0dumpmanager/domain/FusionConfigValidator.kt
+@@ -74,7 +74,7 @@ object FusionConfigValidator {
+         range("manifest_max_events_per_source", draft.manifestMaxEventsPerSource, 1, 262144); range("manifest_max_total_events", draft.manifestMaxTotalEvents, 1, 1048576)
+         range("manifest_max_xml_depth", draft.manifestMaxXmlDepth, 1, 256); range("manifest_max_attribute_length", draft.manifestMaxAttributeLength, 1, 4096)
+         range("walk_delay_ms", draft.walkDelayMs, 0, 0xffff_ffffL); range("walk_max_classes", draft.walkMaxClasses, 1, 1_000_000)
+-        range("walk_max_methods", draft.walkMaxMethods, 1, 10_000_000); range("force_max_calls", draft.forceMaxCalls, 1, 8)
++        range("walk_max_methods", draft.walkMaxMethods, 1, 10_000_000); range("force_max_calls", draft.forceMaxCalls, 1, 10_000_000)
+         if (draft.walkNamespacePrefix.isNotEmpty() && !namespacePrefix.matches(draft.walkNamespacePrefix)) {
+             error("walk_namespace_prefix", FusionValidationErrorCode.INVALID_NAMESPACE_PREFIX)
+         }
+-- 
+2.43.0
+

@@ -1,0 +1,35 @@
+From 49c59fe2705d31c54e67d1aa7727f67f0efa64ff Mon Sep 17 00:00:00 2001
+From: Ivory <contact@ivory.cafe>
+Date: Tue, 1 Sep 2026 19:29:50 +0800
+Subject: [PATCH 7/9] Pass namespace scope into DexCache discovery
+
+Keep the Framework walk request aligned with the ART bridge so configured namespace filtering happens before DexCache results consume the bounded class budget.
+
+Constraint: Retain the existing ClassLoaderWalk source ordering and capture semantics.
+Rejected: Filtering only after native enumeration | Large DEX tables could still truncate the target namespace.
+Confidence: high
+Scope-risk: narrow
+Directive: Keep bridge signatures synchronized across Framework, libcore, and ART.
+Tested: r0dump_f7_class_loader_walk_source_test.py; git diff --check.
+Not-tested: Full framework build and device verification.
+Change-Id: I646c280bc5a5c1a10ec452bed14b05220b2e4abf
+---
+ core/java/android/app/r0dump_ClassLoaderWalk.java | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/core/java/android/app/r0dump_ClassLoaderWalk.java b/core/java/android/app/r0dump_ClassLoaderWalk.java
+index 71a1513ab..8f2a5ea87 100644
+--- a/core/java/android/app/r0dump_ClassLoaderWalk.java
++++ b/core/java/android/app/r0dump_ClassLoaderWalk.java
+@@ -320,7 +320,7 @@ final class r0dump_ClassLoaderWalk {
+       r0dump_walkNames(
+           config,
+           loader,
+-          r0dump_Runtime.r0dump_GetDexCacheClassNames(loader),
++          r0dump_Runtime.r0dump_GetDexCacheClassNames(loader, config.walkNamespacePrefix),
+           null,
+           r0dump_SOURCE_DEX_CACHE,
+           state);
+-- 
+2.43.0
+

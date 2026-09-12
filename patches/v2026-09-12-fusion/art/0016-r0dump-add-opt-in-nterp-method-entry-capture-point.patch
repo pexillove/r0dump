@@ -1,0 +1,319 @@
+From 4165048ee809d592ec82f308f6e55d5db7d6c915 Mon Sep 17 00:00:00 2001
+From: Ivory <contact@ivory.cafe>
+Date: Thu, 10 Sep 2026 21:43:56 +0800
+Subject: [PATCH 16/21] r0dump: add opt-in nterp method-entry capture point
+
+Gate a NterpR0dumpMethodEntry trampoline behind
+g_r0dump_nterp_method_entry_enabled in START_EXECUTING_INSTRUCTIONS on
+all five ABIs (arm64/arm/riscv64/x86_64/x86); disabled path branches over
+the hook to the original body byte-for-byte. Add a source-contract test
+asserting the disabled-gate symmetry across every ABI.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Change-Id: I886f16348801377b867319cfbed327203da894d6
+---
+ runtime/interpreter/mterp/arm64ng/main.S      |  7 ++
+ runtime/interpreter/mterp/armng/main.S        | 10 +++
+ runtime/interpreter/mterp/nterp.cc            | 10 +++
+ runtime/interpreter/mterp/riscv64/main.S      |  7 ++
+ runtime/interpreter/mterp/x86_64ng/main.S     |  6 ++
+ runtime/interpreter/mterp/x86ng/main.S        |  7 ++
+ runtime/r0dump/r0dump_force_invoke.cc         |  1 +
+ runtime/r0dump/r0dump_hook_point.cc           |  1 +
+ runtime/r0dump/r0dump_hook_point.h            |  3 +-
+ .../r0dump_nterp_method_entry_source_test.py  | 86 +++++++++++++++++++
+ 10 files changed, 137 insertions(+), 1 deletion(-)
+ create mode 100644 runtime/r0dump/r0dump_nterp_method_entry_source_test.py
+
+diff --git a/runtime/interpreter/mterp/arm64ng/main.S b/runtime/interpreter/mterp/arm64ng/main.S
+index a92ce43..85749ca 100644
+--- a/runtime/interpreter/mterp/arm64ng/main.S
++++ b/runtime/interpreter/mterp/arm64ng/main.S
+@@ -377,6 +377,12 @@ END \name
+ 
+ // Increase method hotness and do suspend check before starting executing the method.
+ .macro START_EXECUTING_INSTRUCTIONS
++    adrp x1, g_r0dump_nterp_method_entry_enabled
++    ldr w1, [x1, #:lo12:g_r0dump_nterp_method_entry_enabled]
++    cbz w1, 8f
++    ldr x0, [sp]
++    bl nterp_r0dump_method_entry
++8:
+     ldr x0, [sp]
+     ldrh w2, [x0, #ART_METHOD_HOTNESS_COUNT_OFFSET]
+ #if (NTERP_HOTNESS_VALUE != 0)
+@@ -1914,6 +1920,7 @@ NTERP_TRAMPOLINE nterp_get_method, NterpGetMethod
+ NTERP_TRAMPOLINE nterp_hot_method, NterpHotMethod
+ NTERP_TRAMPOLINE nterp_try_fast_compile, NterpTryFastCompile
+ NTERP_TRAMPOLINE nterp_load_object, NterpLoadObject
++NTERP_TRAMPOLINE nterp_r0dump_method_entry, NterpR0dumpMethodEntry
+ 
+ ENTRY nterp_deliver_pending_exception
+     DELIVER_PENDING_EXCEPTION
+diff --git a/runtime/interpreter/mterp/armng/main.S b/runtime/interpreter/mterp/armng/main.S
+index d64532e..f7f7961 100644
+--- a/runtime/interpreter/mterp/armng/main.S
++++ b/runtime/interpreter/mterp/armng/main.S
+@@ -385,6 +385,15 @@ END \name
+ 
+ // Increase method hotness and do suspend check before starting executing the method.
+ .macro START_EXECUTING_INSTRUCTIONS
++    movw r2, #:lower16:(g_r0dump_nterp_method_entry_enabled - (. + 12))
++    movt r2, #:upper16:(g_r0dump_nterp_method_entry_enabled - (. + 8))
++    add r2, pc
++    ldr r2, [r2]
++    cmp r2, #0
++    beq 8f
++    ldr r0, [sp]
++    bl nterp_r0dump_method_entry
++8:
+     ldr r0, [sp]
+     ldrh r2, [r0, #ART_METHOD_HOTNESS_COUNT_OFFSET]
+     cmp r2, #NTERP_HOTNESS_VALUE
+@@ -1955,6 +1964,7 @@ NTERP_TRAMPOLINE nterp_allocate_object, NterpAllocateObject
+ NTERP_TRAMPOLINE nterp_get_method, NterpGetMethod
+ NTERP_TRAMPOLINE nterp_hot_method, NterpHotMethod
+ NTERP_TRAMPOLINE nterp_load_object, NterpLoadObject
++NTERP_TRAMPOLINE nterp_r0dump_method_entry, NterpR0dumpMethodEntry
+ 
+ ENTRY nterp_deliver_pending_exception
+     DELIVER_PENDING_EXCEPTION
+diff --git a/runtime/interpreter/mterp/nterp.cc b/runtime/interpreter/mterp/nterp.cc
+index 54edd75..0ae715e 100644
+--- a/runtime/interpreter/mterp/nterp.cc
++++ b/runtime/interpreter/mterp/nterp.cc
+@@ -30,6 +30,7 @@
+ #include "interpreter/shadow_frame-inl.h"
+ #include "mirror/string-alloc-inl.h"
+ #include "nterp_helpers.h"
++#include "r0dump/r0dump_capture.h"
+ 
+ namespace art HIDDEN {
+ namespace interpreter {
+@@ -135,6 +136,15 @@ extern "C" void NterpTryFastCompile(ArtMethod* method) REQUIRES_SHARED(Locks::mu
+   }
+ }
+ 
++extern "C" void NterpR0dumpMethodEntry(ArtMethod* method)
++    REQUIRES_SHARED(Locks::mutator_lock_) {
++  ScopedAssertNoThreadSuspension sants("In nterp r0dump method entry");
++  r0dump_ObserveMethodCodeItem(r0dump_Point::kNterpMethodEntry,
++                               "Nterp.method.entry",
++                               method,
++                               r0dump_CodeItemRole::kNterpEntry);
++}
++
+ inline void UpdateHotness(Thread* self, ArtMethod* method) REQUIRES_SHARED(Locks::mutator_lock_) {
+   // The hotness we will add to a method when we perform a
+   // field/method/class/string lookup.
+diff --git a/runtime/interpreter/mterp/riscv64/main.S b/runtime/interpreter/mterp/riscv64/main.S
+index c725ed4..e74b34e 100644
+--- a/runtime/interpreter/mterp/riscv64/main.S
++++ b/runtime/interpreter/mterp/riscv64/main.S
+@@ -279,6 +279,12 @@ END \name
+ // - a0: ArtMethod*
+ // Clobbers: t0
+ .macro START_EXECUTING_INSTRUCTIONS
++    la t0, g_r0dump_nterp_method_entry_enabled
++    lw t0, (t0)
++    beqz t0, 8f
++    ld a0, (sp)
++    call nterp_r0dump_method_entry
++8:
+     ld a0, (sp)
+     lhu t0, ART_METHOD_HOTNESS_COUNT_OFFSET(a0)  // t0 := hotness
+ #if (NTERP_HOTNESS_VALUE != 0)
+@@ -696,6 +702,7 @@ NTERP_TRAMPOLINE nterp_get_method, NterpGetMethod
+ NTERP_TRAMPOLINE nterp_get_static_field, NterpGetStaticField
+ NTERP_TRAMPOLINE nterp_hot_method, NterpHotMethod
+ NTERP_TRAMPOLINE nterp_load_object, NterpLoadObject
++NTERP_TRAMPOLINE nterp_r0dump_method_entry, NterpR0dumpMethodEntry
+ 
+ ENTRY nterp_deliver_pending_exception
+     DELIVER_PENDING_EXCEPTION
+diff --git a/runtime/interpreter/mterp/x86_64ng/main.S b/runtime/interpreter/mterp/x86_64ng/main.S
+index 55b1141..ef2973a 100644
+--- a/runtime/interpreter/mterp/x86_64ng/main.S
++++ b/runtime/interpreter/mterp/x86_64ng/main.S
+@@ -746,6 +746,11 @@ END_FUNCTION \name
+ 
+ // Increase method hotness and do suspend check before starting executing the method.
+ .macro START_EXECUTING_INSTRUCTIONS
++   cmpl LITERAL(0), SYMBOL(g_r0dump_nterp_method_entry_enabled)(%rip)
++   je 8f
++   movq (%rsp), %rdi
++   call nterp_r0dump_method_entry
++8:
+    movq (%rsp), %rdi
+    movzwl ART_METHOD_HOTNESS_COUNT_OFFSET(%rdi), %esi
+ #if (NTERP_HOTNESS_VALUE != 0)
+@@ -2301,6 +2306,7 @@ NTERP_TRAMPOLINE nterp_allocate_object, NterpAllocateObject
+ NTERP_TRAMPOLINE nterp_get_method, NterpGetMethod
+ NTERP_TRAMPOLINE nterp_hot_method, NterpHotMethod
+ NTERP_TRAMPOLINE nterp_load_object, NterpLoadObject
++NTERP_TRAMPOLINE nterp_r0dump_method_entry, NterpR0dumpMethodEntry
+ 
+ DEFINE_FUNCTION nterp_deliver_pending_exception
+     DELIVER_PENDING_EXCEPTION
+diff --git a/runtime/interpreter/mterp/x86ng/main.S b/runtime/interpreter/mterp/x86ng/main.S
+index 939af6a..4ea513b 100644
+--- a/runtime/interpreter/mterp/x86ng/main.S
++++ b/runtime/interpreter/mterp/x86ng/main.S
+@@ -901,6 +901,12 @@ END_FUNCTION \name
+ 
+ // Increase method hotness and do suspend check before starting executing the method.
+ .macro START_EXECUTING_INSTRUCTIONS
++   SETUP_PC_REL_BASE_0 ecx
++   cmpl LITERAL(0), SYMBOL(g_r0dump_nterp_method_entry_enabled) - 0b(%ecx)
++   je 8f
++   movl (%esp), %eax
++   call nterp_r0dump_method_entry
++8:
+    movl (%esp), %eax
+    movzwl ART_METHOD_HOTNESS_COUNT_OFFSET(%eax), %ecx
+ #if (NTERP_HOTNESS_VALUE != 0)
+@@ -2359,6 +2365,7 @@ NTERP_TRAMPOLINE nterp_allocate_object, NterpAllocateObject
+ NTERP_TRAMPOLINE nterp_get_method, NterpGetMethod
+ NTERP_TRAMPOLINE nterp_hot_method, NterpHotMethod
+ NTERP_TRAMPOLINE nterp_load_object, NterpLoadObject
++NTERP_TRAMPOLINE nterp_r0dump_method_entry, NterpR0dumpMethodEntry
+ 
+ DEFINE_FUNCTION nterp_deliver_pending_exception
+     DELIVER_PENDING_EXCEPTION
+diff --git a/runtime/r0dump/r0dump_force_invoke.cc b/runtime/r0dump/r0dump_force_invoke.cc
+index 79e720d..b7db6b6 100644
+--- a/runtime/r0dump/r0dump_force_invoke.cc
++++ b/runtime/r0dump/r0dump_force_invoke.cc
+@@ -111,6 +111,7 @@ bool r0dump_TryHandleForceInvokeNoExecute(ArtMethod* method) {
+   prepared.method_name = method->GetNameView();
+   prepared.method_descriptor = method->GetSignature().ToString();
+   prepared.source_kind = "force_invoke";
++  r0dump_SetPreparedMethodState(method, "no_execute_capture", &prepared);
+   state.captured = r0dump_IsCaptureStaged(r0dump_SubmitPreparedCodeItem(std::move(prepared)));
+   return true;
+ }
+diff --git a/runtime/r0dump/r0dump_hook_point.cc b/runtime/r0dump/r0dump_hook_point.cc
+index 6ef4097..483f4fc 100644
+--- a/runtime/r0dump/r0dump_hook_point.cc
++++ b/runtime/r0dump/r0dump_hook_point.cc
+@@ -69,6 +69,7 @@ constexpr std::array<r0dump_PointDescriptor, kR0dumpPointCount> kR0dumpPointDesc
+     {r0dump_Point::kWalkCookieDex, "Walk.cookie.dex"},
+     {r0dump_Point::kWalkExecutableMethod, "Walk.executable.method"},
+     {r0dump_Point::kForceInvokeNoExecute, "ForceInvoke.no_execute"},
++    {r0dump_Point::kNterpMethodEntry, "Nterp.method.entry"},
+ }};
+ 
+ static_assert(kR0dumpPointDescriptors.size() == kR0dumpPointCount);
+diff --git a/runtime/r0dump/r0dump_hook_point.h b/runtime/r0dump/r0dump_hook_point.h
+index db65168..636dfb7 100644
+--- a/runtime/r0dump/r0dump_hook_point.h
++++ b/runtime/r0dump/r0dump_hook_point.h
+@@ -69,11 +69,12 @@ enum class r0dump_Point : uint8_t {
+   kWalkCookieDex = 39,
+   kWalkExecutableMethod = 40,
+   kForceInvokeNoExecute = 41,
++  kNterpMethodEntry = 42,
+ };
+ 
+ using r0dump_CapturePointMask = uint64_t;
+ 
+-constexpr uint8_t kR0dumpPointCount = 42;
++constexpr uint8_t kR0dumpPointCount = 43;
+ constexpr r0dump_CapturePointMask kR0dumpDefinedPointMask =
+     (r0dump_CapturePointMask{1} << kR0dumpPointCount) - 1;
+ 
+diff --git a/runtime/r0dump/r0dump_nterp_method_entry_source_test.py b/runtime/r0dump/r0dump_nterp_method_entry_source_test.py
+new file mode 100644
+index 0000000..3d53f13
+--- /dev/null
++++ b/runtime/r0dump/r0dump_nterp_method_entry_source_test.py
+@@ -0,0 +1,86 @@
++#!/usr/bin/env python3
++"""Source contract for the opt-in Nterp method-entry observation point."""
++
++from pathlib import Path
++
++
++ART = Path(__file__).resolve().parents[2]
++
++
++def read(relative: str) -> str:
++    return (ART / relative).read_text(encoding="utf-8")
++
++
++def test_point_42_is_defined_but_not_enabled_by_default() -> None:
++    header = read("runtime/r0dump/r0dump_hook_point.h")
++    config = read("runtime/r0dump/r0dump_config.h")
++    assert "kNterpMethodEntry = 42" in header
++    assert "kR0dumpPointCount = 43" in header
++    assert "kNterpMethodEntry" not in config
++
++
++def test_nterp_helper_uses_existing_capture_facade_only() -> None:
++    source = read("runtime/interpreter/mterp/nterp.cc")
++    start = source.index('extern "C" void NterpR0dumpMethodEntry')
++    body = source[start:source.index("\n}\n", start) + 3]
++    assert "r0dump_ObserveMethodCodeItem(" in body
++    assert "kNterpMethodEntry" in body
++    assert "kNterpEntry" in body
++    for forbidden in ("open(", "fopen(", "std::thread", "dladdr(", '"/proc'):
++        assert forbidden not in body
++
++
++def test_every_supported_abi_has_fast_gate_and_trampoline() -> None:
++    for relative in (
++        "runtime/interpreter/mterp/armng/main.S",
++        "runtime/interpreter/mterp/arm64ng/main.S",
++        "runtime/interpreter/mterp/x86ng/main.S",
++        "runtime/interpreter/mterp/x86_64ng/main.S",
++        "runtime/interpreter/mterp/riscv64/main.S",
++    ):
++        source = read(relative)
++        macro = source[source.index(".macro START_EXECUTING_INSTRUCTIONS"):]
++        macro = macro[:macro.index(".endm")]
++        assert "g_r0dump_nterp_method_entry_enabled" in macro, relative
++        assert "nterp_r0dump_method_entry" in macro, relative
++        assert "NTERP_TRAMPOLINE nterp_r0dump_method_entry, NterpR0dumpMethodEntry" in source
++
++
++def test_fast_gate_tracks_capture_lifecycle() -> None:
++    source = read("runtime/r0dump/r0dump_capture.cc")
++    assert 'extern "C" std::atomic<uint32_t> g_r0dump_nterp_method_entry_enabled' in source
++    assert "r0dump_SetActiveCapturePointMask(active_mask)" in source
++    assert source.count("r0dump_SetActiveCapturePointMask(0u)") >= 2
++
++
++# Per-ABI "branch when the gate is disabled" mnemonic.  When the flag is zero this branch must
++# skip straight to the local `8:` label, so the disabled interpreter path never reaches the
++# r0dump call and executes the original method-entry body byte-for-byte.
++_DISABLED_BRANCH = {
++    "armng": "beq 8f",
++    "arm64ng": "cbz w1, 8f",
++    "x86ng": "je 8f",
++    "x86_64ng": "je 8f",
++    "riscv64": "beqz t0, 8f",
++}
++
++
++def test_disabled_gate_branches_over_hook_without_touching_original_body() -> None:
++    for abi, branch in _DISABLED_BRANCH.items():
++        relative = f"runtime/interpreter/mterp/{abi}/main.S"
++        source = read(relative)
++        macro = source[source.index(".macro START_EXECUTING_INSTRUCTIONS"):]
++        macro = macro[: macro.index(".endm")]
++        gate = macro.index("g_r0dump_nterp_method_entry_enabled")
++        branch_at = macro.index(branch, gate)
++        call_at = macro.index("nterp_r0dump_method_entry", branch_at)
++        label_at = macro.index("\n8:", branch_at)
++        # Order must be: read flag -> branch-if-disabled -> hook call -> skip label, so a cleared
++        # flag lands control exactly on the label with the hook call jumped over.
++        assert gate < branch_at < call_at < label_at, relative
++        # Everything after the skip label is the unmodified ART method-entry body, and the hook
++        # must not appear again on the disabled fall-through path.
++        body_after_label = macro[label_at:]
++        assert "ART_METHOD_HOTNESS_COUNT_OFFSET" in body_after_label, relative
++        assert "nterp_r0dump_method_entry" not in body_after_label, relative
++
+-- 
+2.43.0
+

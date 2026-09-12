@@ -1,0 +1,114 @@
+From ac0e82b6c01c1999f2633148431ad6606b947915 Mon Sep 17 00:00:00 2001
+From: Ivory <contact@ivory.cafe>
+Date: Tue, 1 Sep 2026 19:29:42 +0800
+Subject: [PATCH 08/21] Filter DexCache names before consuming walk budget
+
+Pass the configured namespace into the ART DexCache bridge so large unrelated class tables cannot exhaust the bounded discovery budget before targeted classes are considered.
+
+Constraint: Preserve the existing loader-scoped bridge and duplicate filtering in Framework.
+Rejected: Raising the per-call class cap for prefixed walks | It increases memory and scan cost without guaranteeing target coverage.
+Confidence: high
+Scope-risk: narrow
+Directive: Keep native prefilters consistent with Framework namespace matching.
+Tested: all art/runtime/r0dump/*source_test.py; py_compile; git diff --check.
+Not-tested: Full ART build and device verification.
+Change-Id: Ia9a7c63beb7571455c0dd3161dbe017944eba060
+---
+ .../native/dalvik_system_r0dump_Runtime.cc    | 22 +++++++++++++++----
+ ...r0dump_f7_class_loader_walk_source_test.py |  3 ++-
+ 2 files changed, 20 insertions(+), 5 deletions(-)
+
+diff --git a/runtime/native/dalvik_system_r0dump_Runtime.cc b/runtime/native/dalvik_system_r0dump_Runtime.cc
+index e48a1ff..45336fd 100644
+--- a/runtime/native/dalvik_system_r0dump_Runtime.cc
++++ b/runtime/native/dalvik_system_r0dump_Runtime.cc
+@@ -491,12 +491,17 @@ static jobjectArray r0dump_Runtime_r0dump_GetCookieClassNames(JNIEnv* env, jclas
+ 
+ static jobjectArray r0dump_Runtime_r0dump_GetDexCacheClassNames(JNIEnv* env,
+                                                                  jclass,
+-                                                                 jobject java_loader) {
++                                                                 jobject java_loader,
++                                                                 jstring java_namespace_prefix) {
+   ScopedObjectAccess soa(env);
+   ObjPtr<mirror::ClassLoader> loader = soa.Decode<mirror::ClassLoader>(java_loader);
+   if (loader == nullptr) {
+     return r0dump_NewStringArray(env, {});
+   }
++  ScopedUtfChars namespace_prefix(env, java_namespace_prefix);
++  if (namespace_prefix.c_str() == nullptr) {
++    return r0dump_NewStringArray(env, {});
++  }
+   const r0dump_ProcessConfig* config = r0dump_GetProcessConfig();
+   const size_t limit = config == nullptr ? 2000u : config->walk_max_classes;
+   std::vector<std::string> names;
+@@ -507,9 +512,14 @@ static jobjectArray r0dump_Runtime_r0dump_GetDexCacheClassNames(JNIEnv* env,
+    public:
+     Visitor(ObjPtr<mirror::ClassLoader> loader,
+             size_t limit,
++            std::string_view namespace_prefix,
+             std::vector<std::string>* names,
+             std::unordered_set<std::string>* seen)
+-        : loader_(loader), limit_(limit), names_(names), seen_(seen) {}
++        : loader_(loader),
++          limit_(limit),
++          namespace_prefix_(namespace_prefix),
++          names_(names),
++          seen_(seen) {}
+ 
+     void Visit(ObjPtr<mirror::DexCache> dex_cache)
+         REQUIRES_SHARED(Locks::dex_lock_, Locks::mutator_lock_) override {
+@@ -525,6 +535,9 @@ static jobjectArray r0dump_Runtime_r0dump_GetDexCacheClassNames(JNIEnv* env,
+       for (uint32_t i = 0; i < dex_file->NumClassDefs() && names_->size() < limit_; ++i) {
+         const std::string name =
+             DescriptorToDot(dex_file->GetClassDescriptor(dex_file->GetClassDef(i)));
++        if (!namespace_prefix_.empty() && name.rfind(namespace_prefix_, 0u) != 0u) {
++          continue;
++        }
+         if (seen_->insert(name).second) {
+           names_->push_back(name);
+         }
+@@ -534,9 +547,10 @@ static jobjectArray r0dump_Runtime_r0dump_GetDexCacheClassNames(JNIEnv* env,
+    private:
+     ObjPtr<mirror::ClassLoader> loader_;
+     size_t limit_;
++    std::string_view namespace_prefix_;
+     std::vector<std::string>* names_;
+     std::unordered_set<std::string>* seen_;
+-  } visitor(loader, limit, &names, &seen);
++  } visitor(loader, limit, namespace_prefix.c_str(), &names, &seen);
+ 
+   ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
+   if (class_linker != nullptr) {
+@@ -1007,7 +1021,7 @@ static JNINativeMethod gMethods[] = {
+         r0dump_Runtime, r0dump_GetCookieClassNames, "(Ljava/lang/Object;)[Ljava/lang/String;"),
+     NATIVE_METHOD(r0dump_Runtime,
+                   r0dump_GetDexCacheClassNames,
+-                  "(Ljava/lang/ClassLoader;)[Ljava/lang/String;"),
++                  "(Ljava/lang/ClassLoader;Ljava/lang/String;)[Ljava/lang/String;"),
+     NATIVE_METHOD(r0dump_Runtime,
+                   r0dump_FindLoadedClass,
+                   "(Ljava/lang/ClassLoader;Ljava/lang/String;)Ljava/lang/Class;"),
+diff --git a/runtime/r0dump/r0dump_f7_class_loader_walk_source_test.py b/runtime/r0dump/r0dump_f7_class_loader_walk_source_test.py
+index 9603fe8..167de7d 100644
+--- a/runtime/r0dump/r0dump_f7_class_loader_walk_source_test.py
++++ b/runtime/r0dump/r0dump_f7_class_loader_walk_source_test.py
+@@ -26,7 +26,7 @@ def r0dump_test_framework_worker() -> None:
+     assert "r0dump_GetRegisteredClassLoaders()" in walk
+     assert "IdentityHashMap<ClassLoader" in walk
+     assert "r0dump_GetDexCookies(loader)" in walk
+-    assert "r0dump_GetDexCacheClassNames(loader)" in walk
++    assert "r0dump_GetDexCacheClassNames(loader, config.walkNamespacePrefix)" in walk
+     assert "r0dump_GetLoadedClassNames(loader)" in walk
+     assert "r0dump_ManifestHelper.r0dump_parse" in walk
+     assert "r0dump_FindLoadedClass(loader, className)" in walk
+@@ -161,6 +161,7 @@ def r0dump_test_libcore_and_art_bridge() -> None:
+         assert name in runtime_native
+     assert "ClassLinker()->GetClassLoaders" in runtime_native
+     assert "GetClassTable()->Visit" in runtime_native
++    assert "namespace_prefix" in runtime_native
+     assert "r0dump_ConvertJavaArrayToDexFiles" in runtime_native
+     assert "kWalkCookieDex" in runtime_native
+     assert "kWalkExecutableMethod" in runtime_native
+-- 
+2.43.0
+

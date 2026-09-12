@@ -1,0 +1,1051 @@
+From 65cb3d031341f89a05769244837975404d11e835 Mon Sep 17 00:00:00 2001
+From: Ivory <contact@ivory.cafe>
+Date: Tue, 1 Sep 2026 19:27:14 +0800
+Subject: [PATCH 07/21] Make Fusion runtime records actionable for export and
+ debugging
+
+Carry object identity through durable records, tighten prepared-directory validation, and expose bounded walk/force diagnostics. Add DexCache namespace discovery so current Fusion can recover classes that are absent from loaded tables without reintroducing old global state.
+
+Constraint: Preserve the existing no-execute capture contract and helper-owned output boundary.
+Rejected: Porting the legacy monolithic dump path | It bypasses current staging and security boundaries.
+Confidence: high
+Scope-risk: moderate
+Directive: Keep future discovery sources bounded and route them through the shared capture pipeline.
+Tested: r0dump_f7_class_loader_walk_source_test.py; r0dump_config_boundary_source_test.py; git diff --check.
+Not-tested: Full ART/AOSP build; lunch release configuration is unavailable in this checkout.
+Change-Id: I1ce439bc30f8bd93245c037dbec8f151ca2d3461
+---
+ .../native/dalvik_system_r0dump_Runtime.cc    | 319 ++++++++++++++++--
+ runtime/r0dump/r0dump_buffer.cc               |   1 +
+ runtime/r0dump/r0dump_buffer.h                |   1 +
+ runtime/r0dump/r0dump_capture.h               |   5 +
+ runtime/r0dump/r0dump_config.cc               |  31 ++
+ runtime/r0dump/r0dump_config.h                |   1 +
+ .../r0dump_config_boundary_source_test.py     |   4 +
+ runtime/r0dump/r0dump_config_test.cc          |  12 +
+ .../r0dump_f2_canonical_output_source_test.py |  12 +-
+ ...r0dump_f7_class_loader_walk_source_test.py |   4 +
+ .../r0dump_f8_force_invoke_source_test.py     |   5 +-
+ runtime/r0dump/r0dump_file.cc                 | 204 +++++++++--
+ 12 files changed, 543 insertions(+), 56 deletions(-)
+
+diff --git a/runtime/native/dalvik_system_r0dump_Runtime.cc b/runtime/native/dalvik_system_r0dump_Runtime.cc
+index 729b77a..e48a1ff 100644
+--- a/runtime/native/dalvik_system_r0dump_Runtime.cc
++++ b/runtime/native/dalvik_system_r0dump_Runtime.cc
+@@ -31,6 +31,7 @@
+ #include <vector>
+ 
+ #include "art_method-inl.h"
++#include "base/mutex.h"
+ #include "base/time_utils.h"
+ #include "class_linker.h"
+ #include "class_table-inl.h"
+@@ -40,6 +41,7 @@
+ #include "handle_scope-inl.h"
+ #include "mirror/class-inl.h"
+ #include "mirror/class_loader.h"
++#include "mirror/dex_cache.h"
+ #include "mirror/object-inl.h"
+ #include "native_util.h"
+ #include "nativehelper/jni_macros.h"
+@@ -47,7 +49,6 @@
+ #include "nativehelper/scoped_utf_chars.h"
+ #include "r0dump/r0dump_capture.h"
+ #include "r0dump/r0dump_config.h"
+-#include "r0dump/r0dump_file.h"
+ #include "r0dump/r0dump_force_invoke.h"
+ #include "r0dump/r0dump_log.h"
+ #include "runtime.h"
+@@ -59,17 +60,81 @@ namespace {
+ std::atomic<uint32_t> g_r0dump_force_invoke_calls{0u};
+ std::atomic<uint64_t> g_r0dump_force_invoke_attempts{0u};
+ std::atomic<bool> g_r0dump_walk_started_logged{false};
++std::atomic<uint64_t> g_r0dump_walk_dex_count{0u};
++std::atomic<uint64_t> g_r0dump_walk_dex_cache_count{0u};
++std::atomic<uint64_t> g_r0dump_walk_class_candidates{0u};
++std::atomic<uint64_t> g_r0dump_walk_classes_loaded{0u};
++std::atomic<uint64_t> g_r0dump_walk_class_resolve_failed{0u};
++std::atomic<uint64_t> g_r0dump_walk_method_candidates{0u};
++std::atomic<uint64_t> g_r0dump_walk_code_items_captured{0u};
++std::atomic<uint64_t> g_r0dump_walk_code_items_rejected{0u};
+ 
+-void r0dump_LogWalkStartedOnce() {
++void r0dump_ResetWalkCounters() {
++  g_r0dump_walk_dex_count.store(0u, std::memory_order_relaxed);
++  g_r0dump_walk_dex_cache_count.store(0u, std::memory_order_relaxed);
++  g_r0dump_walk_class_candidates.store(0u, std::memory_order_relaxed);
++  g_r0dump_walk_classes_loaded.store(0u, std::memory_order_relaxed);
++  g_r0dump_walk_class_resolve_failed.store(0u, std::memory_order_relaxed);
++  g_r0dump_walk_method_candidates.store(0u, std::memory_order_relaxed);
++  g_r0dump_walk_code_items_captured.store(0u, std::memory_order_relaxed);
++  g_r0dump_walk_code_items_rejected.store(0u, std::memory_order_relaxed);
++  g_r0dump_walk_started_logged.store(false, std::memory_order_relaxed);
++}
++
++void r0dump_LogWalkStartedOnce(const r0dump_ProcessConfig* config = nullptr) {
+   bool expected = false;
+   if (g_r0dump_walk_started_logged.compare_exchange_strong(
+           expected, true, std::memory_order_relaxed)) {
++    const std::string run_object = config == nullptr ? "-" : "run:" + std::string(config->run_id);
+     r0dump_Log(r0dump_LogLevel::kInfo,
+                "walk_started",
+-               {{"status", "started"}, {"site", "Walk.inventory"}});
++               {{"status", "started"},
++                {"site", "Walk.inventory"},
++                {"object_kind", "run"},
++                {"object", run_object},
++                {"run_id", config == nullptr ? std::string_view("-") : config->run_id},
++                {"package", config == nullptr ? std::string_view("-") : config->target_package},
++                {"process", config == nullptr ? std::string_view("-") : config->process_name}});
+   }
+ }
+ 
++void r0dump_LogForceEvent(r0dump_LogLevel level,
++                          std::string_view event,
++                          std::string_view status,
++                          std::string_view site,
++                          const r0dump_ProcessConfig& config,
++                          std::string_view class_name,
++                          ArtMethod* method,
++                          uint64_t attempt_id,
++                          std::string_view class_init_status,
++                          std::string_view materialize_status,
++                          std::string_view selector_source) REQUIRES_SHARED(Locks::mutator_lock_) {
++  const std::string method_name = method == nullptr ? "-" : std::string(method->GetNameView());
++  const std::string descriptor = method == nullptr ? "-" : method->GetSignature().ToString();
++  const std::string object =
++      method == nullptr ? "class:" + std::string(class_name)
++                        : "method:" + std::string(class_name) + "#" + method_name + descriptor;
++  const std::string attempt = std::to_string(attempt_id);
++  r0dump_Log(level,
++             event,
++             {{"status", status},
++              {"site", site},
++              {"object_kind", method == nullptr ? "class" : "method"},
++              {"object", object},
++              {"package", config.target_package},
++              {"process", config.process_name},
++              {"run_id", config.run_id},
++              {"class", class_name},
++              {"method", method_name},
++              {"descriptor", descriptor},
++              {"attempt_id", attempt},
++              {"selector_source", selector_source},
++              {"class_init_status", class_init_status},
++              {"materialize_status", materialize_status},
++              {"dispatch_status", "suppressed_before_dispatch"},
++              {"capture_role", "force_materialize"}});
++}
++
+ struct r0dump_JavaRoute final {
+   r0dump_Point point;
+   const char* site;
+@@ -133,9 +198,17 @@ bool r0dump_ToUint32(jlong value, uint32_t* result) {
+ }
+ 
+ void r0dump_LogRejected(std::string_view field) {
++  Runtime* runtime = Runtime::Current();
++  const std::string package = runtime == nullptr ? "-" : runtime->GetProcessPackageName();
+   r0dump_Log(r0dump_LogLevel::kWarn,
+              "config_rejected",
+-             {{"status", "invalid"}, {"site", "AT.bind.configure"}, {"field", field}});
++             {{"status", "invalid"},
++              {"site", "AT.bind.configure"},
++              {"object_kind", "run"},
++              {"object", "run:-"},
++              {"package", package},
++              {"process", "-"},
++              {"field", field}});
+ }
+ 
+ std::string_view r0dump_SourceKind(jint source_id) {
+@@ -146,6 +219,8 @@ std::string_view r0dump_SourceKind(jint source_id) {
+       return "loaded_class_table";
+     case 2:
+       return "manifest_seed";
++    case 3:
++      return "dex_cache_class_list";
+     default:
+       return "unknown";
+   }
+@@ -204,6 +279,7 @@ static jboolean r0dump_Runtime_r0dump_configureNative(JNIEnv* env,
+                                                       jboolean walk_enabled,
+                                                       jint walk_start,
+                                                       jint walk_mode,
++                                                      jstring java_walk_namespace_prefix,
+                                                       jlong walk_delay_ms,
+                                                       jlong walk_max_classes,
+                                                       jlong walk_max_methods,
+@@ -221,13 +297,15 @@ static jboolean r0dump_Runtime_r0dump_configureNative(JNIEnv* env,
+   ScopedUtfChars target_process(env, java_target_process);
+   ScopedUtfChars process_name(env, java_process_name);
+   ScopedUtfChars output_parent(env, java_output_parent);
++  ScopedUtfChars walk_namespace_prefix(env, java_walk_namespace_prefix);
+   ScopedUtfChars force_class(env, java_force_class);
+   ScopedUtfChars force_method(env, java_force_method);
+   ScopedUtfChars force_method_descriptor(env, java_force_method_descriptor);
+   if (run_id.c_str() == nullptr || target_package.c_str() == nullptr ||
+       target_process.c_str() == nullptr || process_name.c_str() == nullptr ||
+       output_parent.c_str() == nullptr || force_class.c_str() == nullptr ||
+-      force_method.c_str() == nullptr || force_method_descriptor.c_str() == nullptr) {
++      walk_namespace_prefix.c_str() == nullptr || force_method.c_str() == nullptr ||
++      force_method_descriptor.c_str() == nullptr) {
+     r0dump_LogRejected("strings");
+     return JNI_FALSE;
+   }
+@@ -276,6 +354,7 @@ static jboolean r0dump_Runtime_r0dump_configureNative(JNIEnv* env,
+   }
+   config.walk_start = static_cast<r0dump_WalkStart>(walk_start);
+   config.walk_mode = static_cast<r0dump_WalkMode>(walk_mode);
++  config.walk_namespace_prefix = walk_namespace_prefix.c_str();
+ 
+   Runtime* runtime = Runtime::Current();
+   if (runtime == nullptr || runtime->GetProcessPackageName() != config.target_package) {
+@@ -300,15 +379,27 @@ static jboolean r0dump_Runtime_r0dump_configureNative(JNIEnv* env,
+     r0dump_LogRejected(error.field == nullptr ? "config" : error.field);
+     return JNI_FALSE;
+   }
++  r0dump_ResetWalkCounters();
+   r0dump_InitializeCaptureFlushRun(NanoTime());
++  const r0dump_ProcessConfig* active_config = r0dump_GetProcessConfig();
++  const std::string run_object =
++      active_config == nullptr ? "-" : "run:" + std::string(active_config->run_id);
+   r0dump_Log(r0dump_LogLevel::kInfo,
+              "config_loaded",
+-             {{"status", "enabled"}, {"site", "AT.bind.configure"}});
++             {{"status", "enabled"},
++              {"site", "AT.bind.configure"},
++              {"object_kind", "run"},
++              {"object", run_object},
++              {"run_id", active_config == nullptr ? std::string_view("-") : active_config->run_id},
++              {"package",
++               active_config == nullptr ? std::string_view("-") : active_config->target_package},
++              {"process",
++               active_config == nullptr ? std::string_view("-") : active_config->process_name}});
+   return JNI_TRUE;
+ }
+ 
+ static jobjectArray r0dump_Runtime_r0dump_GetRegisteredClassLoaders(JNIEnv* env, jclass) {
+-  r0dump_LogWalkStartedOnce();
++  r0dump_LogWalkStartedOnce(r0dump_GetProcessConfig());
+   ScopedObjectAccess soa(env);
+   VariableSizedHandleScope loaders(soa.Self());
+   Runtime::Current()->GetClassLinker()->GetClassLoaders(soa.Self(), &loaders);
+@@ -363,6 +454,7 @@ static jobjectArray r0dump_Runtime_r0dump_GetLoadedClassNames(JNIEnv* env,
+     std::string descriptor_storage;
+     names.push_back(DescriptorToDot(klass->GetDescriptor(&descriptor_storage)));
+   }
++  g_r0dump_walk_classes_loaded.fetch_add(names.size(), std::memory_order_relaxed);
+   return r0dump_NewStringArray(env, names);
+ }
+ 
+@@ -392,6 +484,66 @@ static jobjectArray r0dump_Runtime_r0dump_GetCookieClassNames(JNIEnv* env, jclas
+       break;
+     }
+   }
++  g_r0dump_walk_class_candidates.fetch_add(names.size(), std::memory_order_relaxed);
++  g_r0dump_walk_dex_count.fetch_add(dex_files.size(), std::memory_order_relaxed);
++  return r0dump_NewStringArray(env, names);
++}
++
++static jobjectArray r0dump_Runtime_r0dump_GetDexCacheClassNames(JNIEnv* env,
++                                                                 jclass,
++                                                                 jobject java_loader) {
++  ScopedObjectAccess soa(env);
++  ObjPtr<mirror::ClassLoader> loader = soa.Decode<mirror::ClassLoader>(java_loader);
++  if (loader == nullptr) {
++    return r0dump_NewStringArray(env, {});
++  }
++  const r0dump_ProcessConfig* config = r0dump_GetProcessConfig();
++  const size_t limit = config == nullptr ? 2000u : config->walk_max_classes;
++  std::vector<std::string> names;
++  std::unordered_set<std::string> seen;
++  names.reserve(std::min(limit, static_cast<size_t>(256u)));
++
++  class Visitor final : public DexCacheVisitor {
++   public:
++    Visitor(ObjPtr<mirror::ClassLoader> loader,
++            size_t limit,
++            std::vector<std::string>* names,
++            std::unordered_set<std::string>* seen)
++        : loader_(loader), limit_(limit), names_(names), seen_(seen) {}
++
++    void Visit(ObjPtr<mirror::DexCache> dex_cache)
++        REQUIRES_SHARED(Locks::dex_lock_, Locks::mutator_lock_) override {
++      if (names_->size() >= limit_ || dex_cache == nullptr ||
++          dex_cache->GetClassLoader() != loader_) {
++        return;
++      }
++      const DexFile* dex_file = dex_cache->GetDexFile();
++      if (dex_file == nullptr) {
++        return;
++      }
++      g_r0dump_walk_dex_cache_count.fetch_add(1u, std::memory_order_relaxed);
++      for (uint32_t i = 0; i < dex_file->NumClassDefs() && names_->size() < limit_; ++i) {
++        const std::string name =
++            DescriptorToDot(dex_file->GetClassDescriptor(dex_file->GetClassDef(i)));
++        if (seen_->insert(name).second) {
++          names_->push_back(name);
++        }
++      }
++    }
++
++   private:
++    ObjPtr<mirror::ClassLoader> loader_;
++    size_t limit_;
++    std::vector<std::string>* names_;
++    std::unordered_set<std::string>* seen_;
++  } visitor(loader, limit, &names, &seen);
++
++  ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
++  if (class_linker != nullptr) {
++    ReaderMutexLock mu(soa.Self(), *Locks::dex_lock_);
++    class_linker->VisitDexCaches(&visitor);
++  }
++  g_r0dump_walk_class_candidates.fetch_add(names.size(), std::memory_order_relaxed);
+   return r0dump_NewStringArray(env, names);
+ }
+ 
+@@ -408,7 +560,11 @@ static jclass r0dump_Runtime_r0dump_FindLoadedClass(JNIEnv* env,
+   const std::string descriptor = DotToDescriptor(name.c_str());
+   ObjPtr<mirror::Class> klass =
+       Runtime::Current()->GetClassLinker()->LookupClass(soa.Self(), descriptor, loader);
+-  return klass != nullptr && klass->IsResolved() ? soa.AddLocalReference<jclass>(klass) : nullptr;
++  if (klass == nullptr || !klass->IsResolved()) {
++    g_r0dump_walk_class_resolve_failed.fetch_add(1u, std::memory_order_relaxed);
++    return nullptr;
++  }
++  return soa.AddLocalReference<jclass>(klass);
+ }
+ 
+ static void r0dump_Runtime_r0dump_CaptureCookie(JNIEnv* env,
+@@ -498,6 +654,7 @@ static void r0dump_Runtime_r0dump_CaptureExecutable(JNIEnv* env,
+   }
+   const std::optional<uint32_t> class_def_index =
+       method->IsProxyMethod() ? std::nullopt : std::optional<uint32_t>(method->GetClassDefIndex());
++  g_r0dump_walk_method_candidates.fetch_add(1u, std::memory_order_relaxed);
+   r0dump_PreparedCodeItem prepared;
+   if (r0dump_TryPrepareCodeItem(r0dump_Point::kWalkExecutableMethod,
+                                 "Walk.executable.method",
+@@ -509,6 +666,7 @@ static void r0dump_Runtime_r0dump_CaptureExecutable(JNIEnv* env,
+                                 method->GetDeclaringClass()->IsInitialized(),
+                                 false,
+                                 &prepared) != r0dump_CaptureStatus::kSubmitted) {
++    g_r0dump_walk_code_items_rejected.fetch_add(1u, std::memory_order_relaxed);
+     return;
+   }
+   ScopedUtfChars class_name(env, java_class_name);
+@@ -520,6 +678,7 @@ static void r0dump_Runtime_r0dump_CaptureExecutable(JNIEnv* env,
+   prepared.method_descriptor = method->GetSignature().ToString();
+   prepared.source_kind = r0dump_SourceKind(source_id);
+   r0dump_SubmitPreparedCodeItem(std::move(prepared));
++  g_r0dump_walk_code_items_captured.fetch_add(1u, std::memory_order_relaxed);
+ }
+ 
+ static jboolean r0dump_Runtime_r0dump_ForceInvoke(
+@@ -555,45 +714,95 @@ static jboolean r0dump_Runtime_r0dump_ForceInvoke(
+     return JNI_FALSE;
+   }
+ 
++  const std::string_view selector_source =
++      config->force_class.empty() ? "manifest_namespace" : "exact";
++  const uint64_t attempt_id =
++      g_r0dump_force_invoke_attempts.fetch_add(1u, std::memory_order_relaxed) + 1u;
++
+   StackHandleScope<1> hs(soa.Self());
+   Handle<mirror::Class> declaring_class = hs.NewHandle(method->GetDeclaringClass());
+-  r0dump_Log(r0dump_LogLevel::kInfo,
+-             "class_init_started",
+-             {{"status", "started"}, {"site", "ForceInvoke.request"}});
++  r0dump_LogForceEvent(r0dump_LogLevel::kInfo,
++                       "class_init_started",
++                       "started",
++                       "ForceInvoke.request",
++                       *config,
++                       class_name.c_str(),
++                       method,
++                       attempt_id,
++                       "pending",
++                       "not_started",
++                       selector_source);
+   if (!Runtime::Current()->GetClassLinker()->EnsureInitialized(
+           soa.Self(), declaring_class, true, true) ||
+       !declaring_class->IsInitialized()) {
+     if (soa.Self()->IsExceptionPending()) {
+       soa.Self()->ClearException();
+     }
+-    r0dump_Log(r0dump_LogLevel::kWarn,
+-               "class_init_exception",
+-               {{"status", "class_initialization_failed"}, {"site", "ForceInvoke.request"}});
++    r0dump_LogForceEvent(r0dump_LogLevel::kWarn,
++                         "class_init_exception",
++                         "class_initialization_failed",
++                         "ForceInvoke.request",
++                         *config,
++                         class_name.c_str(),
++                         method,
++                         attempt_id,
++                         "failed",
++                         "not_started",
++                         selector_source);
+     return JNI_FALSE;
+   }
+-  r0dump_Log(r0dump_LogLevel::kInfo,
+-             "class_init_completed",
+-             {{"status", "initialized"}, {"site", "ForceInvoke.request"}});
++  r0dump_LogForceEvent(r0dump_LogLevel::kInfo,
++                       "class_init_completed",
++                       "initialized",
++                       "ForceInvoke.request",
++                       *config,
++                       class_name.c_str(),
++                       method,
++                       attempt_id,
++                       "initialized",
++                       "not_started",
++                       selector_source);
+ 
+-  const uint64_t attempt_id =
+-      g_r0dump_force_invoke_attempts.fetch_add(1u, std::memory_order_relaxed) + 1u;
+-  r0dump_Log(r0dump_LogLevel::kInfo,
+-             "materialize_started",
+-             {{"status", "started"}, {"site", "ForceInvoke.no_execute"}});
++  r0dump_LogForceEvent(r0dump_LogLevel::kInfo,
++                       "materialize_started",
++                       "started",
++                       "ForceInvoke.no_execute",
++                       *config,
++                       class_name.c_str(),
++                       method,
++                       attempt_id,
++                       "initialized",
++                       "started",
++                       selector_source);
+   r0dump_ForceInvokeAttempt attempt(method, attempt_id);
+   if (!attempt.r0dump_Entered()) {
+-    r0dump_Log(r0dump_LogLevel::kWarn,
+-               "materialize_rejected",
+-               {{"status", "guard_rejected"}, {"site", "ForceInvoke.no_execute"}});
++    r0dump_LogForceEvent(r0dump_LogLevel::kWarn,
++                         "materialize_rejected",
++                         "guard_rejected",
++                         "ForceInvoke.no_execute",
++                         *config,
++                         class_name.c_str(),
++                         method,
++                         attempt_id,
++                         "initialized",
++                         "rejected",
++                         selector_source);
+     return JNI_FALSE;
+   }
+   JValue result;
+   method->Invoke(nullptr, nullptr, 0u, &result, method->GetShorty());
+   const bool captured = attempt.r0dump_WasCaptured();
+-  r0dump_Log(
+-      captured ? r0dump_LogLevel::kInfo : r0dump_LogLevel::kWarn,
+-      captured ? "materialize_captured" : "materialize_rejected",
+-      {{"status", captured ? "captured" : "not_captured"}, {"site", "ForceInvoke.no_execute"}});
++  r0dump_LogForceEvent(captured ? r0dump_LogLevel::kInfo : r0dump_LogLevel::kWarn,
++                       captured ? "materialize_captured" : "materialize_rejected",
++                       captured ? "captured" : "not_captured",
++                       "ForceInvoke.no_execute",
++                       *config,
++                       class_name.c_str(),
++                       method,
++                       attempt_id,
++                       "initialized",
++                       captured ? "captured" : "rejected",
++                       selector_source);
+   return captured ? JNI_TRUE : JNI_FALSE;
+ }
+ 
+@@ -613,8 +822,8 @@ static jboolean r0dump_Runtime_r0dump_PublishManifestSnapshot(JNIEnv* env,
+                                                               jint rejected_source_count,
+                                                               jint xml_event_count,
+                                                               jstring java_limit_hit) {
+-  r0dump_LogWalkStartedOnce();
+   const r0dump_ProcessConfig* config = r0dump_GetProcessConfig();
++  r0dump_LogWalkStartedOnce(config);
+   if (java_status == nullptr || java_class_names == nullptr || java_seed_kinds == nullptr ||
+       java_source_ordinals == nullptr || java_source_kinds == nullptr ||
+       java_source_statuses == nullptr || java_source_event_counts == nullptr ||
+@@ -725,18 +934,57 @@ static jboolean r0dump_Runtime_r0dump_PublishManifestSnapshot(JNIEnv* env,
+     snapshot.seeds.push_back(
+         {class_name.c_str(), seed_kind.c_str(), static_cast<uint32_t>(source_ordinals[index])});
+   }
+-  return r0dump_PublishCaptureManifestSnapshot(std::move(snapshot)) ? JNI_TRUE : JNI_FALSE;
++  const std::string manifest_status = snapshot.status;
++  const std::string manifest_package = snapshot.package_name;
++  const std::string source_count_string = std::to_string(snapshot.source_count);
++  const std::string parsed_source_count_string = std::to_string(snapshot.parsed_source_count);
++  const std::string rejected_source_count_string = std::to_string(snapshot.rejected_source_count);
++  const std::string xml_event_count_string = std::to_string(snapshot.xml_event_count);
++  const std::string seed_count_string = std::to_string(snapshot.seeds.size());
++  const std::string log_limit_hit = snapshot.limit_hit.empty() ? "-" : snapshot.limit_hit;
++  const bool published = r0dump_PublishCaptureManifestSnapshot(std::move(snapshot));
++  const std::string run_object = "run:" + config->run_id;
++  r0dump_Log(published ? r0dump_LogLevel::kInfo : r0dump_LogLevel::kWarn,
++             "manifest_published",
++             {{"status", published ? manifest_status : "write_failed"},
++              {"site", "Manifest.snapshot"},
++              {"object_kind", "run"},
++              {"object", run_object},
++              {"run_id", config->run_id},
++              {"package", manifest_package},
++              {"process", config->process_name},
++              {"source_count", source_count_string},
++              {"parsed_source_count", parsed_source_count_string},
++              {"rejected_source_count", rejected_source_count_string},
++              {"xml_event_count", xml_event_count_string},
++              {"seed_count", seed_count_string},
++              {"limit_hit", log_limit_hit}});
++  return published ? JNI_TRUE : JNI_FALSE;
+ }
+ 
+ static jboolean r0dump_Runtime_r0dump_CompleteWalk(JNIEnv*, jclass, jboolean bootstrap_completed) {
+   const r0dump_ProcessConfig* config = r0dump_GetProcessConfig();
+   if (config != nullptr &&
+       (config->manifest_enabled || config->walk_enabled || config->force_invoke_enabled)) {
+-    r0dump_LogWalkStartedOnce();
++    r0dump_LogWalkStartedOnce(config);
++    const std::string run_object = "run:" + config->run_id;
+     r0dump_Log(r0dump_LogLevel::kInfo,
+                "walk_completed",
+                {{"status", bootstrap_completed == JNI_TRUE ? "complete" : "failed"},
+-                {"site", "Walk.inventory"}});
++                {"site", "Walk.inventory"},
++                {"object_kind", "run"},
++                {"object", run_object},
++                {"run_id", config->run_id},
++                {"package", config->target_package},
++                {"process", config->process_name},
++                {"dex_count", std::to_string(g_r0dump_walk_dex_count.load())},
++                {"dex_cache_count", std::to_string(g_r0dump_walk_dex_cache_count.load())},
++                {"class_candidates", std::to_string(g_r0dump_walk_class_candidates.load())},
++                {"classes_loaded", std::to_string(g_r0dump_walk_classes_loaded.load())},
++                {"class_resolve_failed", std::to_string(g_r0dump_walk_class_resolve_failed.load())},
++                {"method_candidates", std::to_string(g_r0dump_walk_method_candidates.load())},
++                {"code_items_captured", std::to_string(g_r0dump_walk_code_items_captured.load())},
++                {"code_items_rejected", std::to_string(g_r0dump_walk_code_items_rejected.load())}});
+   }
+   r0dump_CompleteCaptureBootstrapInventory(bootstrap_completed == JNI_TRUE);
+   return r0dump_RequestCaptureFlush(true) ? JNI_TRUE : JNI_FALSE;
+@@ -750,13 +998,16 @@ static JNINativeMethod gMethods[] = {
+     NATIVE_METHOD(r0dump_Runtime,
+                   r0dump_configureNative,
+                   "(IZLjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;"
+-                  "Ljava/lang/String;IJJJJJJJJJZZJJJJJJZIIJJJZLjava/lang/String;Ljava/lang/String;"
++                  "Ljava/lang/String;IJJJJJJJJJZZJJJJJJZIILjava/lang/String;JJJZLjava/lang/String;Ljava/lang/String;"
+                   "Ljava/lang/String;J)Z"),
+     NATIVE_METHOD(r0dump_Runtime, r0dump_GetRegisteredClassLoaders, "()[Ljava/lang/ClassLoader;"),
+     NATIVE_METHOD(
+         r0dump_Runtime, r0dump_GetLoadedClassNames, "(Ljava/lang/ClassLoader;)[Ljava/lang/String;"),
+     NATIVE_METHOD(
+         r0dump_Runtime, r0dump_GetCookieClassNames, "(Ljava/lang/Object;)[Ljava/lang/String;"),
++    NATIVE_METHOD(r0dump_Runtime,
++                  r0dump_GetDexCacheClassNames,
++                  "(Ljava/lang/ClassLoader;)[Ljava/lang/String;"),
+     NATIVE_METHOD(r0dump_Runtime,
+                   r0dump_FindLoadedClass,
+                   "(Ljava/lang/ClassLoader;Ljava/lang/String;)Ljava/lang/Class;"),
+diff --git a/runtime/r0dump/r0dump_buffer.cc b/runtime/r0dump/r0dump_buffer.cc
+index 417cc97..5748dde 100644
+--- a/runtime/r0dump/r0dump_buffer.cc
++++ b/runtime/r0dump/r0dump_buffer.cc
+@@ -694,6 +694,7 @@ r0dump_SubmitResult r0dump_Staging::r0dump_SubmitCodeItem(
+     return r0dump_finish(r0dump_SubmitStatus::kRecordLimit);
+   }
+   record_metadata.method_index = key.method_index;
++  record_metadata.code_item_offset = key.code_offset;
+   record_metadata.code_item_size = key.code_size;
+   record_metadata.class_name = metadata.class_name;
+   record_metadata.method_name = metadata.method_name;
+diff --git a/runtime/r0dump/r0dump_buffer.h b/runtime/r0dump/r0dump_buffer.h
+index b53f8c4..3b1dda5 100644
+--- a/runtime/r0dump/r0dump_buffer.h
++++ b/runtime/r0dump/r0dump_buffer.h
+@@ -178,6 +178,7 @@ struct r0dump_RecordMetadata final {
+   std::optional<bool> source_in_memory;
+   std::optional<uint32_t> class_def_index;
+   std::optional<uint32_t> method_index;
++  std::optional<uint32_t> code_item_offset;
+   std::optional<uint64_t> code_item_size;
+   std::string class_name;
+   std::string method_name;
+diff --git a/runtime/r0dump/r0dump_capture.h b/runtime/r0dump/r0dump_capture.h
+index 928436c..befe322 100644
+--- a/runtime/r0dump/r0dump_capture.h
++++ b/runtime/r0dump/r0dump_capture.h
+@@ -304,6 +304,11 @@ r0dump_CaptureStatus r0dump_PrepareCodeItem(r0dump_BufferPool& pool,
+ r0dump_CaptureResult r0dump_SubmitPreparedCodeItem(r0dump_Staging& staging,
+                                                    r0dump_PreparedCodeItem&& prepared);
+ 
++// Validates the framework-delivered prepared run directory before capture is enabled. The file
++// module owns the implementation; this declaration is kept in the capture facade so JNI setup
++// does not depend on the writer header.
++bool r0dump_IsPreparedRunDirectory(int fd);
++
+ }  // namespace art HIDDEN
+ 
+ #endif  // ART_RUNTIME_R0DUMP_R0DUMP_CAPTURE_H_
+diff --git a/runtime/r0dump/r0dump_config.cc b/runtime/r0dump/r0dump_config.cc
+index bc4339c..f5fa009 100644
+--- a/runtime/r0dump/r0dump_config.cc
++++ b/runtime/r0dump/r0dump_config.cc
+@@ -150,6 +150,31 @@ bool r0dump_IsBinaryClassName(std::string_view value) {
+   return true;
+ }
+ 
++bool r0dump_IsNamespacePrefix(std::string_view value) {
++  if (value.empty() || value.size() > kR0dumpPropertyValueBytesHardLimit || value.back() != '.') {
++    return false;
++  }
++  const std::string_view body = value.substr(0u, value.size() - 1u);
++  size_t start = 0u;
++  while (start < body.size()) {
++    const size_t end = body.find('.', start);
++    const size_t length = (end == std::string_view::npos ? body.size() : end) - start;
++    const std::string_view segment = body.substr(start, length);
++    if (segment.empty() || !(r0dump_IsAsciiAlpha(segment.front()) || segment.front() == '_' ||
++                             segment.front() == '$') ||
++        !std::all_of(segment.begin() + 1u, segment.end(), [](char ch) {
++          return r0dump_IsAsciiAlpha(ch) || r0dump_IsAsciiDigit(ch) || ch == '_' || ch == '$';
++        })) {
++      return false;
++    }
++    if (end == std::string_view::npos) {
++      break;
++    }
++    start = end + 1u;
++  }
++  return true;
++}
++
+ bool r0dump_IsMethodName(std::string_view value) {
+   if (value.empty() || value.size() > kR0dumpPropertyValueBytesHardLimit) {
+     return false;
+@@ -292,6 +317,12 @@ bool r0dump_ValidateConfig(const r0dump_ProcessConfig& config, r0dump_ConfigErro
+     r0dump_SetError(error, r0dump_ConfigErrorCode::kInvalidWalkSelector, "walk_selector");
+     return false;
+   }
++  if (!config.walk_namespace_prefix.empty() &&
++      !r0dump_IsNamespacePrefix(config.walk_namespace_prefix)) {
++    r0dump_SetError(error, r0dump_ConfigErrorCode::kInvalidWalkSelector,
++                    "walk_namespace_prefix");
++    return false;
++  }
+   if (config.walk_max_classes == 0u || config.walk_max_classes > kR0dumpWalkClassesHardLimit ||
+       config.walk_max_methods == 0u || config.walk_max_methods > kR0dumpWalkMethodsHardLimit) {
+     r0dump_SetError(error, r0dump_ConfigErrorCode::kInvalidWalkLimit, "walk_limits");
+diff --git a/runtime/r0dump/r0dump_config.h b/runtime/r0dump/r0dump_config.h
+index 5658cde..2d5706a 100644
+--- a/runtime/r0dump/r0dump_config.h
++++ b/runtime/r0dump/r0dump_config.h
+@@ -117,6 +117,7 @@ struct r0dump_ProcessConfig {
+   bool walk_enabled = false;
+   r0dump_WalkStart walk_start = r0dump_WalkStart::kAfterApplicationOnCreate;
+   r0dump_WalkMode walk_mode = r0dump_WalkMode::kLoadedOnly;
++  std::string walk_namespace_prefix;
+   uint32_t walk_delay_ms = 5000u;
+   uint32_t walk_max_classes = 2000u;
+   uint32_t walk_max_methods = 20000u;
+diff --git a/runtime/r0dump/r0dump_config_boundary_source_test.py b/runtime/r0dump/r0dump_config_boundary_source_test.py
+index 65d71cd..2d99c1f 100644
+--- a/runtime/r0dump/r0dump_config_boundary_source_test.py
++++ b/runtime/r0dump/r0dump_config_boundary_source_test.py
+@@ -63,6 +63,10 @@ def r0dump_assert_limit_forwarding() -> None:
+         assert libcore.count(camel) >= 3, camel
+         assert snake in native, snake
+         assert snake in snapshot, snake
++    assert '"walk_namespace_prefix"' in framework
++    assert "walkNamespacePrefix" in framework
++    assert "walk_namespace_prefix" in native
++    assert "walk_namespace_prefix" in snapshot
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/runtime/r0dump/r0dump_config_test.cc b/runtime/r0dump/r0dump_config_test.cc
+index b070004..6c30fae 100644
+--- a/runtime/r0dump/r0dump_config_test.cc
++++ b/runtime/r0dump/r0dump_config_test.cc
+@@ -110,6 +110,18 @@ TEST(r0dump_ConfigTest, RejectsPathLikeIdentityFields) {
+   EXPECT_TRUE(r0dump_ValidateConfig(config, nullptr));
+ }
+ 
++TEST(r0dump_ConfigTest, NamespacePrefixIsExplicitAndSegmentBounded) {
++  r0dump_ProcessConfig config = r0dump_ValidConfig();
++  config.walk_namespace_prefix = "com.example.ui.";
++  EXPECT_TRUE(r0dump_ValidateConfig(config, nullptr));
++
++  config.walk_namespace_prefix = "com.example.ui";
++  r0dump_ConfigError error;
++  EXPECT_FALSE(r0dump_ValidateConfig(config, &error));
++  EXPECT_EQ(error.code, r0dump_ConfigErrorCode::kInvalidWalkSelector);
++  EXPECT_STREQ(error.field, "walk_namespace_prefix");
++}
++
+ TEST(r0dump_ConfigTest, AcceptsOnlyCanonicalOutputParent) {
+   r0dump_ProcessConfig config = r0dump_ValidConfig();
+   config.output_parent = r0dump_OutputParent("com.other.target");
+diff --git a/runtime/r0dump/r0dump_f2_canonical_output_source_test.py b/runtime/r0dump/r0dump_f2_canonical_output_source_test.py
+index 5dd6d0e..385b1d9 100644
+--- a/runtime/r0dump/r0dump_f2_canonical_output_source_test.py
++++ b/runtime/r0dump/r0dump_f2_canonical_output_source_test.py
+@@ -1,4 +1,4 @@
+-#!/usr/bin/env python3
++#!/ usr / bin / env python3
+ 
+ from pathlib import Path
+ 
+@@ -87,6 +87,16 @@ def r0dump_test_worker_owns_capture_lifecycle_logging() -> None:
+         '"run_completed"',
+     ):
+         assert event in source
++    for field in (
++        '"object_kind"',
++        '"object"',
++        '"dex_format"',
++        '"checksum"',
++        '"source_in_memory"',
++        '"code_item_offset"',
++        '"artifact_id"',
++    ):
++        assert field in source
+     for hook in (
+         "art/runtime/art_method.cc",
+         "art/runtime/class_linker.cc",
+diff --git a/runtime/r0dump/r0dump_f7_class_loader_walk_source_test.py b/runtime/r0dump/r0dump_f7_class_loader_walk_source_test.py
+index 0daa5a7..9603fe8 100644
+--- a/runtime/r0dump/r0dump_f7_class_loader_walk_source_test.py
++++ b/runtime/r0dump/r0dump_f7_class_loader_walk_source_test.py
+@@ -26,6 +26,7 @@ def r0dump_test_framework_worker() -> None:
+     assert "r0dump_GetRegisteredClassLoaders()" in walk
+     assert "IdentityHashMap<ClassLoader" in walk
+     assert "r0dump_GetDexCookies(loader)" in walk
++    assert "r0dump_GetDexCacheClassNames(loader)" in walk
+     assert "r0dump_GetLoadedClassNames(loader)" in walk
+     assert "r0dump_ManifestHelper.r0dump_parse" in walk
+     assert "r0dump_FindLoadedClass(loader, className)" in walk
+@@ -61,6 +62,8 @@ def r0dump_test_framework_worker() -> None:
+     assert manifest_gate < manifest_parse < manifest_else
+     assert "HashSet<String>" in walk
+     assert "!state.r0dump_markClass(loader, className)" in walk
++    assert "r0dump_matchesConfiguredNamespace" in walk
++    assert "r0dump_SOURCE_DEX_CACHE" in walk
+ 
+ 
+ def r0dump_test_passive_only_request_starts_the_single_worker() -> None:
+@@ -146,6 +149,7 @@ def r0dump_test_libcore_and_art_bridge() -> None:
+         "r0dump_GetRegisteredClassLoaders",
+         "r0dump_GetLoadedClassNames",
+         "r0dump_GetCookieClassNames",
++        "r0dump_GetDexCacheClassNames",
+         "r0dump_FindLoadedClass",
+         "r0dump_CaptureCookie",
+         "r0dump_CaptureExecutable",
+diff --git a/runtime/r0dump/r0dump_f8_force_invoke_source_test.py b/runtime/r0dump/r0dump_f8_force_invoke_source_test.py
+index f41b8ed..b008bbf 100644
+--- a/runtime/r0dump/r0dump_f8_force_invoke_source_test.py
++++ b/runtime/r0dump/r0dump_f8_force_invoke_source_test.py
+@@ -67,7 +67,10 @@ def r0dump_test_native_initialization_and_sentinel() -> None:
+         '"materialize_rejected"',
+     ):
+         assert event in force
+-    assert "class_name.c_str()" not in force[force.index("class_init_started") :]
++    assert "r0dump_LogForceEvent" in force
++    assert '"dispatch_status"' in runtime_native
++    assert '"selector_source"' in runtime_native
++    assert '"attempt_id"' in runtime_native
+ 
+     art_method = r0dump_read("art/runtime/art_method.cc")
+     invoke = art_method.split("void ArtMethod::Invoke", 1)[1]
+diff --git a/runtime/r0dump/r0dump_file.cc b/runtime/r0dump/r0dump_file.cc
+index 2b5c4ce..1c90e90 100644
+--- a/runtime/r0dump/r0dump_file.cc
++++ b/runtime/r0dump/r0dump_file.cc
+@@ -73,6 +73,9 @@ bool g_r0dump_flush_degraded = false;
+ uint64_t g_r0dump_start_monotonic_ns = 0u;
+ std::string g_r0dump_manifest_status;
+ std::string g_r0dump_bootstrap_inventory_status = "pending";
++std::string g_r0dump_log_run_id;
++std::string g_r0dump_log_package;
++std::string g_r0dump_log_process;
+ 
+ r0dump_FileResult r0dump_Success() { return {.ok = true}; }
+ 
+@@ -267,29 +270,164 @@ std::string_view r0dump_RecordStatusName(r0dump_RecordStatus status) {
+   return {};
+ }
+ 
+-void r0dump_LogDurableRecord(const r0dump_PendingRecord& record) {
++std::string r0dump_HexHash(uint64_t hash);
++
++std::string_view r0dump_LogValue(std::string_view value) {
++  return value.empty() ? std::string_view("-") : value;
++}
++
++template <typename T>
++std::string r0dump_LogOptionalNumber(const std::optional<T>& value) {
++  return value.has_value() ? std::to_string(*value) : "-";
++}
++
++std::string r0dump_LogOptionalBool(const std::optional<bool>& value) {
++  return value.has_value() ? (*value ? "true" : "false") : "-";
++}
++
++struct r0dump_RecordLogValues final {
++  std::string sequence;
++  std::string thread_id;
++  std::string process_id;
++  std::string monotonic_ns;
++  std::string dex_object_id;
++  std::string location_hash;
++  std::string checksum;
++  std::string declared_size;
++  std::string data_size;
++  std::string container_size;
++  std::string source_ordinal;
++  std::string source_count;
++  std::string source_in_memory;
++  std::string class_def_index;
++  std::string method_index;
++  std::string code_item_offset;
++  std::string code_item_size;
++  std::string artifact_id;
++  std::string object;
++};
++
++void r0dump_LogRecordEvent(r0dump_LogLevel level,
++                           std::string_view event,
++                           std::string_view status,
++                           const r0dump_PendingRecord& record,
++                           const r0dump_ArtifactReference* artifact,
++                           std::string_view run_id,
++                           uint32_t pid) {
++  const std::unique_ptr<r0dump_RecordLogValues> values = std::make_unique<r0dump_RecordLogValues>();
++  values->sequence = std::to_string(record.sequence);
++  values->thread_id = std::to_string(record.tid);
++  values->process_id = std::to_string(pid);
++  values->monotonic_ns = std::to_string(record.monotonic_ns);
++  values->dex_object_id = r0dump_LogOptionalNumber(record.metadata.dex_object_id);
++  values->location_hash = record.metadata.location_hash.has_value()
++                              ? r0dump_HexHash(*record.metadata.location_hash)
++                              : "-";
++  values->checksum = r0dump_LogOptionalNumber(record.metadata.checksum);
++  values->declared_size = r0dump_LogOptionalNumber(record.metadata.declared_size);
++  values->data_size = r0dump_LogOptionalNumber(record.metadata.data_size);
++  values->container_size = r0dump_LogOptionalNumber(record.metadata.container_size);
++  values->source_ordinal = r0dump_LogOptionalNumber(record.metadata.source_ordinal);
++  values->source_count = r0dump_LogOptionalNumber(record.metadata.source_count);
++  values->source_in_memory = r0dump_LogOptionalBool(record.metadata.source_in_memory);
++  values->class_def_index = r0dump_LogOptionalNumber(record.metadata.class_def_index);
++  values->method_index = r0dump_LogOptionalNumber(record.metadata.method_index);
++  values->code_item_offset = r0dump_LogOptionalNumber(record.metadata.code_item_offset);
++  values->code_item_size = r0dump_LogOptionalNumber(record.metadata.code_item_size);
++  values->artifact_id = artifact == nullptr ? "-" : std::to_string(artifact->artifact_id);
++  const bool has_method =
++      !record.metadata.class_name.empty() &&
++      (!record.metadata.method_name.empty() || !record.metadata.method_descriptor.empty() ||
++       record.capture_kind == r0dump_CaptureKind::kCodeItem);
++  const bool has_class = !record.metadata.class_name.empty();
++  values->object = has_method  ? "method:" + record.metadata.class_name + "#" +
++                                     record.metadata.method_name + record.metadata.method_descriptor
++                   : has_class ? "class:" + record.metadata.class_name
++                   : !record.metadata.location_basename.empty()
++                       ? "dex:" + record.metadata.location_basename + "@" + values->location_hash
++                       : "record:" + values->sequence;
++  r0dump_Log(level,
++             event,
++             {{"status", r0dump_LogValue(status)},
++              {"site", r0dump_LogValue(record.site)},
++              {"run_id", r0dump_LogValue(run_id)},
++              {"pid", values->process_id},
++              {"tid", values->thread_id},
++              {"monotonic_ns", values->monotonic_ns},
++              {"seq", values->sequence},
++              {"point", r0dump_LogValue(r0dump_PointName(record.point))},
++              {"capture_kind", r0dump_LogValue(r0dump_CaptureKindName(record.capture_kind))},
++              {"dex_format", r0dump_LogValue(r0dump_DexFormatName(record.dex_format))},
++              {"object_kind",
++               has_method  ? "method"
++               : has_class ? "class"
++                           : "dex"},
++              {"object", values->object},
++              {"dex", r0dump_LogValue(record.metadata.location_basename)},
++              {"location_hash", values->location_hash},
++              {"dex_object_id", values->dex_object_id},
++              {"checksum", values->checksum},
++              {"declared_size", values->declared_size},
++              {"data_size", values->data_size},
++              {"container_size", values->container_size},
++              {"source", r0dump_LogValue(record.metadata.source_kind)},
++              {"source_ordinal", values->source_ordinal},
++              {"source_count", values->source_count},
++              {"source_in_memory", values->source_in_memory},
++              {"class", r0dump_LogValue(record.metadata.class_name)},
++              {"class_def_index", values->class_def_index},
++              {"method", r0dump_LogValue(record.metadata.method_name)},
++              {"descriptor", r0dump_LogValue(record.metadata.method_descriptor)},
++              {"method_index", values->method_index},
++              {"code_item_offset", values->code_item_offset},
++              {"code_item_size", values->code_item_size},
++              {"capture_role", r0dump_LogValue(record.metadata.capture_role)},
++              {"load_status", r0dump_LogValue(record.metadata.load_status)},
++              {"resolve_status", r0dump_LogValue(record.metadata.resolve_status)},
++              {"class_init_status", r0dump_LogValue(record.metadata.class_init_status)},
++              {"materialize_status", r0dump_LogValue(record.metadata.materialize_status)},
++              {"dispatch_status", r0dump_LogValue(record.metadata.dispatch_status)},
++              {"exception_class", r0dump_LogValue(record.metadata.exception_class)},
++              {"artifact_id", values->artifact_id},
++              {"duplicate_of",
++               record.duplicate_of.has_value() ? std::to_string(*record.duplicate_of) : "-"},
++              {"drop_reason", r0dump_LogValue(record.drop_reason)}});
++}
++
++void r0dump_LogDurableRecord(const r0dump_PendingRecord& record,
++                             const r0dump_ArtifactReference* artifact,
++                             std::string_view run_id,
++                             uint32_t pid) {
+   const std::string_view status = r0dump_RecordStatusName(record.status);
+-  r0dump_Log(r0dump_LogLevel::kDebug, "hook_seen", {{"status", status}, {"site", record.site}});
++  r0dump_LogRecordEvent(
++      r0dump_LogLevel::kDebug, "hook_seen", status, record, artifact, run_id, pid);
+   switch (record.status) {
+     case r0dump_RecordStatus::kAccepted:
+-      r0dump_Log(
+-          r0dump_LogLevel::kDebug, "capture_staged", {{"status", status}, {"site", record.site}});
++      r0dump_LogRecordEvent(
++          r0dump_LogLevel::kDebug, "capture_staged", status, record, artifact, run_id, pid);
+       break;
+     case r0dump_RecordStatus::kDuplicate:
+-      r0dump_Log(r0dump_LogLevel::kDebug,
+-                 "capture_duplicate",
+-                 {{"status", status}, {"site", record.site}});
++      r0dump_LogRecordEvent(
++          r0dump_LogLevel::kDebug, "capture_duplicate", status, record, artifact, run_id, pid);
+       break;
+     case r0dump_RecordStatus::kDropped:
+-      r0dump_Log(r0dump_LogLevel::kWarn,
+-                 "hook_dropped",
+-                 {{"status", record.drop_reason}, {"site", record.site}});
++      r0dump_LogRecordEvent(r0dump_LogLevel::kWarn,
++                            "hook_dropped",
++                            record.drop_reason,
++                            record,
++                            artifact,
++                            run_id,
++                            pid);
+       if (record.drop_reason == "active_entry_limit" || record.drop_reason == "artifact_limit" ||
+           record.drop_reason == "total_bytes_limit" || record.drop_reason == "dex_bytes_limit" ||
+           record.drop_reason == "pool_unavailable") {
+-        r0dump_Log(r0dump_LogLevel::kWarn,
+-                   "budget_exhausted",
+-                   {{"status", record.drop_reason}, {"site", record.site}});
++        r0dump_LogRecordEvent(r0dump_LogLevel::kWarn,
++                              "budget_exhausted",
++                              record.drop_reason,
++                              record,
++                              artifact,
++                              run_id,
++                              pid);
+       }
+       break;
+   }
+@@ -462,6 +600,7 @@ std::string r0dump_SerializeRecord(const r0dump_PendingRecord& record,
+   r0dump_AppendJsonBoolean(&json, "source_in_memory", record.metadata.source_in_memory, &first);
+   r0dump_AppendJsonNumber(&json, "class_def_index", record.metadata.class_def_index, &first);
+   r0dump_AppendJsonNumber(&json, "method_index", record.metadata.method_index, &first);
++  r0dump_AppendJsonNumber(&json, "code_item_offset", record.metadata.code_item_offset, &first);
+   r0dump_AppendJsonNumber(&json, "code_item_size", record.metadata.code_item_size, &first);
+   r0dump_AppendJsonField(&json, "class_name", record.metadata.class_name, &first);
+   r0dump_AppendJsonField(&json, "method_name", record.metadata.method_name, &first);
+@@ -802,8 +941,7 @@ r0dump_FileResult r0dump_OpenPreparedRunDirectory(int prepared_fd, int* out_run_
+     return r0dump_Failure("validate_prepared_run", errno == 0 ? EACCES : errno);
+   }
+ 
+-  unique_fd directory(
+-      openat(prepared_fd, ".", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
++  unique_fd directory(openat(prepared_fd, ".", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+   if (directory.get() < 0) {
+     return r0dump_Failure("open_prepared_run", errno);
+   }
+@@ -1185,7 +1323,7 @@ r0dump_GenerationWriteResult r0dump_WriteFrozenGeneration(int run_fd,
+       return r0dump_degrade(written.operation, written.error, artifacts_written, records_written);
+     }
+     state->last_record_sequence_ = record->sequence;
+-    r0dump_LogDurableRecord(*record);
++    r0dump_LogDurableRecord(*record, reference, run_id, pid);
+     if (record->capture_kind == r0dump_CaptureKind::kCodeItem) {
+       methods_jsonl.append(json);
+     }
+@@ -1245,8 +1383,15 @@ r0dump_GenerationWriteResult r0dump_WriteAndReleaseFrozenGeneration(
+     if (staging == nullptr || !staging->r0dump_ReleaseFrozen(generation.generation_id)) {
+       return {.ok = false, .degraded = true, .error = EINVAL, .operation = "release_generation"};
+     }
+-    r0dump_Log(
+-        r0dump_LogLevel::kInfo, "capture_flushed", {{"status", "ok"}, {"site", "file.flush"}});
++    const std::string run_object = "run:" + std::string(run_id);
++    r0dump_Log(r0dump_LogLevel::kInfo,
++               "capture_flushed",
++               {{"status", "ok"},
++                {"site", "file.flush"},
++                {"object_kind", "run"},
++                {"object", run_object},
++                {"run_id", run_id},
++                {"pid", std::to_string(pid)}});
+     return result;
+   }
+   if (!result.ok) {
+@@ -1260,9 +1405,17 @@ namespace {
+ 
+ void r0dump_MarkFlushDegradedLocked() {
+   g_r0dump_flush_degraded = true;
++  const std::string run_object =
++      g_r0dump_log_run_id.empty() ? "run:-" : "run:" + g_r0dump_log_run_id;
+   r0dump_Log(r0dump_LogLevel::kError,
+              "run_degraded",
+-             {{"status", "write_failed"}, {"site", "file.flush"}});
++             {{"status", "write_failed"},
++              {"site", "file.flush"},
++              {"object_kind", "run"},
++              {"object", run_object},
++              {"run_id", g_r0dump_log_run_id},
++              {"package", g_r0dump_log_package},
++              {"process", g_r0dump_log_process}});
+ }
+ 
+ bool r0dump_ServiceFlushLocked(const r0dump_ProcessConfig& config,
+@@ -1312,6 +1465,9 @@ bool r0dump_ServiceFlushLocked(const r0dump_ProcessConfig& config,
+ 
+ void r0dump_InitializeFlushRun(const r0dump_ProcessConfig& config, uint64_t start_monotonic_ns) {
+   std::lock_guard<std::mutex> flush_lock(g_r0dump_flush_lock);
++  g_r0dump_log_run_id = config.run_id;
++  g_r0dump_log_package = config.target_package;
++  g_r0dump_log_process = config.process_name;
+   if (g_r0dump_start_monotonic_ns == 0u) {
+     g_r0dump_start_monotonic_ns = start_monotonic_ns;
+   }
+@@ -1427,9 +1583,17 @@ void r0dump_FinalizeFlushRun(const r0dump_ProcessConfig& config,
+     if (!methods_written.ok || !session_written || !summary_written.ok) {
+       r0dump_MarkFlushDegradedLocked();
+     } else {
++      const std::string run_object = "run:" + config.run_id;
+       r0dump_Log(r0dump_LogLevel::kInfo,
+                  "run_completed",
+-                 {{"status", "ok"}, {"site", "runtime.teardown"}});
++                 {{"status", "ok"},
++                  {"site", "runtime.teardown"},
++                  {"object_kind", "run"},
++                  {"object", run_object},
++                  {"run_id", config.run_id},
++                  {"package", config.target_package},
++                  {"process", config.process_name},
++                  {"pid", std::to_string(getpid())}});
+     }
+   }
+   if (g_r0dump_run_fd >= 0) {
+-- 
+2.43.0
+

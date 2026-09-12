@@ -1,0 +1,121 @@
+From 55ecbbcab490344e874792229ad3f491c0050cbd Mon Sep 17 00:00:00 2001
+From: Ivory <contact@ivory.cafe>
+Date: Fri, 11 Sep 2026 18:32:32 +0800
+Subject: [PATCH 29/32] manager: add rescan control to the app picker
+
+The installed-app list was loaded once at startup, so a target installed while
+the manager was already open (the common case when preparing a sample) never
+appeared and could not be selected. Add ViewModel.rescanApplications() to reload
+just the list without touching the draft, and surface it as the search bar's
+trailing action whenever the query is empty (the clear button still takes over
+once text is entered).
+---
+ res/values-zh-rCN/strings.xml                     |  1 +
+ res/values/strings.xml                            |  1 +
+ .../r0dumpmanager/app/R0dumpManagerViewModel.kt   |  6 ++++++
+ .../r0dumpmanager/ui/R0dumpManagerScreen.kt       | 15 +++++++++++++--
+ 4 files changed, 21 insertions(+), 2 deletions(-)
+
+diff --git a/res/values-zh-rCN/strings.xml b/res/values-zh-rCN/strings.xml
+index 58bbac5..3b2c89e 100644
+--- a/res/values-zh-rCN/strings.xml
++++ b/res/values-zh-rCN/strings.xml
+@@ -44,6 +44,7 @@
+     <string name="select_application">应用选择</string>
+     <string name="search_installed_apps">搜索已安装应用</string>
+     <string name="clear_search">清除搜索</string>
++    <string name="rescan_apps">重新扫描已安装应用</string>
+     <string name="no_app_results">没有匹配的应用</string>
+     <string name="target_package">目标包名</string>
+     <string name="artifact_export_title">产物导出</string>
+diff --git a/res/values/strings.xml b/res/values/strings.xml
+index f9a0f24..829efb9 100644
+--- a/res/values/strings.xml
++++ b/res/values/strings.xml
+@@ -44,6 +44,7 @@
+     <string name="select_application">Application selection</string>
+     <string name="search_installed_apps">Search installed applications</string>
+     <string name="clear_search">Clear search</string>
++    <string name="rescan_apps">Rescan installed apps</string>
+     <string name="no_app_results">No matching applications</string>
+     <string name="target_package">Target package</string>
+     <string name="artifact_export_title">Artifact export</string>
+diff --git a/src/com/android/r0dumpmanager/app/R0dumpManagerViewModel.kt b/src/com/android/r0dumpmanager/app/R0dumpManagerViewModel.kt
+index 7d90443..774942c 100644
+--- a/src/com/android/r0dumpmanager/app/R0dumpManagerViewModel.kt
++++ b/src/com/android/r0dumpmanager/app/R0dumpManagerViewModel.kt
+@@ -141,6 +141,12 @@ class R0dumpManagerViewModel(
+     private val inFlight = AtomicBoolean(false); private val _uiState = MutableStateFlow(R0dumpUiState()); val uiState: StateFlow<R0dumpUiState> = _uiState.asStateFlow()
+     init { refresh() }
+     fun refresh() = refreshInternal(preserveDraft = true)
++    /** Reload only the installed-app list (e.g. after installing a new target), leaving the draft untouched. */
++    fun rescanApplications() = viewModelScope.launch(ioDispatcher) {
++        if (!_uiState.value.isOwnerUser) return@launch
++        val applications = dependencies.loadInstalledApplications()
++        _uiState.update { it.copy(applications = applications) }
++    }
+     private fun refreshInternal(preserveDraft: Boolean) = viewModelScope.launch(ioDispatcher) {
+         val snapshot = dependencies.readSnapshot()
+         val applications = if (_uiState.value.isOwnerUser) dependencies.loadInstalledApplications() else emptyList()
+diff --git a/src/com/android/r0dumpmanager/ui/R0dumpManagerScreen.kt b/src/com/android/r0dumpmanager/ui/R0dumpManagerScreen.kt
+index cfef4d0..92dbb84 100644
+--- a/src/com/android/r0dumpmanager/ui/R0dumpManagerScreen.kt
++++ b/src/com/android/r0dumpmanager/ui/R0dumpManagerScreen.kt
+@@ -50,6 +50,7 @@ import androidx.compose.material.icons.filled.ExpandMore
+ import androidx.compose.material.icons.filled.Info
+ import androidx.compose.material.icons.filled.Language
+ import androidx.compose.material.icons.filled.PlayArrow
++import androidx.compose.material.icons.filled.Refresh
+ import androidx.compose.material.icons.filled.Restore
+ import androidx.compose.material.icons.filled.Search
+ import androidx.compose.material.icons.filled.Settings
+@@ -616,6 +617,7 @@ private fun ApplicationScreen(
+                 selectedPackage = state.draft.targetPackage,
+                 enabled = state.canEdit,
+                 compact = compact,
++                onRescan = { viewModel.rescanApplications() },
+                 onSelect = { target ->
+                     viewModel.selectTarget(target)
+                     query = ""
+@@ -670,6 +672,7 @@ private fun ApplicationScreen(
+                 } else {
+                     Modifier.align(Alignment.TopCenter).padding(16.dp).widthIn(max = 720.dp)
+                 },
++                onRescan = { viewModel.rescanApplications() },
+                 onSelect = { target ->
+                     viewModel.selectTarget(target)
+                     query = ""
+@@ -753,20 +756,28 @@ private fun ApplicationSearchBar(
+     enabled: Boolean,
+     compact: Boolean,
+     modifier: Modifier = Modifier,
++    onRescan: () -> Unit,
+     onSelect: (TargetApplication) -> Unit,
+ ) {
+     val filtered = applications.filter {
+         query.isBlank() || it.label.contains(query, true) || it.packageName.contains(query, true)
+     }
+     val leadingIcon: @Composable () -> Unit = { Icon(Icons.Default.Search, null) }
+-    val trailingIcon: @Composable (() -> Unit)? = if (query.isNotEmpty()) {
++    // With a query the trailing control clears it; otherwise it re-scans the
++    // installed packages so an app installed after launch shows up without
++    // restarting the manager.
++    val trailingIcon: @Composable (() -> Unit) = if (query.isNotEmpty()) {
+         {
+             IconButton(onClick = { onQueryChange("") }) {
+                 Icon(Icons.Default.Close, stringResource(R.string.clear_search))
+             }
+         }
+     } else {
+-        null
++        {
++            IconButton(onClick = onRescan, enabled = enabled) {
++                Icon(Icons.Default.Refresh, stringResource(R.string.rescan_apps))
++            }
++        }
+     }
+     val results: @Composable () -> Unit = {
+         when {
+-- 
+2.43.0
+

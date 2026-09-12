@@ -1,0 +1,1188 @@
+From ba3d5431b8bc72229282cab83583a26e5b013936 Mon Sep 17 00:00:00 2001
+From: Ivory <contact@ivory.cafe>
+Date: Fri, 11 Sep 2026 07:53:01 +0800
+Subject: [PATCH 27/32] helper: rehydrate dexdata captures into complete DEX
+ on-device
+
+The dexdata branch was a stub that always emitted a partial with reason
+dexrecon_missing_runtime_tables, so app DEX captured as logical-data (e.g.
+com.VCB.ui.*) never produced a usable output on device -- only the host tool
+could rebuild it. Port r0dump_dex_rehydrate.py into the helper: reconstruct a
+canonical DEX 035 image from the headerless capture plus the RuntimeView
+(data_begin + displaced ID-table pointers + section counts) recorded on each
+dexdata record, collecting only reachable data items and rebasing every
+offset-bearing field. Wire it into the dexdata branch, writing
+repaired/<digest>.rehydrated.dex and marking the record verified.
+
+Exceptions/RTTI are off under Soong, so all parsing uses bool/optional error
+plumbing with a SIZE_MAX sentinel instead of throwing. Verified on device
+against com.VCB run vcb-20260910-203819: every rehydrated DEX is byte-for-byte
+identical (sha256) to the host rehydrator's output; dexdump -f passes,
+15586 com.VCB.ui references decode, JADX emits 1080 java files. Export summary
+rose from 0 to 136 verified across the three fixes.
+---
+ helper/r0dump_export_core.cpp | 1133 ++++++++++++++++++++++++++++++++-
+ 1 file changed, 1132 insertions(+), 1 deletion(-)
+
+diff --git a/helper/r0dump_export_core.cpp b/helper/r0dump_export_core.cpp
+index 09004ac..77bb649 100644
+--- a/helper/r0dump_export_core.cpp
++++ b/helper/r0dump_export_core.cpp
+@@ -19,6 +19,7 @@
+ #include <chrono>
+ #include <cstdint>
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <fstream>
+ #include <iomanip>
+@@ -419,6 +420,1122 @@ RepairDexFixed(const std::vector<uint8_t> &data) {
+   return {std::move(repaired), details};
+ }
+ 
++// --- DEX rehydration -------------------------------------------------------
++// Faithful port of art/tools/r0dump/r0dump_dex_rehydrate.py. Rebuilds a
++// complete DEX 035 image from a headerless dexdata capture plus the RuntimeView
++// (data_begin + displaced ID-table pointers + section counts) recorded beside
++// it. The output is byte-for-byte identical to the host rehydrator so a device
++// export matches what the Host tool would produce from the same evidence.
++
++constexpr size_t kRehErr = SIZE_MAX;
++constexpr size_t kRehHeaderSize = 0x70u;
++constexpr uint32_t kRehEndian = 0x12345678u;
++constexpr uint32_t kRehNoIndex = 0xFFFFFFFFu;
++
++enum RehSection {
++  kRehStringIds = 0, kRehTypeIds, kRehProtoIds,
++  kRehFieldIds, kRehMethodIds, kRehClassDefs, kRehSectionCount
++};
++constexpr uint32_t kRehItemSize[kRehSectionCount] = {4u, 4u, 12u, 8u, 8u, 32u};
++constexpr size_t kRehHeaderPos[kRehSectionCount] = {56u, 64u, 72u, 80u, 88u, 96u};
++constexpr const char *kRehSectionName[kRehSectionCount] = {
++    "string_ids", "type_ids", "proto_ids", "field_ids", "method_ids",
++    "class_defs"};
++
++struct RehLayout {
++  size_t offsets[kRehSectionCount];
++  uint32_t counts[kRehSectionCount];
++};
++
++struct RehClassData {
++  std::vector<std::pair<uint32_t, uint32_t>> static_fields;
++  std::vector<std::pair<uint32_t, uint32_t>> instance_fields;
++  std::vector<std::array<uint32_t, 3>> direct_methods;
++  std::vector<std::array<uint32_t, 3>> virtual_methods;
++};
++
++size_t RehAlign4(size_t value) { return (value + 3u) & ~static_cast<size_t>(3u); }
++
++uint32_t RehU32(const std::vector<uint8_t> &raw, size_t offset, bool *ok) {
++  if (offset + 4u > raw.size()) {
++    *ok = false;
++    return 0u;
++  }
++  return static_cast<uint32_t>(raw[offset]) |
++         static_cast<uint32_t>(raw[offset + 1u]) << 8u |
++         static_cast<uint32_t>(raw[offset + 2u]) << 16u |
++         static_cast<uint32_t>(raw[offset + 3u]) << 24u;
++}
++
++uint16_t RehU16(const std::vector<uint8_t> &raw, size_t offset, bool *ok) {
++  if (offset + 2u > raw.size()) {
++    *ok = false;
++    return 0u;
++  }
++  return static_cast<uint16_t>(static_cast<uint16_t>(raw[offset]) |
++                               static_cast<uint16_t>(raw[offset + 1u]) << 8u);
++}
++
++uint32_t RehUleb(const std::vector<uint8_t> &raw, size_t *cursor, bool *ok) {
++  uint32_t value = 0u;
++  unsigned shift = 0u;
++  for (int index = 0; index < 5; ++index) {
++    if (*cursor >= raw.size()) {
++      *ok = false;
++      return 0u;
++    }
++    const uint8_t byte = raw[(*cursor)++];
++    value |= static_cast<uint32_t>(byte & 0x7fu) << shift;
++    if (byte < 0x80u) {
++      return value;
++    }
++    shift += 7u;
++  }
++  *ok = false;
++  return 0u;
++}
++
++int64_t RehSleb(const std::vector<uint8_t> &raw, size_t *cursor, bool *ok) {
++  int64_t value = 0;
++  unsigned shift = 0u;
++  for (int index = 0; index < 5; ++index) {
++    if (*cursor >= raw.size()) {
++      *ok = false;
++      return 0;
++    }
++    const uint8_t byte = raw[(*cursor)++];
++    value |= static_cast<int64_t>(byte & 0x7fu) << shift;
++    shift += 7u;
++    if (byte < 0x80u) {
++      if (byte & 0x40u) {
++        value -= (static_cast<int64_t>(1) << shift);
++      }
++      return value;
++    }
++  }
++  *ok = false;
++  return 0;
++}
++
++void RehAppendUleb(std::vector<uint8_t> *out, uint32_t value) {
++  while (true) {
++    const uint8_t byte = value & 0x7fu;
++    value >>= 7u;
++    out->push_back(static_cast<uint8_t>(byte | (value ? 0x80u : 0u)));
++    if (!value) {
++      return;
++    }
++  }
++}
++
++// Data-item walkers: return the exclusive end offset, or kRehErr if malformed.
++size_t RehStringDataEnd(const std::vector<uint8_t> &raw, size_t offset) {
++  bool ok = true;
++  size_t cursor = offset;
++  RehUleb(raw, &cursor, &ok);
++  if (!ok) {
++    return kRehErr;
++  }
++  while (cursor < raw.size()) {
++    if (raw[cursor] == 0u) {
++      return cursor + 1u;
++    }
++    ++cursor;
++  }
++  return kRehErr;
++}
++
++size_t RehTypeListEnd(const std::vector<uint8_t> &raw, size_t offset) {
++  bool ok = true;
++  const uint32_t size = RehU32(raw, offset, &ok);
++  if (!ok) {
++    return kRehErr;
++  }
++  const size_t end = offset + 4u + static_cast<size_t>(size) * 2u;
++  if (end > raw.size()) {
++    return kRehErr;
++  }
++  return end;
++}
++
++size_t RehEncodedValueEnd(const std::vector<uint8_t> &raw, size_t offset) {
++  if (offset >= raw.size()) {
++    return kRehErr;
++  }
++  const uint8_t header = raw[offset];
++  const uint8_t value_type = header & 0x1fu;
++  const uint8_t value_arg = header >> 5u;
++  size_t cursor = offset + 1u;
++  auto scalar_width = [](uint8_t type) -> int {
++    switch (type) {
++      case 0x00: return 1;
++      case 0x02: return 2;
++      case 0x03: return 2;
++      case 0x04: return 4;
++      case 0x06: return 8;
++      case 0x10: return 4;
++      case 0x11: return 8;
++      case 0x15: return 4;
++      case 0x16: return 4;
++      case 0x17: return 4;
++      case 0x18: return 4;
++      case 0x19: return 4;
++      case 0x1a: return 4;
++      case 0x1b: return 4;
++      default: return -1;
++    }
++  };
++  if (value_type == 0x1cu) {  // VALUE_ARRAY
++    if (value_arg) {
++      return kRehErr;
++    }
++    bool ok = true;
++    const uint32_t size = RehUleb(raw, &cursor, &ok);
++    if (!ok) {
++      return kRehErr;
++    }
++    for (uint32_t index = 0u; index < size; ++index) {
++      cursor = RehEncodedValueEnd(raw, cursor);
++      if (cursor == kRehErr) {
++        return kRehErr;
++      }
++    }
++  } else if (value_type == 0x1du) {  // VALUE_ANNOTATION
++    if (value_arg) {
++      return kRehErr;
++    }
++    bool ok = true;
++    RehUleb(raw, &cursor, &ok);  // type_idx
++    const uint32_t size = RehUleb(raw, &cursor, &ok);
++    if (!ok) {
++      return kRehErr;
++    }
++    for (uint32_t index = 0u; index < size; ++index) {
++      RehUleb(raw, &cursor, &ok);  // name_idx
++      if (!ok) {
++        return kRehErr;
++      }
++      cursor = RehEncodedValueEnd(raw, cursor);
++      if (cursor == kRehErr) {
++        return kRehErr;
++      }
++    }
++  } else if (const int width = scalar_width(value_type); width >= 0) {
++    if (value_arg >= width) {
++      return kRehErr;
++    }
++    cursor += static_cast<size_t>(value_arg) + 1u;
++  } else if (value_type == 0x1eu) {  // VALUE_NULL
++    if (value_arg) {
++      return kRehErr;
++    }
++  } else if (value_type == 0x1fu) {  // VALUE_BOOLEAN
++    if (value_arg > 1u) {
++      return kRehErr;
++    }
++  } else {
++    return kRehErr;
++  }
++  if (cursor > raw.size()) {
++    return kRehErr;
++  }
++  return cursor;
++}
++
++size_t RehEncodedArrayEnd(const std::vector<uint8_t> &raw, size_t offset) {
++  bool ok = true;
++  size_t cursor = offset;
++  const uint32_t size = RehUleb(raw, &cursor, &ok);
++  if (!ok) {
++    return kRehErr;
++  }
++  for (uint32_t index = 0u; index < size; ++index) {
++    cursor = RehEncodedValueEnd(raw, cursor);
++    if (cursor == kRehErr) {
++      return kRehErr;
++    }
++  }
++  return cursor;
++}
++
++size_t RehEncodedAnnotationEnd(const std::vector<uint8_t> &raw, size_t offset) {
++  bool ok = true;
++  size_t cursor = offset;
++  RehUleb(raw, &cursor, &ok);  // type_idx
++  const uint32_t size = RehUleb(raw, &cursor, &ok);
++  if (!ok) {
++    return kRehErr;
++  }
++  for (uint32_t index = 0u; index < size; ++index) {
++    RehUleb(raw, &cursor, &ok);  // name_idx
++    if (!ok) {
++      return kRehErr;
++    }
++    cursor = RehEncodedValueEnd(raw, cursor);
++    if (cursor == kRehErr) {
++      return kRehErr;
++    }
++  }
++  return cursor;
++}
++
++size_t RehAnnotationItemEnd(const std::vector<uint8_t> &raw, size_t offset) {
++  if (offset >= raw.size()) {
++    return kRehErr;
++  }
++  if (raw[offset] > 2u) {
++    return kRehErr;
++  }
++  return RehEncodedAnnotationEnd(raw, offset + 1u);
++}
++
++size_t RehCodeItemEnd(const std::vector<uint8_t> &raw, size_t offset) {
++  if (offset + 16u > raw.size()) {
++    return kRehErr;
++  }
++  bool ok = true;
++  const uint16_t tries_size = RehU16(raw, offset + 6u, &ok);
++  const uint32_t insns_size = RehU32(raw, offset + 12u, &ok);
++  if (!ok) {
++    return kRehErr;
++  }
++  size_t cursor = offset + 16u + static_cast<size_t>(insns_size) * 2u;
++  if (cursor > raw.size()) {
++    return kRehErr;
++  }
++  if (!tries_size) {
++    return cursor;
++  }
++  cursor = RehAlign4(cursor) + static_cast<size_t>(tries_size) * 8u;
++  const uint32_t handlers_size = RehUleb(raw, &cursor, &ok);
++  if (!ok) {
++    return kRehErr;
++  }
++  for (uint32_t index = 0u; index < handlers_size; ++index) {
++    const int64_t handler_count = RehSleb(raw, &cursor, &ok);
++    if (!ok) {
++      return kRehErr;
++    }
++    const int64_t magnitude = handler_count < 0 ? -handler_count : handler_count;
++    for (int64_t entry = 0; entry < magnitude; ++entry) {
++      RehUleb(raw, &cursor, &ok);  // type_idx
++      RehUleb(raw, &cursor, &ok);  // address
++    }
++    if (handler_count <= 0) {
++      RehUleb(raw, &cursor, &ok);  // catch_all_addr
++    }
++    if (!ok) {
++      return kRehErr;
++    }
++  }
++  if (cursor > raw.size()) {
++    return kRehErr;
++  }
++  return cursor;
++}
++
++size_t RehDebugInfoEnd(const std::vector<uint8_t> &raw, size_t offset) {
++  bool ok = true;
++  size_t cursor = offset;
++  RehUleb(raw, &cursor, &ok);  // line_start
++  const uint32_t parameters_size = RehUleb(raw, &cursor, &ok);
++  if (!ok) {
++    return kRehErr;
++  }
++  for (uint32_t index = 0u; index < parameters_size; ++index) {
++    RehUleb(raw, &cursor, &ok);  // uleb128p1 name index
++  }
++  if (!ok) {
++    return kRehErr;
++  }
++  while (true) {
++    if (cursor >= raw.size()) {
++      return kRehErr;
++    }
++    const uint8_t opcode = raw[cursor++];
++    if (opcode == 0u) {
++      return cursor;
++    }
++    if (opcode == 1u) {
++      RehUleb(raw, &cursor, &ok);
++    } else if (opcode == 2u) {
++      RehSleb(raw, &cursor, &ok);
++    } else if (opcode == 3u) {
++      for (int part = 0; part < 3; ++part) {
++        RehUleb(raw, &cursor, &ok);
++      }
++    } else if (opcode == 4u) {
++      for (int part = 0; part < 4; ++part) {
++        RehUleb(raw, &cursor, &ok);
++      }
++    } else if (opcode == 5u || opcode == 6u) {
++      RehUleb(raw, &cursor, &ok);
++    }
++    // Opcodes 7, 8, 9 and >= 10 (special range) carry no arguments.
++    if (!ok) {
++      return kRehErr;
++    }
++  }
++}
++
++bool RehParseClassData(const std::vector<uint8_t> &raw, size_t offset,
++                       RehClassData *out, size_t *end) {
++  if (offset == 0u || offset >= raw.size()) {
++    return false;
++  }
++  bool ok = true;
++  size_t cursor = offset;
++  const uint32_t static_count = RehUleb(raw, &cursor, &ok);
++  const uint32_t instance_count = RehUleb(raw, &cursor, &ok);
++  const uint32_t direct_count = RehUleb(raw, &cursor, &ok);
++  const uint32_t virtual_count = RehUleb(raw, &cursor, &ok);
++  if (!ok) {
++    return false;
++  }
++  auto read_fields = [&](uint32_t count,
++                         std::vector<std::pair<uint32_t, uint32_t>> *dst) {
++    uint32_t running = 0u;
++    for (uint32_t index = 0u; index < count; ++index) {
++      const uint32_t delta = RehUleb(raw, &cursor, &ok);
++      const uint32_t access = RehUleb(raw, &cursor, &ok);
++      if (!ok) {
++        return;
++      }
++      running += delta;
++      dst->emplace_back(running, access);
++    }
++  };
++  auto read_methods = [&](uint32_t count,
++                          std::vector<std::array<uint32_t, 3>> *dst) {
++    uint32_t running = 0u;
++    for (uint32_t index = 0u; index < count; ++index) {
++      const uint32_t delta = RehUleb(raw, &cursor, &ok);
++      const uint32_t access = RehUleb(raw, &cursor, &ok);
++      const uint32_t code_off = RehUleb(raw, &cursor, &ok);
++      if (!ok) {
++        return;
++      }
++      running += delta;
++      dst->push_back({running, access, code_off});
++    }
++  };
++  read_fields(static_count, &out->static_fields);
++  read_fields(instance_count, &out->instance_fields);
++  read_methods(direct_count, &out->direct_methods);
++  read_methods(virtual_count, &out->virtual_methods);
++  if (!ok) {
++    return false;
++  }
++  if (end) {
++    *end = cursor;
++  }
++  return true;
++}
++
++std::vector<uint8_t> RehEncodeClassData(const RehClassData &parsed,
++                                        size_t raw_base) {
++  std::vector<uint8_t> out;
++  RehAppendUleb(&out, static_cast<uint32_t>(parsed.static_fields.size()));
++  RehAppendUleb(&out, static_cast<uint32_t>(parsed.instance_fields.size()));
++  RehAppendUleb(&out, static_cast<uint32_t>(parsed.direct_methods.size()));
++  RehAppendUleb(&out, static_cast<uint32_t>(parsed.virtual_methods.size()));
++  auto emit_fields =
++      [&](const std::vector<std::pair<uint32_t, uint32_t>> &values) {
++        uint32_t previous = 0u;
++        for (const auto &[index, access] : values) {
++          RehAppendUleb(&out, index - previous);
++          RehAppendUleb(&out, access);
++          previous = index;
++        }
++      };
++  auto emit_methods =
++      [&](const std::vector<std::array<uint32_t, 3>> &values) {
++        uint32_t previous = 0u;
++        for (const auto &method : values) {
++          RehAppendUleb(&out, method[0] - previous);
++          RehAppendUleb(&out, method[1]);
++          RehAppendUleb(&out, method[2]
++                                  ? static_cast<uint32_t>(raw_base + method[2])
++                                  : 0u);
++          previous = method[0];
++        }
++      };
++  emit_fields(parsed.static_fields);
++  emit_fields(parsed.instance_fields);
++  emit_methods(parsed.direct_methods);
++  emit_methods(parsed.virtual_methods);
++  return out;
++}
++
++bool RehParseHex(const Json::Value &value, uint64_t *out) {
++  if (!value.isString()) {
++    return false;
++  }
++  const std::string text = value.asString();
++  errno = 0;
++  char *end = nullptr;
++  const unsigned long long parsed = strtoull(text.c_str(), &end, 16);
++  if (end == text.c_str() || errno != 0) {
++    return false;
++  }
++  *out = static_cast<uint64_t>(parsed) & ((static_cast<uint64_t>(1) << 56) - 1u);
++  return true;
++}
++
++bool RehParseRuntimeLayout(const std::vector<uint8_t> &raw,
++                           const Json::Value &record, RehLayout *out) {
++  const Json::Value &runtime_view = record["runtime_view"];
++  if (!runtime_view.isObject()) {
++    return false;
++  }
++  uint64_t base = 0u;
++  if (!RehParseHex(runtime_view["data_begin"], &base)) {
++    return false;
++  }
++  for (int section = 0; section < kRehSectionCount; ++section) {
++    uint64_t pointer = 0u;
++    if (!RehParseHex(runtime_view[kRehSectionName[section]], &pointer)) {
++      return false;
++    }
++    if (pointer < base) {
++      return false;
++    }
++    const uint64_t offset = pointer - base;
++    if (offset >= raw.size()) {
++      return false;
++    }
++    out->offsets[section] = static_cast<size_t>(offset);
++  }
++  const Json::Value &record_counts = record["section_counts_current"];
++  const Json::Value &counts = record_counts.isObject()
++                                  ? record_counts
++                                  : runtime_view["section_counts_current"];
++  if (!counts.isObject()) {
++    return false;  // Only the epoch_current path is supported on device.
++  }
++  for (int section = 0; section < kRehSectionCount; ++section) {
++    const Json::Value &value = counts[kRehSectionName[section]];
++    if (!value.isIntegral()) {
++      return false;
++    }
++    const Json::Int64 count = value.asInt64();
++    if (count < 0) {
++      return false;
++    }
++    out->counts[section] = static_cast<uint32_t>(count);
++  }
++  return true;
++}
++
++bool RehValidateLayout(const std::vector<uint8_t> &raw, const RehLayout &layout) {
++  bool ok = true;
++  const uint32_t *counts = layout.counts;
++  for (int section = 0; section < kRehSectionCount; ++section) {
++    if (layout.offsets[section] +
++            static_cast<size_t>(counts[section]) * kRehItemSize[section] >
++        raw.size()) {
++      return false;
++    }
++  }
++  for (uint32_t index = 0u; index < counts[kRehStringIds]; ++index) {
++    const uint32_t offset =
++        RehU32(raw, layout.offsets[kRehStringIds] + index * 4u, &ok);
++    if (!ok || offset >= raw.size()) {
++      return false;
++    }
++  }
++  for (uint32_t index = 0u; index < counts[kRehTypeIds]; ++index) {
++    const uint32_t descriptor =
++        RehU32(raw, layout.offsets[kRehTypeIds] + index * 4u, &ok);
++    if (!ok || descriptor >= counts[kRehStringIds]) {
++      return false;
++    }
++  }
++  for (uint32_t index = 0u; index < counts[kRehProtoIds]; ++index) {
++    const size_t base =
++        layout.offsets[kRehProtoIds] + static_cast<size_t>(index) * 12u;
++    const uint32_t shorty = RehU32(raw, base, &ok);
++    const uint32_t result = RehU32(raw, base + 4u, &ok);
++    const uint32_t parameters = RehU32(raw, base + 8u, &ok);
++    if (!ok || shorty >= counts[kRehStringIds] ||
++        result >= counts[kRehTypeIds] || parameters >= raw.size()) {
++      return false;
++    }
++  }
++  for (int which = 0; which < 2; ++which) {
++    const RehSection section = which == 0 ? kRehFieldIds : kRehMethodIds;
++    for (uint32_t index = 0u; index < counts[section]; ++index) {
++      const size_t base =
++          layout.offsets[section] + static_cast<size_t>(index) * 8u;
++      const uint16_t first = RehU16(raw, base, &ok);
++      const uint16_t second = RehU16(raw, base + 2u, &ok);
++      const uint32_t third = RehU32(raw, base + 4u, &ok);
++      if (!ok || first >= counts[kRehTypeIds] ||
++          third >= counts[kRehStringIds]) {
++        return false;
++      }
++      if (section == kRehFieldIds && second >= counts[kRehTypeIds]) {
++        return false;
++      }
++      if (section == kRehMethodIds && second >= counts[kRehProtoIds]) {
++        return false;
++      }
++    }
++  }
++  for (uint32_t index = 0u; index < counts[kRehClassDefs]; ++index) {
++    const size_t base =
++        layout.offsets[kRehClassDefs] + static_cast<size_t>(index) * 32u;
++    uint32_t fields[8];
++    for (int part = 0; part < 8; ++part) {
++      fields[part] = RehU32(raw, base + static_cast<size_t>(part) * 4u, &ok);
++    }
++    if (!ok) {
++      return false;
++    }
++    const uint32_t class_idx = fields[0];
++    const uint32_t super_idx = fields[2];
++    const uint32_t interfaces = fields[3];
++    const uint32_t source = fields[4];
++    const uint32_t annotations = fields[5];
++    const uint32_t class_data = fields[6];
++    const uint32_t static_values = fields[7];
++    if (class_idx >= counts[kRehTypeIds] ||
++        (super_idx != kRehNoIndex && super_idx >= counts[kRehTypeIds])) {
++      return false;
++    }
++    for (const uint32_t pointed : {interfaces, annotations, class_data,
++                                   static_values}) {
++      if (pointed && pointed >= raw.size()) {
++        return false;
++      }
++    }
++    if (source != kRehNoIndex && source >= counts[kRehStringIds]) {
++      return false;
++    }
++    if (class_data) {
++      RehClassData parsed;
++      if (!RehParseClassData(raw, class_data, &parsed, nullptr)) {
++        return false;
++      }
++      auto check_methods =
++          [&](const std::vector<std::array<uint32_t, 3>> &methods) -> bool {
++        for (const auto &method : methods) {
++          if (method[0] >= counts[kRehMethodIds] ||
++              (method[2] && method[2] >= raw.size())) {
++            return false;
++          }
++          if (method[2] && method[2] + 16u > raw.size()) {
++            return false;
++          }
++        }
++        return true;
++      };
++      if (!check_methods(parsed.direct_methods) ||
++          !check_methods(parsed.virtual_methods)) {
++        return false;
++      }
++    }
++  }
++  return true;
++}
++
++struct RehCollectCtx {
++  const std::vector<uint8_t> *raw;
++  std::map<uint16_t, std::map<size_t, size_t>> *groups;
++  std::set<size_t> annotation_sets;
++  std::set<size_t> annotation_ref_lists;
++  bool ok = true;
++};
++
++void RehAddItem(RehCollectCtx *ctx, uint16_t type, uint32_t offset,
++                size_t (*end_fn)(const std::vector<uint8_t> &, size_t)) {
++  if (!ctx->ok || !offset) {
++    return;
++  }
++  if (offset >= ctx->raw->size()) {
++    ctx->ok = false;
++    return;
++  }
++  const size_t end = end_fn(*ctx->raw, offset);
++  if (end == kRehErr) {
++    ctx->ok = false;
++    return;
++  }
++  (*ctx->groups)[type][offset] = end;
++}
++
++void RehAddAnnotationSet(RehCollectCtx *ctx, uint32_t offset) {
++  if (!ctx->ok || !offset || ctx->annotation_sets.count(offset)) {
++    return;
++  }
++  if (offset + 4u > ctx->raw->size()) {
++    ctx->ok = false;
++    return;
++  }
++  ctx->annotation_sets.insert(offset);
++  bool ok = true;
++  const uint32_t count = RehU32(*ctx->raw, offset, &ok);
++  const size_t end =
++      static_cast<size_t>(offset) + 4u + static_cast<size_t>(count) * 4u;
++  if (!ok || end > ctx->raw->size()) {
++    ctx->ok = false;
++    return;
++  }
++  (*ctx->groups)[0x1003u][offset] = end;
++  for (uint32_t index = 0u; index < count; ++index) {
++    RehAddItem(ctx, 0x2004u, RehU32(*ctx->raw, offset + 4u + index * 4u, &ok),
++               RehAnnotationItemEnd);
++    if (!ok) {
++      ctx->ok = false;
++      return;
++    }
++  }
++}
++
++void RehAddAnnotationRefList(RehCollectCtx *ctx, uint32_t offset) {
++  if (!ctx->ok || !offset || ctx->annotation_ref_lists.count(offset)) {
++    return;
++  }
++  if (offset + 4u > ctx->raw->size()) {
++    ctx->ok = false;
++    return;
++  }
++  ctx->annotation_ref_lists.insert(offset);
++  bool ok = true;
++  const uint32_t count = RehU32(*ctx->raw, offset, &ok);
++  const size_t end =
++      static_cast<size_t>(offset) + 4u + static_cast<size_t>(count) * 4u;
++  if (!ok || end > ctx->raw->size()) {
++    ctx->ok = false;
++    return;
++  }
++  (*ctx->groups)[0x1002u][offset] = end;
++  for (uint32_t index = 0u; index < count; ++index) {
++    RehAddAnnotationSet(ctx, RehU32(*ctx->raw, offset + 4u + index * 4u, &ok));
++    if (!ok) {
++      ctx->ok = false;
++      return;
++    }
++  }
++}
++
++bool RehCollectReachable(const std::vector<uint8_t> &raw,
++                         const RehLayout &layout,
++                         std::map<uint16_t, std::map<size_t, size_t>> *groups) {
++  RehCollectCtx ctx;
++  ctx.raw = &raw;
++  ctx.groups = groups;
++  bool ok = true;
++  const uint32_t *counts = layout.counts;
++  for (uint32_t index = 0u; index < counts[kRehStringIds]; ++index) {
++    RehAddItem(&ctx, 0x2002u,
++               RehU32(raw, layout.offsets[kRehStringIds] + index * 4u, &ok),
++               RehStringDataEnd);
++    if (!ok || !ctx.ok) {
++      return false;
++    }
++  }
++  for (uint32_t index = 0u; index < counts[kRehProtoIds]; ++index) {
++    RehAddItem(
++        &ctx, 0x1001u,
++        RehU32(raw,
++               layout.offsets[kRehProtoIds] + static_cast<size_t>(index) * 12u +
++                   8u,
++               &ok),
++        RehTypeListEnd);
++    if (!ok || !ctx.ok) {
++      return false;
++    }
++  }
++  for (uint32_t index = 0u; index < counts[kRehClassDefs]; ++index) {
++    const size_t base =
++        layout.offsets[kRehClassDefs] + static_cast<size_t>(index) * 32u;
++    const uint32_t interfaces = RehU32(raw, base + 12u, &ok);
++    const uint32_t annotations = RehU32(raw, base + 20u, &ok);
++    const uint32_t class_data = RehU32(raw, base + 24u, &ok);
++    const uint32_t static_values = RehU32(raw, base + 28u, &ok);
++    if (!ok) {
++      return false;
++    }
++    RehAddItem(&ctx, 0x1001u, interfaces, RehTypeListEnd);
++    RehAddItem(&ctx, 0x2005u, static_values, RehEncodedArrayEnd);
++    if (!ctx.ok) {
++      return false;
++    }
++    if (annotations) {
++      if (annotations + 16u > raw.size()) {
++        return false;
++      }
++      const uint32_t fields_size = RehU32(raw, annotations + 4u, &ok);
++      const uint32_t methods_size = RehU32(raw, annotations + 8u, &ok);
++      const uint32_t parameters_size = RehU32(raw, annotations + 12u, &ok);
++      if (!ok) {
++        return false;
++      }
++      const size_t directory_end =
++          static_cast<size_t>(annotations) + 16u +
++          (static_cast<size_t>(fields_size) + methods_size + parameters_size) *
++              8u;
++      if (directory_end > raw.size()) {
++        return false;
++      }
++      (*groups)[0x2006u][annotations] = directory_end;
++      RehAddAnnotationSet(&ctx, RehU32(raw, annotations, &ok));
++      if (!ok || !ctx.ok) {
++        return false;
++      }
++      size_t cursor = static_cast<size_t>(annotations) + 16u;
++      for (uint32_t entry = 0u; entry < fields_size + methods_size; ++entry) {
++        RehAddAnnotationSet(&ctx, RehU32(raw, cursor + 4u, &ok));
++        if (!ok || !ctx.ok) {
++          return false;
++        }
++        cursor += 8u;
++      }
++      for (uint32_t entry = 0u; entry < parameters_size; ++entry) {
++        RehAddAnnotationRefList(&ctx, RehU32(raw, cursor + 4u, &ok));
++        if (!ok || !ctx.ok) {
++          return false;
++        }
++        cursor += 8u;
++      }
++    }
++    if (class_data) {
++      RehClassData parsed;
++      if (!RehParseClassData(raw, class_data, &parsed, nullptr)) {
++        return false;
++      }
++      auto add_code =
++          [&](const std::vector<std::array<uint32_t, 3>> &methods) -> bool {
++        for (const auto &method : methods) {
++          if (method[2]) {
++            RehAddItem(&ctx, 0x2001u, method[2], RehCodeItemEnd);
++            if (!ctx.ok) {
++              return false;
++            }
++            RehAddItem(&ctx, 0x2003u,
++                       RehU32(raw, static_cast<size_t>(method[2]) + 8u, &ok),
++                       RehDebugInfoEnd);
++            if (!ok || !ctx.ok) {
++              return false;
++            }
++          }
++        }
++        return true;
++      };
++      if (!add_code(parsed.direct_methods) ||
++          !add_code(parsed.virtual_methods)) {
++        return false;
++      }
++    }
++  }
++  return ctx.ok;
++}
++
++void RehPatchAnnotationTree(std::vector<uint8_t> *output, uint32_t at,
++                            size_t raw_base,
++                            std::set<std::pair<int, uint32_t>> *seen,
++                            bool *ok) {
++  if (!*ok || !at) {
++    return;
++  }
++  if (!seen->insert({0, at}).second) {  // 0 == directory
++    return;
++  }
++  const size_t physical = raw_base + at;
++  if (physical + 16u > output->size()) {
++    *ok = false;
++    return;
++  }
++  const uint32_t class_annotations = ReadU32(*output, physical);
++  const uint32_t fields_size = ReadU32(*output, physical + 4u);
++  const uint32_t methods_size = ReadU32(*output, physical + 8u);
++  auto shifted = [&](uint32_t old) -> uint32_t {
++    if (old >= output->size() - raw_base) {
++      *ok = false;
++      return 0u;
++    }
++    return old ? static_cast<uint32_t>(raw_base + old) : 0u;
++  };
++  auto annotation_set = [&](uint32_t offset) {
++    if (!*ok || !offset) {
++      return;
++    }
++    if (!seen->insert({1, offset}).second) {  // 1 == set
++      return;
++    }
++    const size_t set_physical = raw_base + offset;
++    if (set_physical + 4u > output->size()) {
++      *ok = false;
++      return;
++    }
++    const uint32_t count = ReadU32(*output, set_physical);
++    for (uint32_t index = 0u; index < count; ++index) {
++      const size_t position = set_physical + 4u + static_cast<size_t>(index) * 4u;
++      if (position + 4u > output->size()) {
++        *ok = false;
++        return;
++      }
++      WriteU32(output, position, shifted(ReadU32(*output, position)));
++      if (!*ok) {
++        return;
++      }
++    }
++  };
++  annotation_set(class_annotations);
++  if (!*ok) {
++    return;
++  }
++  WriteU32(output, physical, shifted(class_annotations));
++  if (!*ok) {
++    return;
++  }
++  size_t cursor = physical + 16u;
++  for (uint32_t entry = 0u; entry < fields_size + methods_size; ++entry) {
++    const size_t value_position = cursor + 4u;
++    if (value_position + 4u > output->size()) {
++      *ok = false;
++      return;
++    }
++    const uint32_t old = ReadU32(*output, value_position);
++    annotation_set(old);
++    if (!*ok) {
++      return;
++    }
++    WriteU32(output, value_position, shifted(old));
++    if (!*ok) {
++      return;
++    }
++    cursor += 8u;
++  }
++}
++
++std::optional<std::vector<uint8_t>> RehBuild(const std::vector<uint8_t> &raw,
++                                             const RehLayout &layout) {
++  if (!RehValidateLayout(raw, layout)) {
++    return std::nullopt;
++  }
++  std::map<uint16_t, std::map<size_t, size_t>> groups;
++  if (!RehCollectReachable(raw, layout, &groups)) {
++    return std::nullopt;
++  }
++  const uint32_t *counts = layout.counts;
++
++  size_t table_offsets[kRehSectionCount];
++  size_t cursor = kRehHeaderSize;
++  for (int section = 0; section < kRehSectionCount; ++section) {
++    cursor = RehAlign4(cursor);
++    table_offsets[section] = cursor;
++    cursor += static_cast<size_t>(counts[section]) * kRehItemSize[section];
++  }
++  const size_t raw_base = RehAlign4(cursor);
++
++  std::vector<uint8_t> output(raw_base + raw.size(), 0u);
++  for (const auto &[type, items] : groups) {
++    static_cast<void>(type);
++    for (const auto &[old_offset, old_end] : items) {
++      std::copy(raw.begin() + old_offset, raw.begin() + old_end,
++                output.begin() + raw_base + old_offset);
++    }
++  }
++  for (int section = 0; section < kRehSectionCount; ++section) {
++    const size_t size = static_cast<size_t>(counts[section]) *
++                        kRehItemSize[section];
++    std::copy(raw.begin() + layout.offsets[section],
++              raw.begin() + layout.offsets[section] + size,
++              output.begin() + table_offsets[section]);
++  }
++  for (uint32_t index = 0u; index < counts[kRehStringIds]; ++index) {
++    const size_t position = table_offsets[kRehStringIds] + index * 4u;
++    WriteU32(&output, position,
++             static_cast<uint32_t>(raw_base + ReadU32(output, position)));
++  }
++  for (uint32_t index = 0u; index < counts[kRehProtoIds]; ++index) {
++    const size_t position =
++        table_offsets[kRehProtoIds] + static_cast<size_t>(index) * 12u + 8u;
++    const uint32_t old = ReadU32(output, position);
++    WriteU32(&output, position,
++             old ? static_cast<uint32_t>(raw_base + old) : 0u);
++  }
++
++  std::vector<uint32_t> class_data_order;
++  std::map<uint32_t, uint32_t> class_data_cache;
++  std::vector<uint32_t> annotations;
++  bool ok = true;
++  for (uint32_t index = 0u; index < counts[kRehClassDefs]; ++index) {
++    const size_t source =
++        layout.offsets[kRehClassDefs] + static_cast<size_t>(index) * 32u;
++    const size_t destination =
++        table_offsets[kRehClassDefs] + static_cast<size_t>(index) * 32u;
++    uint32_t values[8];
++    for (int part = 0; part < 8; ++part) {
++      values[part] = RehU32(raw, source + static_cast<size_t>(part) * 4u, &ok);
++    }
++    if (!ok) {
++      return std::nullopt;
++    }
++    const uint32_t interfaces = values[3];
++    const uint32_t annotation_off = values[5];
++    const uint32_t class_data_off = values[6];
++    const uint32_t static_values = values[7];
++    values[3] = interfaces ? static_cast<uint32_t>(raw_base + interfaces) : 0u;
++    values[5] =
++        annotation_off ? static_cast<uint32_t>(raw_base + annotation_off) : 0u;
++    values[7] =
++        static_values ? static_cast<uint32_t>(raw_base + static_values) : 0u;
++    if (annotation_off) {
++      annotations.push_back(annotation_off);
++    }
++    if (class_data_off) {
++      if (class_data_cache.emplace(class_data_off, 0u).second) {
++        class_data_order.push_back(class_data_off);
++      }
++    }
++    for (int part = 0; part < 8; ++part) {
++      WriteU32(&output, destination + static_cast<size_t>(part) * 4u,
++               values[part]);
++    }
++  }
++
++  if (auto it = groups.find(0x2001u); it != groups.end()) {
++    for (const auto &[code_off, code_end] : it->second) {
++      static_cast<void>(code_end);
++      const size_t debug_position = raw_base + code_off + 8u;
++      const uint32_t debug_off = ReadU32(output, debug_position);
++      WriteU32(&output, debug_position,
++               debug_off ? static_cast<uint32_t>(raw_base + debug_off) : 0u);
++    }
++  }
++  std::set<std::pair<int, uint32_t>> annotation_seen;
++  for (const uint32_t annotation : annotations) {
++    RehPatchAnnotationTree(&output, annotation, raw_base, &annotation_seen,
++                           &ok);
++    if (!ok) {
++      return std::nullopt;
++    }
++  }
++
++  size_t class_data_base = RehAlign4(output.size());
++  if (class_data_base > output.size()) {
++    output.resize(class_data_base, 0u);
++  }
++  for (const uint32_t old : class_data_order) {
++    class_data_cache[old] = static_cast<uint32_t>(output.size());
++    RehClassData parsed;
++    if (!RehParseClassData(raw, old, &parsed, nullptr)) {
++      return std::nullopt;
++    }
++    const std::vector<uint8_t> encoded = RehEncodeClassData(parsed, raw_base);
++    output.insert(output.end(), encoded.begin(), encoded.end());
++  }
++  for (uint32_t index = 0u; index < counts[kRehClassDefs]; ++index) {
++    const size_t source =
++        layout.offsets[kRehClassDefs] + static_cast<size_t>(index) * 32u;
++    const uint32_t old_class_data = RehU32(raw, source + 24u, &ok);
++    if (!ok) {
++      return std::nullopt;
++    }
++    if (old_class_data) {
++      WriteU32(&output,
++               table_offsets[kRehClassDefs] + static_cast<size_t>(index) * 32u +
++                   24u,
++               class_data_cache[old_class_data]);
++    }
++  }
++
++  size_t map_off = RehAlign4(output.size());
++  if (map_off > output.size()) {
++    output.resize(map_off, 0u);
++  }
++  std::vector<std::array<uint32_t, 3>> map_items;  // {type, size, offset}
++  map_items.push_back({0x0000u, 1u, 0u});
++  map_items.push_back({0x0001u, counts[kRehStringIds],
++                       static_cast<uint32_t>(table_offsets[kRehStringIds])});
++  map_items.push_back({0x0002u, counts[kRehTypeIds],
++                       static_cast<uint32_t>(table_offsets[kRehTypeIds])});
++  map_items.push_back({0x0003u, counts[kRehProtoIds],
++                       static_cast<uint32_t>(table_offsets[kRehProtoIds])});
++  map_items.push_back({0x0004u, counts[kRehFieldIds],
++                       static_cast<uint32_t>(table_offsets[kRehFieldIds])});
++  map_items.push_back({0x0005u, counts[kRehMethodIds],
++                       static_cast<uint32_t>(table_offsets[kRehMethodIds])});
++  map_items.push_back({0x0006u, counts[kRehClassDefs],
++                       static_cast<uint32_t>(table_offsets[kRehClassDefs])});
++  for (const auto &[type, items] : groups) {
++    if (items.empty()) {
++      continue;
++    }
++    map_items.push_back({static_cast<uint32_t>(type),
++                         static_cast<uint32_t>(items.size()),
++                         static_cast<uint32_t>(raw_base + items.begin()->first)});
++  }
++  if (!class_data_cache.empty()) {
++    map_items.push_back({0x2000u,
++                         static_cast<uint32_t>(class_data_cache.size()),
++                         static_cast<uint32_t>(class_data_base)});
++  }
++  map_items.push_back({0x1000u, 1u, static_cast<uint32_t>(map_off)});
++  std::sort(map_items.begin(), map_items.end(),
++            [](const std::array<uint32_t, 3> &lhs,
++               const std::array<uint32_t, 3> &rhs) {
++              return lhs[2] < rhs[2];
++            });
++  {
++    std::vector<uint8_t> header(4u, 0u);
++    WriteU32(&header, 0u, static_cast<uint32_t>(map_items.size()));
++    output.insert(output.end(), header.begin(), header.end());
++  }
++  for (const auto &item : map_items) {
++    std::vector<uint8_t> entry(12u, 0u);
++    entry[0] = static_cast<uint8_t>(item[0]);
++    entry[1] = static_cast<uint8_t>(item[0] >> 8u);
++    WriteU32(&entry, 4u, item[1]);
++    WriteU32(&entry, 8u, item[2]);
++    output.insert(output.end(), entry.begin(), entry.end());
++  }
++
++  const size_t file_size = output.size();
++  static const uint8_t kMagic[8] = {'d', 'e', 'x', '\n', '0', '3', '5', '\0'};
++  std::copy(kMagic, kMagic + 8, output.begin());
++  WriteU32(&output, 32u, static_cast<uint32_t>(file_size));
++  WriteU32(&output, 36u, static_cast<uint32_t>(kRehHeaderSize));
++  WriteU32(&output, 40u, kRehEndian);
++  WriteU32(&output, 52u, static_cast<uint32_t>(map_off));
++  for (int section = 0; section < kRehSectionCount; ++section) {
++    WriteU32(&output, kRehHeaderPos[section], counts[section]);
++    WriteU32(&output, kRehHeaderPos[section] + 4u,
++             static_cast<uint32_t>(table_offsets[section]));
++  }
++  size_t first_data_offset = SIZE_MAX;
++  for (const auto &[type, items] : groups) {
++    static_cast<void>(type);
++    if (!items.empty()) {
++      first_data_offset = std::min(first_data_offset, items.begin()->first);
++    }
++  }
++  if (first_data_offset == SIZE_MAX) {
++    return std::nullopt;
++  }
++  const size_t data_off = raw_base + first_data_offset;
++  WriteU32(&output, 104u, static_cast<uint32_t>(file_size - data_off));
++  WriteU32(&output, 108u, static_cast<uint32_t>(data_off));
++  SHA1(output.data() + 32u, output.size() - 32u, output.data() + 12u);
++  WriteU32(&output, 8u,
++           static_cast<uint32_t>(adler32(adler32(0L, Z_NULL, 0),
++                                         output.data() + 12u,
++                                         output.size() - 12u)));
++  return output;
++}
++
++std::optional<std::vector<uint8_t>> RehydrateDexData(
++    const std::vector<uint8_t> &raw, const Json::Value &record) {
++  RehLayout layout;
++  if (!RehParseRuntimeLayout(raw, record, &layout)) {
++    return std::nullopt;
++  }
++  return RehBuild(raw, layout);
++}
++
+ bool ReadUleb128(const std::vector<uint8_t> &data, size_t *offset, size_t limit,
+                  uint32_t *value, std::string *error) {
+   uint32_t result = 0u;
+@@ -995,8 +2112,22 @@ ProcessSummary RepairProcess(const fs::path &process, const fs::path &output) {
+     }
+ 
+     if (RecordString(entry.record, "capture_kind") == "dexdata") {
+-      item["trust"] = "partial";
+       item["kind"] = "dexdata";
++      if (auto rebuilt = RehydrateDexData(data, entry.record);
++          rebuilt.has_value()) {
++        const fs::path rehydrated =
++            output / "repaired" / (entry.digest + ".rehydrated.dex");
++        if (WriteFile(rehydrated, *rebuilt)) {
++          item["trust"] = "verified";
++          item["output_kind"] = "reconstructed_standard";
++          item["file_size"] = Json::UInt64(rebuilt->size());
++          item["output"] =
++              fs::relative(rehydrated, output, error).generic_string();
++          items[entry.name] = std::move(item);
++          continue;
++        }
++      }
++      item["trust"] = "partial";
+       item["output_kind"] = "dexrecon";
+       item["reason"] = "dexrecon_missing_runtime_tables";
+       const fs::path partial =
+-- 
+2.43.0
+

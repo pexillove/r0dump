@@ -1,0 +1,111 @@
+From c45c9d5335c13cb0d85be6a7b4971691481077c1 Mon Sep 17 00:00:00 2001
+From: Ivory <contact@ivory.cafe>
+Date: Fri, 11 Sep 2026 08:25:42 +0800
+Subject: [PATCH 28/32] manager: default to a first/second-gen shell unpacking
+ baseline
+
+Retune the DEFAULTS profile so an operator gets broad coverage without hand-
+tuning. capture_point_mask gains the low-volume whole-DEX entry points a packer
+routes a decrypted image through -- Cookie.result.dex(0), InMemory.dex.parsed(2,
+InMemoryDexClassLoader), Walk.cookie.dex(39, active snapshot during the walk) --
+on top of OpenCommon.return(3), RegisterDexFile.return(5) and
+ForceInvoke.no_execute(41). walk_mode moves to dex_names so force-invoke visits
+every class and materialises lazily-restored second-gen CodeItems into the in-
+memory image before it is snapshotted. Per-method capture points are left off on
+purpose: max_records caps at 4096, so the design captures whole DEX images (few,
+large records), not one record per method. max_records/max_artifacts rise to the
+validator ceiling (4096/512) for multi-dex apps and their dynamically loaded
+shells. Byte budgets already sit at their maxima. Update the contract test's
+operational-baseline assertions to the new mask, walk mode and budgets.
+---
+ .../r0dumpmanager/domain/CapturePointRegistry.kt     | 12 +++++++++++-
+ .../r0dumpmanager/domain/FusionConfigDraft.kt        | 10 +++++++---
+ .../r0dumpmanager/domain/FusionConfigContractTest.kt |  7 +++++--
+ 3 files changed, 23 insertions(+), 6 deletions(-)
+
+diff --git a/src/com/android/r0dumpmanager/domain/CapturePointRegistry.kt b/src/com/android/r0dumpmanager/domain/CapturePointRegistry.kt
+index 049d3d6..e0aceae 100644
+--- a/src/com/android/r0dumpmanager/domain/CapturePointRegistry.kt
++++ b/src/com/android/r0dumpmanager/domain/CapturePointRegistry.kt
+@@ -12,7 +12,17 @@ object CapturePointRegistry {
+     val definedMask: ULong = (1uL shl pointCount) - 1uL
+     val undefinedMask: ULong = definedMask.inv()
+     val forceNoExecuteMask: ULong = 1uL shl 41
+-    val defaultMask: ULong = (1uL shl 3) or (1uL shl 5) or forceNoExecuteMask
++    // Baseline tuned to unpack first- and second-generation shells with whole-DEX
++    // capture (the design keeps records few: max_records caps at 4096, so per-method
++    // points are deliberately excluded). Covers the common load paths a gen-1 packer
++    // hands a decrypted DEX through -- OpenCommon (file), InMemory.dex.parsed
++    // (InMemoryDexClassLoader), Cookie.result.dex, RegisterDexFile.return -- plus the
++    // active DEX snapshot taken while walking (Walk.cookie.dex). ForceInvoke.no_execute
++    // materialises gen-2 method CodeItems into the in-memory image before it is
++    // snapshotted; pairing it with walk_mode=dex_names (walk every class) reaches
++    // lazily-restored methods without emitting a record per method.
++    val defaultMask: ULong = (1uL shl 0) or (1uL shl 2) or (1uL shl 3) or (1uL shl 5) or
++        (1uL shl 39) or forceNoExecuteMask
+     val points = listOf(
+         CapturePoint(0, "Cookie.result.dex", "CreateCookieFromOatFileManagerResult", "DEX snapshot"),
+         CapturePoint(1, "InMemory.buffer.copied", "DexFile_openInMemoryDexFilesNative", "raw buffer"),
+diff --git a/src/com/android/r0dumpmanager/domain/FusionConfigDraft.kt b/src/com/android/r0dumpmanager/domain/FusionConfigDraft.kt
+index a7dfb16..cd77caf 100644
+--- a/src/com/android/r0dumpmanager/domain/FusionConfigDraft.kt
++++ b/src/com/android/r0dumpmanager/domain/FusionConfigDraft.kt
+@@ -8,8 +8,10 @@ data class FusionConfigDraft(
+     val targetPackage: String = "",
+     val targetProcess: String = "",
+     val capturePointMask: ULong = CapturePointRegistry.defaultMask,
+-    val maxRecords: Long = 512,
+-    val maxArtifacts: Long = 128,
++    // Whole-DEX captures across a multi-dex app plus its dynamically loaded shells
++    // need headroom, so the baseline runs at the validator ceiling (4096/512).
++    val maxRecords: Long = 4096,
++    val maxArtifacts: Long = 512,
+     val maxTotalBytes: Long = 1_073_741_824,
+     val maxDexBytes: Long = 268_435_456,
+     val bufferPoolBytes: Long = 536_870_912,
+@@ -26,7 +28,9 @@ data class FusionConfigDraft(
+     val manifestMaxAttributeLength: Long = 1024,
+     val walkEnabled: Boolean = true,
+     val walkStart: WalkStart = WalkStart.AFTER_APPLICATION_ON_CREATE,
+-    val walkMode: WalkMode = WalkMode.LOADED_ONLY,
++    // Walk every class named in the DEX, not only the already-loaded ones, so
++    // force-invoke reaches lazily-restored second-generation methods.
++    val walkMode: WalkMode = WalkMode.DEX_NAMES,
+     val walkNamespacePrefix: String = "",
+     val walkDelayMs: Long = 5000,
+     val walkMaxClasses: Long = 16_384,
+diff --git a/tests/src/com/android/r0dumpmanager/domain/FusionConfigContractTest.kt b/tests/src/com/android/r0dumpmanager/domain/FusionConfigContractTest.kt
+index ae08b1d..d8255d1 100644
+--- a/tests/src/com/android/r0dumpmanager/domain/FusionConfigContractTest.kt
++++ b/tests/src/com/android/r0dumpmanager/domain/FusionConfigContractTest.kt
+@@ -11,7 +11,7 @@ class FusionConfigContractTest {
+         val json = JSONObject(FusionConfigSchema.toJson(FusionConfigSchema.defaults()))
+         assertEquals(FusionConfigSchema.FIELD_COUNT, json.length())
+         assertEquals(FusionConfigSchema.fields.toSet(), json.keys().asSequence().toSet())
+-        assertEquals("0x0000020000000028", json.getString("capture_point_mask"))
++        assertEquals("0x000002800000002d", json.getString("capture_point_mask"))
+         assertEquals("", json.getString("walk_namespace_prefix"))
+     }
+     @Test fun defaultsMatchTheManagerOperationalBaseline() {
+@@ -20,14 +20,17 @@ class FusionConfigContractTest {
+         assertEquals(268_435_456L, defaults.maxDexBytes)
+         assertEquals(536_870_912L, defaults.bufferPoolBytes)
+         assertEquals(4_194_304L, defaults.maxCodeItemBytes)
++        assertEquals(4096L, defaults.maxRecords)
++        assertEquals(512L, defaults.maxArtifacts)
+         assertTrue(defaults.manifestEnabled)
+         assertTrue(defaults.walkEnabled)
++        assertEquals(WalkMode.DEX_NAMES, defaults.walkMode)
+         assertEquals(16_384L, defaults.walkMaxClasses)
+         assertEquals(65_536L, defaults.walkMaxMethods)
+         assertTrue(defaults.forceInvokeEnabled)
+         assertTrue(defaults.anrProtectionEnabled)
+         assertEquals(
+-            setOf(3, 5, 41),
++            setOf(0, 2, 3, 5, 39, 41),
+             CapturePointRegistry.points.filter { CapturePointRegistry.contains(defaults.capturePointMask, it.bit) }
+                 .mapTo(mutableSetOf()) { it.bit },
+         )
+-- 
+2.43.0
+

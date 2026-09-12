@@ -1,0 +1,193 @@
+From 0aeb5be3a3e642b6a7ae6029a82d7d706dca9156 Mon Sep 17 00:00:00 2001
+From: Ivory <contact@ivory.cafe>
+Date: Fri, 11 Sep 2026 22:41:10 +0800
+Subject: [PATCH 32/32] manager: expose the full config surface + app actions
+ over MCP
+
+set_config now overlays any of the 35 schema fields by name (force_class,
+walk_delay_ms, manifest_max_components, ...) onto the profile-seeded draft via
+toJson->merge->fromJson, with friendly aliases (process main/all, walk_mode,
+walk_start, force_invoke, anr_protection, capture_mask). Add launch_app,
+stop_app and recover tools so an MCP client can drive the whole pipeline --
+configure (any field), enable/disable, cold-start/stop the target, recover, and
+repair_export -- matching every capability the UI has. Enables iterating the
+FART-style delay + active-invocation strategy (walk_delay_ms + force_invoke)
+entirely over MCP.
+---
+ .../android/r0dumpmanager/mcp/McpServer.kt    | 116 ++++++++++++++++--
+ 1 file changed, 103 insertions(+), 13 deletions(-)
+
+diff --git a/src/com/android/r0dumpmanager/mcp/McpServer.kt b/src/com/android/r0dumpmanager/mcp/McpServer.kt
+index 0b4cc8b..5e8ea89 100644
+--- a/src/com/android/r0dumpmanager/mcp/McpServer.kt
++++ b/src/com/android/r0dumpmanager/mcp/McpServer.kt
+@@ -11,6 +11,8 @@ import com.android.r0dumpmanager.domain.FusionConfigSchema
+ import com.android.r0dumpmanager.domain.FusionConfigValidator
+ import com.android.r0dumpmanager.domain.ProfileId
+ import com.android.r0dumpmanager.domain.ProfileRegistry
++import com.android.r0dumpmanager.domain.WalkMode
++import com.android.r0dumpmanager.domain.WalkStart
+ import org.json.JSONArray
+ import org.json.JSONObject
+ import java.time.Instant
+@@ -87,7 +89,9 @@ class McpServer(
+             .put(
+                 tool(
+                     "set_config",
+-                    "Build and publish a fusion config. 'profile' (defaults|coolapk|custom) seeds the draft; other fields override it.",
++                    "Build and publish a fusion config. 'profile' (defaults|coolapk|custom) seeds the draft; " +
++                        "then ANY of the 35 schema fields (by name, e.g. force_class, walk_delay_ms, " +
++                        "manifest_max_components) overrides it. Listed fields below are common shortcuts.",
+                     JSONObject()
+                         .put("package", strProp("target package name"))
+                         .put("process", strProp("'main', 'all', or an explicit process name"))
+@@ -95,12 +99,38 @@ class McpServer(
+                         .put("capture_mask", strProp("capture_point_mask as 0x-hex or decimal"))
+                         .put("max_records", intProp("record budget"))
+                         .put("max_artifacts", intProp("artifact budget"))
++                        .put("walk_enabled", boolProp("enable the class-loader walk"))
++                        .put("walk_mode", strProp("loaded_only (walk loaded classes) | dex_names"))
++                        .put("walk_start", strProp("app (after Application.onCreate) | activity (after first Activity)"))
++                        .put("walk_delay_ms", intProp("delay before the walk, so a packer finishes loading its classes"))
++                        .put("walk_max_classes", intProp("max classes the walk visits"))
++                        .put("walk_max_methods", intProp("max methods actively invoked"))
++                        .put("force_invoke", boolProp("actively invoke methods (no-execute) to materialize hidden code"))
++                        .put("force_max_calls", intProp("max force-invoke calls"))
++                        .put("anr_protection", boolProp("keep ANR protection on during heavy active invocation"))
+                         .put("enabled", boolProp("publish enabled (default: keep current)")),
+                     JSONArray().put("package"),
+                 ),
+             )
+             .put(tool("enable", "Publish the current draft with capture enabled.", none, empty))
+             .put(tool("disable", "Disable capture on the device.", none, empty))
++            .put(
++                tool(
++                    "launch_app",
++                    "Cold-start the target app (so its shell decrypts/loads and capture fires).",
++                    JSONObject().put("package", strProp("package to launch (default: current target)")),
++                    empty,
++                ),
++            )
++            .put(
++                tool(
++                    "stop_app",
++                    "Force-stop the target app and wait for it to die.",
++                    JSONObject().put("package", strProp("package to stop (default: current target)")),
++                    empty,
++                ),
++            )
++            .put(tool("recover", "Recover a config left in the interrupted (odd-generation) state.", none, empty))
+             .put(
+                 tool(
+                     "repair_export",
+@@ -121,6 +151,9 @@ class McpServer(
+                 "set_config" -> setConfig(args)
+                 "enable" -> enable()
+                 "disable" -> disable()
++                "launch_app" -> launchApp(args)
++                "stop_app" -> stopApp(args)
++                "recover" -> recover()
+                 "repair_export" -> repairExport(args)
+                 else -> return toolError("unknown tool: $name")
+             }
+@@ -165,21 +198,55 @@ class McpServer(
+         }
+         val seeded = if (profile == ProfileId.CUSTOM) current else ProfileRegistry.apply(profile, current)
+         val pkg = args.getString("package")
+-        val process = when (val requested = args.optString("process", "main").lowercase()) {
+-            "all" -> ""
+-            "main", "" -> pkg
+-            else -> if (requested == args.optString("process")) args.getString("process") else requested
++
++        // Every one of the 35 schema fields is settable: start from the seeded
++        // draft's full JSON and overlay any field the caller passed by its schema
++        // name (e.g. walk_delay_ms, force_class, manifest_max_components), plus a
++        // few friendly aliases. This keeps the MCP surface complete and future-proof.
++        val merged = JSONObject(FusionConfigSchema.toJson(seeded))
++        merged.put("target_package", pkg)
++        if (pkg != seeded.targetPackage) {
++            merged.put("target_process", pkg) // sensible default (main) for a new target
++        }
++        for (field in FusionConfigSchema.fields) {
++            if (field != "schema" && args.has(field)) merged.put(field, args.get(field))
++        }
++        if (args.has("process")) {
++            merged.put(
++                "target_process",
++                when (args.getString("process").lowercase()) {
++                    "all" -> ""
++                    "main" -> pkg
++                    else -> args.getString("process")
++                },
++            )
++        }
++        if (args.has("walk_mode")) {
++            merged.put(
++                "walk_mode",
++                when (args.getString("walk_mode").lowercase()) {
++                    "dex_names", "dex", "names" -> WalkMode.DEX_NAMES.propertyValue
++                    else -> WalkMode.LOADED_ONLY.propertyValue
++                },
++            )
++        }
++        if (args.has("walk_start")) {
++            merged.put(
++                "walk_start",
++                when (args.getString("walk_start").lowercase()) {
++                    "activity", "after_first_activity_on_create", "first_activity" ->
++                        WalkStart.AFTER_FIRST_ACTIVITY_ON_CREATE.propertyValue
++                    else -> WalkStart.AFTER_APPLICATION_ON_CREATE.propertyValue
++                },
++            )
+         }
+-        var draft = seeded.copy(
+-            targetPackage = pkg,
+-            targetProcess = process,
+-            maxRecords = args.optLong("max_records", seeded.maxRecords),
+-            maxArtifacts = args.optLong("max_artifacts", seeded.maxArtifacts),
+-            enabled = args.optBoolean("enabled", seeded.enabled),
+-        )
++        if (args.has("force_invoke")) merged.put("force_invoke_enabled", args.getBoolean("force_invoke"))
++        if (args.has("anr_protection")) merged.put("anr_protection_enabled", args.getBoolean("anr_protection"))
+         if (args.has("capture_mask")) {
+-            draft = draft.copy(capturePointMask = parseMask(args.getString("capture_mask")))
++            merged.put("capture_point_mask", FusionConfigSchema.maskText(parseMask(args.getString("capture_mask"))))
+         }
++
++        var draft = FusionConfigSchema.fromJson(merged.toString())
+         if (!FusionConfigValidator.isValidRunId(draft.runId)) {
+             draft = draft.copy(runId = createRunId(pkg, profile))
+         }
+@@ -193,6 +260,29 @@ class McpServer(
+         return snapshotJson(properties.publish(draft, generation)).put("ok", true)
+     }
+ 
++    private suspend fun launchApp(args: JSONObject): JSONObject {
++        val pkg = targetPackage(args)
++        packages.launch(pkg).getOrThrow()
++        return JSONObject().put("ok", true).put("launched", pkg)
++    }
++
++    private suspend fun stopApp(args: JSONObject): JSONObject {
++        val pkg = targetPackage(args)
++        packages.forceStopAndWait(pkg).getOrThrow()
++        return JSONObject().put("ok", true).put("stopped", pkg)
++    }
++
++    private suspend fun recover(): JSONObject =
++        snapshotJson(properties.recoverInterrupted()).put("ok", true)
++
++    private suspend fun targetPackage(args: JSONObject): String {
++        val pkg = args.optString("package").ifBlank {
++            properties.read().draftOrNull()?.targetPackage.orEmpty()
++        }
++        if (pkg.isBlank()) throw IllegalArgumentException("package is required (no current target)")
++        return pkg
++    }
++
+     private suspend fun enable(): JSONObject {
+         val snapshot = properties.read()
+         val draft = snapshot.draftOrNull()
+-- 
+2.43.0
+

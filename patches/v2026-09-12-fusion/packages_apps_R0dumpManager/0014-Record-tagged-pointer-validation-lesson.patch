@@ -1,0 +1,32 @@
+From 59699fa94296a3c3121d0e0e20a5951ba1f76513 Mon Sep 17 00:00:00 2001
+From: Ivory <contact@ivory.cafe>
+Date: Wed, 2 Sep 2026 07:45:00 +0800
+Subject: [PATCH 14/32] Record tagged pointer validation lesson
+
+Constraint: Arm64 diagnostic pointers may carry top-byte tags
+Rejected: Map lookup on unnormalized pointers | falsely reports readable headers as unavailable
+Confidence: high
+Scope-risk: narrow
+Directive: Normalize diagnostic addresses without changing runtime pointer semantics
+Tested: ART build and device smoke after replacement
+Not-tested: None
+---
+ IMPLEMENTATION.md | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/IMPLEMENTATION.md b/IMPLEMENTATION.md
+index 38025ce..e39de45 100644
+--- a/IMPLEMENTATION.md
++++ b/IMPLEMENTATION.md
+@@ -1553,6 +1553,8 @@ header counts，避免依赖保护器私有布局猜测：
+ 
+ * `runtime_view` 只描述 ART 实际观察到的地址、长度、section pointer/count、`dex_identity`、location
+   和每个 region 的来源；地址没有对应 raw span 时，报告必须降级，禁止填零或猜测 vendor 偏移。
++  Arm64 地址在进入 `/proc/self/maps` 校验前必须去除可能存在的 top-byte/MTE tag，否则同一可读区域
++  会被误判为不可读，进而丢失 header counts。
+ * `logical-data.raw` 是无 header 的 `DataBegin()/DataSize()` 逻辑镜像。对分裂匿名映射，运行时逐段通过
+   `/proc/self/maps` + `process_vm_readv` 复制，空洞保留为零并记录 partial 状态；禁止恢复为连续可读前
+   直接 `memcpy`。与同 run 的
+-- 
+2.43.0
+

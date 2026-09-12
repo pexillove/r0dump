@@ -1,0 +1,48 @@
+From eccdcd8db3208012bf6d2c4ebdc184c5f0944ab4 Mon Sep 17 00:00:00 2001
+From: Ivory <contact@ivory.cafe>
+Date: Wed, 2 Sep 2026 07:26:15 +0800
+Subject: [PATCH 13/32] Document protected DEX recovery and backfill limits
+
+Constraint: Protected runtime data may be sparse and artifact budgets are finite
+Rejected: Treating class names and CodeItems as a complete DEX | lacks table provenance and method-body bytes
+Confidence: high
+Scope-risk: narrow
+Directive: Preserve partial diagnostics and never promote incomplete logical images
+Tested: Documentation diff check; host source and Python regression tests
+Not-tested: None
+---
+ IMPLEMENTATION.md | 11 +++++++++--
+ 1 file changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/IMPLEMENTATION.md b/IMPLEMENTATION.md
+index 80630fa..38025ce 100644
+--- a/IMPLEMENTATION.md
++++ b/IMPLEMENTATION.md
+@@ -1547,15 +1547,22 @@ ART 仍在内存中的**逻辑 DEX 视图**：`DexFile` 的 identity/location、
+ 运行时字节按标准 DEX 035 重新排布，再计算 SHA-1/Adler-32。普通 `DexFile::Begin()/Size()` 快照在
+ verify、重定位或保护器处理后可能已经不是可解析的标准 DEX，因此不能替代逻辑视图。
+ 
+-Fusion 采用相同的证据分层，但不恢复旧版的全局 watcher：
++Fusion 采用相同的证据分层，但不恢复旧版的全局 watcher；当前实现由 ART 在 `DexFile` 上提供只读
++`R0dumpRuntimeView` 快照，直接暴露实际的 `data_begin/data_size`、六张 ID 表指针和可安全读取的
++header counts，避免依赖保护器私有布局猜测：
+ 
+ * `runtime_view` 只描述 ART 实际观察到的地址、长度、section pointer/count、`dex_identity`、location
+   和每个 region 的来源；地址没有对应 raw span 时，报告必须降级，禁止填零或猜测 vendor 偏移。
+-* `logical-data.raw` 是无 header 的 `DataBegin()/DataSize()` 逻辑镜像；与同 run 的
++* `logical-data.raw` 是无 header 的 `DataBegin()/DataSize()` 逻辑镜像。对分裂匿名映射，运行时逐段通过
++  `/proc/self/maps` + `process_vm_readv` 复制，空洞保留为零并记录 partial 状态；禁止恢复为连续可读前
++  直接 `memcpy`。与同 run 的
+   `logical-layout.json`（或 record 中内嵌的 `runtime_view`）配对后，才允许进入重建器。
+ * 只有六张 ID 表、所有可达 class-data、annotation/debug 及 CodeItem 均能在边界内解析，且引用关系
+   自洽时，输出 `reconstructed_standard_verified/*.dex`；缺少任一表或存在冲突时输出
+   `logical_layout`/evidence，仍可提供 descriptor catalog，但绝不伪造方法体。
++* CodeItem 回填必须按 `dex_object_id + method_index + 类名/方法名/描述符` 绑定目标 DEX；仅按方法索引
++  在多份运行时 DEX 间匹配会产生歧义。即使逻辑 DEX 已成功重建，若 CodeItem 受 artifact 预算丢弃，报告
++  仍应保留 `artifact_limit`，不能声称完成回填。
+ * 标准 DEX 修复、CodeItem 回填、逻辑视图重建是三个独立阶段。每阶段都保留原始 blob 和 report，重建
+   后再次校验 map list、header ranges、SHA-1 和 Adler-32；JADX 只消费 verified standard DEX。
+ 
+-- 
+2.43.0
+

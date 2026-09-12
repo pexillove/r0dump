@@ -1,0 +1,65 @@
+From 7c80e92eb2e44793bce7db886a1200245dc8610e Mon Sep 17 00:00:00 2001
+From: Ivory <contact@ivory.cafe>
+Date: Tue, 1 Sep 2026 22:13:15 +0800
+Subject: [PATCH 10/21] Keep empty runtime tables addressable
+
+Represent zero-count ID tables at the logical base so runtime_view remains parseable for sparse DEX layouts.\n\nConstraint: Rehydration metadata must retain all six table keys even when a table is empty.\nRejected: Omitting empty tables | The strict parser requires a complete section contract.\nConfidence: high\nScope-risk: narrow\nDirective: Preserve zero-count table entries when extending runtime provenance.\nTested: Python r0dump suite 18/18; diff --check.\nNot-tested: Android C++ build remains blocked by unrelated Soong dependency graph errors.
+
+Change-Id: I44cbd4def1829b190cc53e1d9fd8c0e6e4ed0529
+---
+ runtime/r0dump/r0dump_capture.cc | 27 ++++++++++++++++++---------
+ 1 file changed, 18 insertions(+), 9 deletions(-)
+
+diff --git a/runtime/r0dump/r0dump_capture.cc b/runtime/r0dump/r0dump_capture.cc
+index dfc60fc..769b4e5 100644
+--- a/runtime/r0dump/r0dump_capture.cc
++++ b/runtime/r0dump/r0dump_capture.cc
+@@ -386,7 +386,13 @@ r0dump_RecordMetadata r0dump_DexMetadata(const DexFile& dex) {
+   const size_t data_size = dex.DataSize();
+   const bool has_logical_base = data_begin != nullptr && data_size != 0u;
+   const auto in_logical_image = [&](uint32_t offset, uint32_t count, size_t item_size) {
+-    if (!has_logical_base || dex_begin == nullptr || offset < header.data_off_) {
++    if (!has_logical_base || dex_begin == nullptr) {
++      return false;
++    }
++    if (count == 0u) {
++      return true;
++    }
++    if (offset < header.data_off_) {
+       return false;
+     }
+     const uint64_t relative = static_cast<uint64_t>(offset) - header.data_off_;
+@@ -402,19 +408,22 @@ r0dump_RecordMetadata r0dump_DexMetadata(const DexFile& dex) {
+     char base[32];
+     std::snprintf(base, sizeof(base), "0x%llx",
+                   static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(data_begin)));
+-    const auto pointer = [&](uint32_t offset) {
++    const auto pointer = [&](uint32_t offset, uint32_t count) {
+       char value[32];
++      const uintptr_t address = count == 0u
++                                    ? reinterpret_cast<uintptr_t>(data_begin)
++                                    : reinterpret_cast<uintptr_t>(dex_begin) + offset;
+       std::snprintf(value, sizeof(value), "0x%llx",
+-                    static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(dex_begin) + offset));
++                    static_cast<unsigned long long>(address));
+       return std::string(value);
+     };
+     metadata.runtime_view_json = "{\"data_begin\":\"" + std::string(base) +
+-        "\",\"string_ids\":\"" + pointer(header.string_ids_off_) +
+-        "\",\"type_ids\":\"" + pointer(header.type_ids_off_) +
+-        "\",\"proto_ids\":\"" + pointer(header.proto_ids_off_) +
+-        "\",\"field_ids\":\"" + pointer(header.field_ids_off_) +
+-        "\",\"method_ids\":\"" + pointer(header.method_ids_off_) +
+-        "\",\"class_defs\":\"" + pointer(header.class_defs_off_) +
++        "\",\"string_ids\":\"" + pointer(header.string_ids_off_, header.string_ids_size_) +
++        "\",\"type_ids\":\"" + pointer(header.type_ids_off_, header.type_ids_size_) +
++        "\",\"proto_ids\":\"" + pointer(header.proto_ids_off_, header.proto_ids_size_) +
++        "\",\"field_ids\":\"" + pointer(header.field_ids_off_, header.field_ids_size_) +
++        "\",\"method_ids\":\"" + pointer(header.method_ids_off_, header.method_ids_size_) +
++        "\",\"class_defs\":\"" + pointer(header.class_defs_off_, header.class_defs_size_) +
+         "\",\"section_counts_current\":{\"string_ids\":" +
+         std::to_string(header.string_ids_size_) + ",\"type_ids\":" +
+         std::to_string(header.type_ids_size_) + ",\"proto_ids\":" +
+-- 
+2.43.0
+

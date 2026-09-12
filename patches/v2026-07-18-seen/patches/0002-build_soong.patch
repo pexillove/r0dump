@@ -1,0 +1,35 @@
+diff --git a/build/soong/scripts/gen_build_prop.py b/build/soong/scripts/gen_build_prop.py
+index aa721099679933c829f5ef9320c796ac77ff1559..8c1c5881adc0a643775919a9ccccb4eef6398b12 100644
+--- a/build/soong/scripts/gen_build_prop.py
++++ b/build/soong/scripts/gen_build_prop.py
+@@ -47,6 +47,14 @@ def get_build_keys(product_config):
+     return "release-keys"
+   return "dev-keys"
+ 
++def get_r0dump_display_id(config):
++  for prop in config.get("PRODUCT_PRODUCT_PROPERTIES", []):
++    if prop.startswith("ro.lineage.display.version="):
++      value = prop.split("=", 1)[1]
++      if value.startswith("R0DUMP_"):
++        return value.replace("_", " ")
++  return None
++
+ def override_config(config):
+   if "PRODUCT_BUILD_PROP_OVERRIDES" in config:
+     current_key = None
+@@ -209,8 +217,13 @@ def generate_build_info(args):
+ 
+   print(f"ro.build.id?={config['BuildId']}")
+ 
+-  # ro.build.display.id is shown under Settings -> About Phone
+-  if config["BuildVariant"] != "eng":
++  # ro.build.display.id is shown under Settings -> About Phone.
++  # Keep branded R0DUMP user builds stable across release signing instead of
++  # exposing the Android platform build ID (for example BP4A...).
++  r0dump_display_id = get_r0dump_display_id(config)
++  if r0dump_display_id:
++    print(f"ro.build.display.id?={r0dump_display_id}")
++  elif config["BuildVariant"] != "eng":
+     # User builds should show:
+     # release build number or branch.buld_number non-release builds
+ 

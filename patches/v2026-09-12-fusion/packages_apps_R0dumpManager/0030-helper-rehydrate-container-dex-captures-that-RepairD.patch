@@ -1,0 +1,68 @@
+From 5fd2da7bd6d5d968d843fd58ce82fb061191d26f Mon Sep 17 00:00:00 2001
+From: Ivory <contact@ivory.cafe>
+Date: Fri, 11 Sep 2026 19:00:30 +0800
+Subject: [PATCH 30/32] helper: rehydrate container 'dex' captures that
+ RepairDexFixed rejects
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A whole-DEX capture can be a DEX container: the header's file_size spans the
+container (data section shared across sub-DEXes) while the single-DEX structures
+end far earlier, so RepairDexFixed rejects it with data_range_out_of_bounds and
+the real code is lost to a partial. These captures carry a RuntimeView just like
+dexdata, so fall back to RehydrateDexData when the standard repair fails; on
+success emit a reconstructed_standard .rehydrated.dex marked verified. Found via
+com.icbc.elife (工银e生活), whose base.apk DEX is captured as a ~56MB container
+at RegisterDexFile.return; host rehydrate confirmed it rebuilds to a
+dexdump-valid image. Normal single DEXes are unaffected: they succeed in
+RepairDexFixed and never reach the fallback, and RehydrateDexData returns
+nullopt when no RuntimeView is present.
+---
+ helper/r0dump_export_core.cpp | 29 ++++++++++++++++++++++++-----
+ 1 file changed, 24 insertions(+), 5 deletions(-)
+
+diff --git a/helper/r0dump_export_core.cpp b/helper/r0dump_export_core.cpp
+index 77bb649..9d6696d 100644
+--- a/helper/r0dump_export_core.cpp
++++ b/helper/r0dump_export_core.cpp
+@@ -2147,12 +2147,31 @@ ProcessSummary RepairProcess(const fs::path &process, const fs::path &output) {
+           output / "repaired" / (entry.digest + ".dexfixed.dex");
+       WriteFile(fixed, *repaired);
+       item["output"] = fs::relative(fixed, output, error).generic_string();
+-    } else {
+-      const fs::path partial =
+-          output / "partial" / (entry.digest + ".partial.json");
+-      WriteText(partial, JsonText(item));
+-      item["output"] = fs::relative(partial, output, error).generic_string();
++      items[entry.name] = std::move(item);
++      continue;
+     }
++    // A "dex" capture whose header spans a container (its declared file_size
++    // exceeds the single-DEX extent, so RepairDexFixed reports
++    // data_range_out_of_bounds) still carries a RuntimeView. Rebuild it through
++    // the rehydrator, exactly as a dexdata capture, before giving up as partial.
++    if (auto rebuilt = RehydrateDexData(data, entry.record);
++        rebuilt.has_value()) {
++      const fs::path rehydrated =
++          output / "repaired" / (entry.digest + ".rehydrated.dex");
++      if (WriteFile(rehydrated, *rebuilt)) {
++        item.removeMember("reason");
++        item["trust"] = "verified";
++        item["output_kind"] = "reconstructed_standard";
++        item["file_size"] = Json::UInt64(rebuilt->size());
++        item["output"] = fs::relative(rehydrated, output, error).generic_string();
++        items[entry.name] = std::move(item);
++        continue;
++      }
++    }
++    const fs::path partial =
++        output / "partial" / (entry.digest + ".partial.json");
++    WriteText(partial, JsonText(item));
++    item["output"] = fs::relative(partial, output, error).generic_string();
+     items[entry.name] = std::move(item);
+   }
+ 
+-- 
+2.43.0
+

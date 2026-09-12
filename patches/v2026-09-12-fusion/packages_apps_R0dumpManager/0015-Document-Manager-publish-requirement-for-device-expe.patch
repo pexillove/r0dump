@@ -1,0 +1,36 @@
+From 7c418270c855ac110ac6d240404791aaf04ca80a Mon Sep 17 00:00:00 2001
+From: Ivory <contact@ivory.cafe>
+Date: Wed, 2 Sep 2026 07:45:51 +0800
+Subject: [PATCH 15/32] Document Manager publish requirement for device
+ experiments
+
+Constraint: ART process state is created by the framework publish path
+Rejected: Direct setprop-only experiments | do not create helper-backed sessions and can use invalid mask encoding
+Confidence: high
+Scope-risk: narrow
+Directive: Start targeted captures through Manager publish before launching the target package
+Tested: Manager documentation diff check; property format verified on device
+Not-tested: New targeted run pending Manager UI publish
+---
+ IMPLEMENTATION.md | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/IMPLEMENTATION.md b/IMPLEMENTATION.md
+index e39de45..5ea7305 100644
+--- a/IMPLEMENTATION.md
++++ b/IMPLEMENTATION.md
+@@ -1582,6 +1582,11 @@ run 根目录中的 `export-report.json` 记录设备、包名、远端 run、
+ 环境变量，以及 `--run-id`、`--no-repair`、`--dexdump`、`--jadx` 和 `--verbose` 参数；目标目录或 ZIP
+ 已存在时拒绝覆盖，拉取失败时清理 `.partial-*` 临时目录。整个流程不需要 `adb root`。
+ 
++设备实验不能只靠 `setprop` 拼出一组配置：`capture_point_mask` 必须使用 Manager 约定的 16 位十六进制
++格式，并且必须经 `r0dump_FusionConfig` 的 publish 接口创建 run 与 helper 侧的进程配置；否则 ART 进程
++即使能看到 property，也不会得到有效的 session/run 目录。针对 UI 的实验应从 Manager 提交配置，避免把
++“property 已写入”误认为“采集已启用”。
++
+ SELinux 增量替换是不可拆分事务，必须同时包含：
+ 
+ - `/system/etc/selinux/plat_sepolicy_and_mapping.sha256`；
+-- 
+2.43.0
+

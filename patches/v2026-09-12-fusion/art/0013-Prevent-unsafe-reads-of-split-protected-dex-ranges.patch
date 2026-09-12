@@ -1,0 +1,186 @@
+From 6f4618af1f745475cbf482e990a788909b12f83d Mon Sep 17 00:00:00 2001
+From: Ivory <contact@ivory.cafe>
+Date: Wed, 2 Sep 2026 06:02:41 +0800
+Subject: [PATCH 13/21] Prevent unsafe reads of split protected dex ranges
+
+The protected-Dex fallback now validates a contiguous readable mapping and copies logical data through process_vm_readv before hashing or staging it. This preserves evidence-only invalid_range behavior instead of crashing the target process when DataSize outlives its mapping.
+
+Constraint: protected loaders may repoint DataBegin/DataSize to stale or split virtual ranges
+Rejected: direct memcpy of DataBegin/DataSize | it caused SIGSEGV in r0dump_ObserveDexSource
+Confidence: high
+Scope-risk: narrow
+Directive: future segmented recovery must retain maps validation and a process_vm_readv TOCTOU gate
+Tested: m com.android.art -j8; deployed com.android.art.capex; com.VCB launch produced capture_flushed and no SIGSEGV
+Not-tested: complete com.VCB.ui.* logical-Dex reconstruction remains dependent on runtime table provenance
+Change-Id: I0d23bb4ed995c368c9e08f750be7ea0abe0728a0
+---
+ runtime/r0dump/r0dump_capture.cc | 122 ++++++++++++++++++++++++++++---
+ 1 file changed, 111 insertions(+), 11 deletions(-)
+
+diff --git a/runtime/r0dump/r0dump_capture.cc b/runtime/r0dump/r0dump_capture.cc
+index 769b4e5..f3e90ad 100644
+--- a/runtime/r0dump/r0dump_capture.cc
++++ b/runtime/r0dump/r0dump_capture.cc
+@@ -18,12 +18,16 @@
+ #include <algorithm>
+ #include <array>
+ #include <atomic>
++#include <cerrno>
++#include <cinttypes>
+ #include <cstring>
+ #include <cstdio>
+ #include <memory>
+ #include <mutex>
+ #include <optional>
+ #include <string_view>
++#include <sys/uio.h>
++#include <unistd.h>
+ #include <utility>
+ 
+ #include "art_method-inl.h"
+@@ -157,6 +161,48 @@ bool r0dump_IsBoundedSpan(const uint8_t* begin,
+          size <= container_end_value - begin_value;
+ }
+ 
++// A DexFile's logical data range can outlive the mapping that originally backed its header.
++// Before the protected-Dex fallback touches DataBegin/DataSize, prove that the whole span is
++// currently readable and contiguous.  This is intentionally a read-only maps query; it avoids
++// turning a stale or deliberately split range into a process crash during diagnostic capture.
++bool r0dump_IsReadableSpan(const uint8_t* begin, size_t size) {
++  if (begin == nullptr || size == 0u) {
++    return false;
++  }
++  const uintptr_t start = reinterpret_cast<uintptr_t>(begin);
++  if (size > UINTPTR_MAX - start) {
++    return false;
++  }
++  const uintptr_t end = start + size;
++  FILE* maps = fopen("/proc/self/maps", "re");
++  if (maps == nullptr) {
++    return false;
++  }
++  uintptr_t cursor = start;
++  char line[768] = {};
++  while (fgets(line, sizeof(line), maps) != nullptr) {
++    uintptr_t map_start = 0u;
++    uintptr_t map_end = 0u;
++    char permissions[5] = {};
++    if (sscanf(line, "%" SCNxPTR "-%" SCNxPTR " %4s", &map_start, &map_end, permissions) !=
++            3 ||
++        map_end <= cursor) {
++      continue;
++    }
++    if (map_start > cursor || permissions[0] != 'r') {
++      fclose(maps);
++      return false;
++    }
++    cursor = std::min(end, map_end);
++    if (cursor == end) {
++      fclose(maps);
++      return true;
++    }
++  }
++  fclose(maps);
++  return false;
++}
++
+ bool r0dump_GetCodeItemSpan(const DexFile& dex_file,
+                             const dex::CodeItem* code_item,
+                             size_t max_code_item_bytes,
+@@ -724,28 +770,82 @@ r0dump_CaptureResult r0dump_ObserveDexSource(r0dump_Point point,
+   r0dump_RecordMetadata metadata = r0dump_DexMetadata(dex);
+   r0dump_SetSourceMetadata(source, &metadata);
+   const std::shared_ptr<DexFileContainer>& container = dex.GetContainer();
+-  const std::optional<r0dump_DexFormat> format = r0dump_ValidateDexImage(dex.Begin(), dex.Size());
+-  if (dex.Size() > state->max_dex_bytes || dex.Size() > kR0dumpMaxDexBytesHardLimit ||
+-      container == nullptr || !format.has_value() ||
+-      !r0dump_IsBoundedSpan(
+-          dex.Begin(), dex.Size(), container->Begin(), container->End() - container->Begin())) {
++  const std::optional<r0dump_DexFormat> view_format =
++      r0dump_ValidateDexImage(dex.Begin(), dex.Size());
++  const bool view_bounded =
++      container != nullptr && view_format.has_value() &&
++      r0dump_IsBoundedSpan(
++          dex.Begin(), dex.Size(), container->Begin(), container->End() - container->Begin());
++  // A protected/relocated DexFile can retain a useful logical data mapping while its public
++  // header view has been repointed or invalidated.  The class-walk path is the last source
++  // observation before CodeItems are emitted, so keep that mapping instead of dropping the only
++  // DEX identity that can be used for host-side CodeItem backfill.  DataBegin/DataSize are the
++  // same range ART itself uses for section and CodeItem access; the size and header checks below
++  // remain the hard safety boundary before copying it into the pool.
++  const uint8_t* capture_begin = dex.Begin();
++  size_t capture_size = dex.Size();
++  r0dump_CaptureKind capture_kind = r0dump_CaptureKind::kDexView;
++  std::optional<r0dump_DexFormat> format = view_format;
++  std::unique_ptr<uint8_t[]> safe_fallback_copy;
++  if (!view_bounded) {
++    capture_begin = dex.DataBegin();
++    capture_size = dex.DataSize();
++    capture_kind = r0dump_CaptureKind::kDexData;
++    // Do not even inspect the fallback header until the first header-sized span is proven
++    // readable.  DataBegin/DataSize may describe stale or split mappings after protection.
++    if (r0dump_IsReadableSpan(capture_begin, sizeof(DexFile::Header))) {
++      format = r0dump_ValidateDexImage(capture_begin, capture_size);
++    }
++  }
++  if (capture_begin == nullptr || capture_size < sizeof(DexFile::Header) ||
++      capture_size > state->max_dex_bytes || capture_size > kR0dumpMaxDexBytesHardLimit ||
++      !r0dump_IsReadableSpan(capture_begin, capture_size) ||
++      (!format.has_value() && capture_kind == r0dump_CaptureKind::kDexView)) {
+     return r0dump_RecordDexSourceDrop(*state->staging,
+                                       context,
+                                       format.value_or(r0dump_DexFormat::kNotApplicable),
+                                       std::move(metadata));
+   }
+-  const uint64_t hash = r0dump_HashBytes(dex.Begin(), dex.Size());
++  if (capture_kind == r0dump_CaptureKind::kDexData) {
++    safe_fallback_copy.reset(new (std::nothrow) uint8_t[capture_size]);
++    if (safe_fallback_copy == nullptr) {
++      return r0dump_RecordDexSourceDrop(*state->staging,
++                                        context,
++                                        format.value_or(r0dump_DexFormat::kNotApplicable),
++                                        std::move(metadata));
++    }
++    const iovec local = {safe_fallback_copy.get(), capture_size};
++    const iovec remote = {const_cast<uint8_t*>(capture_begin), capture_size};
++    ssize_t copied;
++    do {
++      copied = process_vm_readv(getpid(), &local, 1u, &remote, 1u, 0u);
++    } while (copied < 0 && errno == EINTR);
++    if (copied != static_cast<ssize_t>(capture_size)) {
++      return r0dump_RecordDexSourceDrop(*state->staging,
++                                        context,
++                                        format.value_or(r0dump_DexFormat::kNotApplicable),
++                                        std::move(metadata));
++    }
++    capture_begin = safe_fallback_copy.get();
++  }
++  const uint64_t hash = r0dump_HashBytes(capture_begin, capture_size);
+   std::optional<r0dump_SubmitResult> referenced = state->staging->r0dump_TryReferenceDex(
+-      r0dump_CaptureKind::kDexView, *format, dex.Begin(), dex.Size(), hash, context, metadata);
++      capture_kind,
++      format.value_or(r0dump_DexFormat::kNotApplicable),
++      capture_begin,
++      capture_size,
++      hash,
++      context,
++      metadata);
+   if (referenced.has_value()) {
+     return {.status = r0dump_CaptureStatus::kSubmitted, .submit = *referenced};
+   }
+   return r0dump_CopyAndSubmitDex(*state->pool,
+                                  *state->staging,
+-                                 dex.Begin(),
+-                                 dex.Size(),
+-                                 r0dump_CaptureKind::kDexView,
+-                                 *format,
++                                 capture_begin,
++                                 capture_size,
++                                 capture_kind,
++                                 format.value_or(r0dump_DexFormat::kNotApplicable),
+                                  context,
+                                  std::move(metadata));
+ }
+-- 
+2.43.0
+

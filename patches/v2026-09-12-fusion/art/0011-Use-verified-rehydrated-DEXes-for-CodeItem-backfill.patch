@@ -1,0 +1,48 @@
+From 0349d3cfefea928939c67a61293bb753566e1d77 Mon Sep 17 00:00:00 2001
+From: Ivory <contact@ivory.cafe>
+Date: Tue, 1 Sep 2026 22:17:47 +0800
+Subject: [PATCH 11/21] Use verified rehydrated DEXes for CodeItem backfill
+
+Make logical-view reconstruction candidates available to the existing CodeItem matching stage so protected classes can receive captured method bodies when a complete runtime bundle is present.\n\nConstraint: Backfill remains gated by strict DEX validation and unique method identity.\nRejected: Keep rehydrated outputs isolated from backfill | That would discard the main recovery path for logical-only captures.\nConfidence: high\nScope-risk: narrow\nDirective: Preserve candidate validation before applying any CodeItem bytes.\nTested: Python r0dump suite 18/18; diff --check.\nNot-tested: Android build and device replacement remain blocked by Soong bootstrap errors.
+
+Change-Id: Ie31af3c0ea4daaf7a851771114e47c4f9f982633
+---
+ tools/r0dump/r0dump_host_repair.py | 16 +++++++++++++---
+ 1 file changed, 13 insertions(+), 3 deletions(-)
+
+diff --git a/tools/r0dump/r0dump_host_repair.py b/tools/r0dump/r0dump_host_repair.py
+index da3dd8b..711be9a 100755
+--- a/tools/r0dump/r0dump_host_repair.py
++++ b/tools/r0dump/r0dump_host_repair.py
+@@ -642,15 +642,25 @@ def r0dump_repair_run(run_dir: Path, output_dir: Path, dexdump: str | None = Non
+         if artifact is None or data is None or digest is None or record.get("capture_kind") == "codeitem":
+             continue
+         validation = r0dump_validate_dex(data)
++        candidate_data = data
++        candidate_artifact = str(artifact.relative_to(run_dir))
++        rehydrated = False
++        if validation.layout is None and record.get("capture_kind") == "dexdata":
++            candidate_data, _ = r0dump_try_rehydrate_logical(run_dir, record, artifact, data)
++            if candidate_data is not None:
++                validation = r0dump_validate_dex(candidate_data)
++                rehydrated = validation.layout is not None
+         if validation.layout is None:
+             continue
+         try:
+-            catalog = r0dump_method_catalog(data, validation.layout)
++            catalog = r0dump_method_catalog(candidate_data, validation.layout)
+         except ValueError:
+             continue
++        candidate_digest = r0dump_sha256(candidate_data)
+         dex_candidates.setdefault(
+-            digest,
+-            {"data": data, "artifact": str(artifact.relative_to(run_dir)), "catalog": catalog},
++            candidate_digest,
++            {"data": candidate_data, "artifact": candidate_artifact, "catalog": catalog,
++             "rehydrated": rehydrated},
+         )
+ 
+     input_entries: dict[str, dict[str, Any]] = {}
+-- 
+2.43.0
+

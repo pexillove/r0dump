@@ -1,0 +1,438 @@
+From 201f0ea7d4032948b44651d45022b9becab78f25 Mon Sep 17 00:00:00 2001
+From: Ivory <contact@ivory.cafe>
+Date: Sun, 30 Aug 2026 23:22:38 +0800
+Subject: [PATCH 2/9] Keep Manager publication atomic and owner-scoped
+
+Constraint: Manager must publish the complete 34-field contract without adding a Binder broker.
+Rejected: Direct per-property writes from app code | would split validation and transaction authority.
+Confidence: high
+Scope-risk: moderate
+Directive: Keep generation checks and read-back verification inside r0dump_FusionConfig.
+Tested: Targeted Framework production build, source contracts, and live publication/recovery matrix.
+Not-tested: FrameworksCoreTests remains blocked by unrelated lock-screen test compile errors.
+Change-Id: I17a90fd4b3e89833fa074f169aa56c4b83e9f879
+---
+ .../java/android/app/r0dump_FusionConfig.java | 154 +++++++++++++++++-
+ .../android/app/r0dump_FusionConfigTest.java  | 120 +++++++++++++-
+ .../server/am/ProcessErrorStateRecord.java    |   3 +-
+ .../am/r0dump_anr_protection_source_test.py   |   5 +-
+ 4 files changed, 271 insertions(+), 11 deletions(-)
+
+diff --git a/core/java/android/app/r0dump_FusionConfig.java b/core/java/android/app/r0dump_FusionConfig.java
+index 73150bbbc..eb4681310 100644
+--- a/core/java/android/app/r0dump_FusionConfig.java
++++ b/core/java/android/app/r0dump_FusionConfig.java
+@@ -178,6 +178,9 @@ public final class r0dump_FusionConfig {
+ 
+   static r0dump_FusionConfig r0dump_configureForApp(
+       Context appContext, String packageName, String processName) {
++    if (!r0dump_isSystemUserUid(Process.myUid())) {
++      return null;
++    }
+     final r0dump_FusionConfig config;
+     try {
+       config = r0dump_readPersisted(SYSTEM_PROPERTIES);
+@@ -322,11 +325,75 @@ public final class r0dump_FusionConfig {
+     return r0dump_writePersisted(config, SYSTEM_PROPERTIES);
+   }
+ 
++  /**
++   * Validates and atomically publishes a complete configuration for the system r0dump manager.
++   *
++   * @hide
++   */
++  public static long r0dump_writePersistedForManager(String rawConfig, long expectedGeneration) {
++    return r0dump_writePersistedForManager(rawConfig, expectedGeneration, SYSTEM_PROPERTIES);
++  }
++
++  /**
++   * Atomically disables the persisted configuration for the system r0dump manager.
++   *
++   * @hide
++   */
++  public static long r0dump_disablePersistedForManager(long expectedGeneration) {
++    return r0dump_disablePersistedForManager(expectedGeneration, SYSTEM_PROPERTIES);
++  }
++
++  /**
++   * Recovers an interrupted publication by committing a disabled snapshot.
++   *
++   * @hide
++   */
++  public static long r0dump_recoverDisabledPersistedForManager() {
++    return r0dump_recoverDisabledPersistedForManager(SYSTEM_PROPERTIES);
++  }
++
++  static long r0dump_writePersistedForManager(
++      String rawConfig, long expectedGeneration, r0dump_PropertyAccess properties) {
++    final r0dump_FusionConfig config = r0dump_parse(rawConfig);
++    final long generation = r0dump_requireExpectedStableGeneration(properties, expectedGeneration);
++    r0dump_publishCompleteOrThrow(config, generation, properties);
++    return generation + 2L;
++  }
++
++  static long r0dump_disablePersistedForManager(
++      long expectedGeneration, r0dump_PropertyAccess properties) {
++    final long generation = r0dump_requireExpectedStableGeneration(properties, expectedGeneration);
++    r0dump_publishDisabledOrThrow(generation, properties);
++    return generation + 2L;
++  }
++
++  static long r0dump_recoverDisabledPersistedForManager(r0dump_PropertyAccess properties) {
++    final long generation = r0dump_readGeneration(properties);
++    if ((generation & 1L) == 0L) {
++      throw r0dump_state("generation_not_in_progress");
++    }
++    if (generation == Long.MAX_VALUE) {
++      throw r0dump_state("generation_exhausted");
++    }
++    try {
++      properties.r0dump_set(PROPERTY_PREFIX + "enabled", "0");
++      properties.r0dump_set(PROPERTY_GENERATION, Long.toString(generation + 1L));
++    } catch (RuntimeException e) {
++      throw r0dump_state("property_write_failed");
++    }
++    r0dump_verifyDisabledOrThrow(generation + 1L, properties);
++    return generation + 1L;
++  }
++
+   /** Returns whether the current persisted snapshot protects this exact target from ANR kill. */
+-  public static boolean r0dump_shouldProtectAnr(String packageName, String processName) {
++  public static boolean r0dump_shouldProtectAnr(
++      int targetUid, String packageName, String processName) {
++    if (!r0dump_isSystemUserUid(targetUid)) {
++      return false;
++    }
+     try {
+       return r0dump_shouldProtectAnr(
+-          r0dump_readPersisted(SYSTEM_PROPERTIES), packageName, processName);
++          r0dump_readPersisted(SYSTEM_PROPERTIES), targetUid, packageName, processName);
+     } catch (RuntimeException e) {
+       Slog.w(TAG, "Unable to read ANR protection configuration");
+       return false;
+@@ -334,13 +401,86 @@ public final class r0dump_FusionConfig {
+   }
+ 
+   static boolean r0dump_shouldProtectAnr(
+-      r0dump_FusionConfig config, String packageName, String processName) {
++      r0dump_FusionConfig config, int targetUid, String packageName, String processName) {
+     return config != null
+         && config.enabled
+         && config.anrProtectionEnabled
++        && r0dump_isSystemUserUid(targetUid)
+         && config.r0dump_matchesProcess(packageName, processName);
+   }
+ 
++  private static long r0dump_requireExpectedStableGeneration(
++      r0dump_PropertyAccess properties, long expectedGeneration) {
++    if (expectedGeneration < 0L || (expectedGeneration & 1L) != 0L) {
++      throw r0dump_state("expected_generation");
++    }
++    final long generation = r0dump_readGeneration(properties);
++    if ((generation & 1L) != 0L) {
++      throw r0dump_state("generation_in_progress");
++    }
++    if (generation != expectedGeneration) {
++      throw r0dump_state("generation_conflict");
++    }
++    if (generation > Long.MAX_VALUE - 2L) {
++      throw r0dump_state("generation_exhausted");
++    }
++    return generation;
++  }
++
++  private static void r0dump_publishCompleteOrThrow(
++      r0dump_FusionConfig config, long generation, r0dump_PropertyAccess properties) {
++    final long publishingGeneration = generation + 1L;
++    try {
++      properties.r0dump_set(PROPERTY_GENERATION, Long.toString(publishingGeneration));
++      for (String field : FIELDS) {
++        properties.r0dump_set(PROPERTY_PREFIX + field, config.r0dump_propertyValue(field));
++      }
++      properties.r0dump_set(PROPERTY_GENERATION, Long.toString(publishingGeneration + 1L));
++    } catch (RuntimeException e) {
++      throw r0dump_state("property_write_failed");
++    }
++    r0dump_verifyCompleteOrThrow(config, publishingGeneration + 1L, properties);
++  }
++
++  private static void r0dump_publishDisabledOrThrow(
++      long generation, r0dump_PropertyAccess properties) {
++    final long publishingGeneration = generation + 1L;
++    try {
++      properties.r0dump_set(PROPERTY_GENERATION, Long.toString(publishingGeneration));
++      properties.r0dump_set(PROPERTY_PREFIX + "enabled", "0");
++      properties.r0dump_set(PROPERTY_GENERATION, Long.toString(publishingGeneration + 1L));
++    } catch (RuntimeException e) {
++      throw r0dump_state("property_write_failed");
++    }
++    r0dump_verifyDisabledOrThrow(publishingGeneration + 1L, properties);
++  }
++
++  private static void r0dump_verifyCompleteOrThrow(
++      r0dump_FusionConfig config, long expectedGeneration, r0dump_PropertyAccess properties) {
++    if (r0dump_readGeneration(properties) != expectedGeneration) {
++      throw r0dump_state("property_verification_failed");
++    }
++    for (String field : FIELDS) {
++      if (!config
++          .r0dump_propertyValue(field)
++          .equals(properties.r0dump_get(PROPERTY_PREFIX + field, ""))) {
++        throw r0dump_state("property_verification_failed");
++      }
++    }
++    if (r0dump_readGeneration(properties) != expectedGeneration) {
++      throw r0dump_state("property_verification_failed");
++    }
++  }
++
++  private static void r0dump_verifyDisabledOrThrow(
++      long expectedGeneration, r0dump_PropertyAccess properties) {
++    if (r0dump_readGeneration(properties) != expectedGeneration
++        || !"0".equals(properties.r0dump_get(PROPERTY_PREFIX + "enabled", ""))
++        || r0dump_readGeneration(properties) != expectedGeneration) {
++      throw r0dump_state("property_verification_failed");
++    }
++  }
++
+   private static long r0dump_readGeneration(r0dump_PropertyAccess properties) {
+     final String value = properties.r0dump_get(PROPERTY_GENERATION, "0");
+     try {
+@@ -824,6 +964,10 @@ public final class r0dump_FusionConfig {
+         .equals(outputParent);
+   }
+ 
++  static boolean r0dump_isSystemUserUid(int uid) {
++    return UserHandle.getUserId(uid) == UserHandle.USER_SYSTEM;
++  }
++
+   private String r0dump_propertyValue(String field) {
+     switch (field) {
+       case "schema":
+@@ -905,6 +1049,10 @@ public final class r0dump_FusionConfig {
+     return new IllegalArgumentException(field);
+   }
+ 
++  private static IllegalStateException r0dump_state(String reason) {
++    return new IllegalStateException(reason);
++  }
++
+   interface r0dump_Publisher {
+     boolean r0dump_publish(r0dump_FusionConfig config, String processName, String outputParent);
+   }
+diff --git a/core/tests/coretests/src/android/app/r0dump_FusionConfigTest.java b/core/tests/coretests/src/android/app/r0dump_FusionConfigTest.java
+index 1a1260546..cfa7f9100 100644
+--- a/core/tests/coretests/src/android/app/r0dump_FusionConfigTest.java
++++ b/core/tests/coretests/src/android/app/r0dump_FusionConfigTest.java
+@@ -320,6 +320,92 @@ public class r0dump_FusionConfigTest {
+         .isEqualTo("1");
+   }
+ 
++  @Test
++  public void r0dump_managerWrite_validatesPublishesAndVerifiesCompleteSnapshot() throws Exception {
++    final r0dump_FakeProperties properties = new r0dump_FakeProperties();
++    final String rawConfig = r0dump_validJson().toString();
++
++    assertThat(r0dump_FusionConfig.r0dump_writePersistedForManager(rawConfig, 0L, properties))
++        .isEqualTo(2L);
++    assertThat(properties.values.get(r0dump_FusionConfig.PROPERTY_PREFIX + "generation"))
++        .isEqualTo("2");
++    assertThat(properties.values.get(r0dump_FusionConfig.PROPERTY_PREFIX + "enabled"))
++        .isEqualTo("1");
++    assertThat(properties.values.get(r0dump_FusionConfig.PROPERTY_PREFIX + "run_id"))
++        .isEqualTo("20260824T120000Z-a1b2c3d4");
++
++    final IllegalStateException conflict =
++        assertThrows(
++            IllegalStateException.class,
++            () -> r0dump_FusionConfig.r0dump_writePersistedForManager(rawConfig, 0L, properties));
++    assertThat(conflict).hasMessageThat().isEqualTo("generation_conflict");
++  }
++
++  @Test
++  public void r0dump_managerDisableAndRecovery_commitDisabledEvenGeneration() throws Exception {
++    final r0dump_FakeProperties properties = new r0dump_FakeProperties();
++    r0dump_FusionConfig.r0dump_writePersistedForManager(
++        r0dump_validJson().toString(), 0L, properties);
++
++    assertThat(r0dump_FusionConfig.r0dump_disablePersistedForManager(2L, properties)).isEqualTo(4L);
++    assertThat(properties.values.get(r0dump_FusionConfig.PROPERTY_PREFIX + "generation"))
++        .isEqualTo("4");
++    assertThat(properties.values.get(r0dump_FusionConfig.PROPERTY_PREFIX + "enabled"))
++        .isEqualTo("0");
++    assertThat(properties.values.get(r0dump_FusionConfig.PROPERTY_PREFIX + "target_package"))
++        .isEqualTo(PACKAGE_NAME);
++
++    properties.values.put(r0dump_FusionConfig.PROPERTY_PREFIX + "generation", "5");
++    properties.values.put(r0dump_FusionConfig.PROPERTY_PREFIX + "enabled", "1");
++    assertThat(r0dump_FusionConfig.r0dump_recoverDisabledPersistedForManager(properties))
++        .isEqualTo(6L);
++    assertThat(properties.values.get(r0dump_FusionConfig.PROPERTY_PREFIX + "generation"))
++        .isEqualTo("6");
++    assertThat(properties.values.get(r0dump_FusionConfig.PROPERTY_PREFIX + "enabled"))
++        .isEqualTo("0");
++  }
++
++  @Test
++  public void r0dump_managerMutations_failClosedForInvalidGenerationAndReadbackMismatch()
++      throws Exception {
++    final r0dump_FakeProperties properties = new r0dump_FakeProperties();
++    properties.values.put(r0dump_FusionConfig.PROPERTY_PREFIX + "generation", "1");
++    final IllegalStateException inProgress =
++        assertThrows(
++            IllegalStateException.class,
++            () ->
++                r0dump_FusionConfig.r0dump_writePersistedForManager(
++                    r0dump_validJson().toString(), 0L, properties));
++    assertThat(inProgress).hasMessageThat().isEqualTo("generation_in_progress");
++
++    properties.values.put(r0dump_FusionConfig.PROPERTY_PREFIX + "generation", "0");
++    properties.corruptPropertyReads = true;
++    final IllegalStateException readbackMismatch =
++        assertThrows(
++            IllegalStateException.class,
++            () ->
++                r0dump_FusionConfig.r0dump_writePersistedForManager(
++                    r0dump_validJson().toString(), 0L, properties));
++    assertThat(readbackMismatch).hasMessageThat().isEqualTo("property_verification_failed");
++  }
++
++  @Test
++  public void r0dump_managerWrite_fieldFailureLeavesOddGenerationForRecovery() throws Exception {
++    final r0dump_FakeProperties properties = new r0dump_FakeProperties();
++    properties.failAfterSets = 1;
++
++    final IllegalStateException failure =
++        assertThrows(
++            IllegalStateException.class,
++            () ->
++                r0dump_FusionConfig.r0dump_writePersistedForManager(
++                    r0dump_validJson().toString(), 0L, properties));
++
++    assertThat(failure).hasMessageThat().isEqualTo("property_write_failed");
++    assertThat(properties.values.get(r0dump_FusionConfig.PROPERTY_PREFIX + "generation"))
++        .isEqualTo("1");
++  }
++
+   @Test
+   public void r0dump_shouldProtectAnr_requiresEnabledFlagAndExactTarget() throws Exception {
+     final r0dump_FusionConfig protectedConfig =
+@@ -328,15 +414,15 @@ public class r0dump_FusionConfigTest {
+ 
+     assertThat(
+             r0dump_FusionConfig.r0dump_shouldProtectAnr(
+-                protectedConfig, PACKAGE_NAME, PROCESS_NAME))
++                protectedConfig, Process.SYSTEM_UID, PACKAGE_NAME, PROCESS_NAME))
+         .isTrue();
+     assertThat(
+             r0dump_FusionConfig.r0dump_shouldProtectAnr(
+-                protectedConfig, PACKAGE_NAME, PACKAGE_NAME + ":child"))
++                protectedConfig, Process.SYSTEM_UID, PACKAGE_NAME, PACKAGE_NAME + ":child"))
+         .isFalse();
+     assertThat(
+             r0dump_FusionConfig.r0dump_shouldProtectAnr(
+-                protectedConfig, "other.package", PROCESS_NAME))
++                protectedConfig, Process.SYSTEM_UID, "other.package", PROCESS_NAME))
+         .isFalse();
+ 
+     final r0dump_FusionConfig allProcessesConfig =
+@@ -347,14 +433,29 @@ public class r0dump_FusionConfigTest {
+                 .toString());
+     assertThat(
+             r0dump_FusionConfig.r0dump_shouldProtectAnr(
+-                allProcessesConfig, PACKAGE_NAME, PACKAGE_NAME + ":child"))
++                allProcessesConfig, Process.SYSTEM_UID, PACKAGE_NAME, PACKAGE_NAME + ":child"))
+         .isTrue();
+ 
+     final r0dump_FusionConfig unprotectedConfig =
+         r0dump_FusionConfig.r0dump_parse(r0dump_validJson().toString());
+     assertThat(
+             r0dump_FusionConfig.r0dump_shouldProtectAnr(
+-                unprotectedConfig, PACKAGE_NAME, PROCESS_NAME))
++                unprotectedConfig, Process.SYSTEM_UID, PACKAGE_NAME, PROCESS_NAME))
++        .isFalse();
++  }
++
++  @Test
++  public void r0dump_systemUserBoundary_rejectsSecondaryUserForAnr() throws Exception {
++    final r0dump_FusionConfig protectedConfig =
++        r0dump_FusionConfig.r0dump_parse(
++            r0dump_validJson().put("anr_protection_enabled", true).toString());
++    final int secondaryUserUid = UserHandle.PER_USER_RANGE + 10000;
++
++    assertThat(r0dump_FusionConfig.r0dump_isSystemUserUid(Process.SYSTEM_UID)).isTrue();
++    assertThat(r0dump_FusionConfig.r0dump_isSystemUserUid(secondaryUserUid)).isFalse();
++    assertThat(
++            r0dump_FusionConfig.r0dump_shouldProtectAnr(
++                protectedConfig, secondaryUserUid, PACKAGE_NAME, PROCESS_NAME))
+         .isFalse();
+   }
+ 
+@@ -475,6 +576,9 @@ public class r0dump_FusionConfigTest {
+       implements r0dump_FusionConfig.r0dump_PropertyAccess {
+     final Map<String, String> values = new HashMap<>();
+     boolean changeGenerationAfterFirstRead;
++    boolean corruptPropertyReads;
++    int failAfterSets = -1;
++    int setCalls;
+     int generationReads;
+ 
+     @Override
+@@ -485,11 +589,17 @@ public class r0dump_FusionConfigTest {
+           return Long.toString(Long.parseLong(values.get(key)) + 2L);
+         }
+       }
++      if (corruptPropertyReads && key.endsWith("run_id")) {
++        return "corrupt";
++      }
+       return values.getOrDefault(key, defaultValue);
+     }
+ 
+     @Override
+     public void r0dump_set(String key, String value) {
++      if (failAfterSets >= 0 && setCalls++ >= failAfterSets) {
++        throw new IllegalStateException("injected_write_failure");
++      }
+       values.put(key, value);
+     }
+   }
+diff --git a/services/core/java/com/android/server/am/ProcessErrorStateRecord.java b/services/core/java/com/android/server/am/ProcessErrorStateRecord.java
+index 606fd202b..b5fc861b9 100644
+--- a/services/core/java/com/android/server/am/ProcessErrorStateRecord.java
++++ b/services/core/java/com/android/server/am/ProcessErrorStateRecord.java
+@@ -276,7 +276,8 @@ class ProcessErrorStateRecord {
+             return false;
+         }
+         final String packageName = mApp.info.packageName;
+-        if (!r0dump_FusionConfig.r0dump_shouldProtectAnr(packageName, mApp.processName)) {
++        if (!r0dump_FusionConfig.r0dump_shouldProtectAnr(
++                mApp.uid, packageName, mApp.processName)) {
+             return false;
+         }
+         Slog.w(TAG, "r0dump ANR protection suppressed kill for package=" + packageName
+diff --git a/services/core/java/com/android/server/am/r0dump_anr_protection_source_test.py b/services/core/java/com/android/server/am/r0dump_anr_protection_source_test.py
+index 30994cf96..b56340501 100644
+--- a/services/core/java/com/android/server/am/r0dump_anr_protection_source_test.py
++++ b/services/core/java/com/android/server/am/r0dump_anr_protection_source_test.py
+@@ -20,7 +20,7 @@ def main() -> None:
+     r0dump_require(process_error, "import android.app.r0dump_FusionConfig;")
+     r0dump_require(
+         process_error,
+-        "r0dump_FusionConfig.r0dump_shouldProtectAnr(packageName, mApp.processName)",
++        "r0dump_FusionConfig.r0dump_shouldProtectAnr(\n                mApp.uid, packageName, mApp.processName)",
+     )
+     if process_error.count("r0dump_shouldSuppressAnrKillLocked(annotation)") != 3:
+         raise AssertionError("all three ANR kill exits must use the r0dump protection gate")
+@@ -32,7 +32,8 @@ def main() -> None:
+         config,
+         'r0dump_readPropertyBoolean(properties, "anr_protection_enabled", "0")',
+     )
+-    r0dump_require(config, "public static boolean r0dump_shouldProtectAnr(")
++    r0dump_require(config, "public static boolean r0dump_shouldProtectAnr(\n      int targetUid")
++    r0dump_require(config, "UserHandle.getUserId(uid) == UserHandle.USER_SYSTEM")
+ 
+ 
+ if __name__ == "__main__":
+-- 
+2.43.0
+

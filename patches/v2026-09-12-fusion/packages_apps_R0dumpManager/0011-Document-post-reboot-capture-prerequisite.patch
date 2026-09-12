@@ -1,0 +1,35 @@
+From 9614e80a9c943b30dc3a838b95e9353949d734f0 Mon Sep 17 00:00:00 2001
+From: Ivory <contact@ivory.cafe>
+Date: Wed, 2 Sep 2026 04:38:25 +0800
+Subject: [PATCH 11/32] Document post-reboot capture prerequisite
+
+Constraint: Capture validation must distinguish a locked user state from package or ART failures.
+Rejected: Diagnose Activity class not found as an ART regression | RUNNING_LOCKED suppresses ordinary application activity resolution.
+Confidence: high
+Scope-risk: narrow
+Directive: Unlock the test user before launch and disable Fusion after each capture run.
+Tested: Physical OnePlus 9 run after unlock; com.VCB capture and export completed.
+Not-tested: User build and locked-user capture path.
+---
+ IMPLEMENTATION.md | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/IMPLEMENTATION.md b/IMPLEMENTATION.md
+index 7f7a1c8..b19b015 100644
+--- a/IMPLEMENTATION.md
++++ b/IMPLEMENTATION.md
+@@ -1501,6 +1501,11 @@ ART APEX 构建。
+ 确认图稳定，再执行 `m com.android.art -j8`；必须以 `#### build completed successfully` 和新生成的
+ `system/apex/com.android.art.capex` 为成功证据。
+ 
++设备重启后的另一个陷阱是用户可能仍处于 `RUNNING_LOCKED`。此时 PackageManager 会暂时不向 shell
++解析普通应用的 Activity，`am start`/`monkey` 可能返回 `Activity class ... does not exist`，这不代表 APK
++或 ART 损坏；先解锁用户（测试机 PIN 为 `2468`），再启动目标应用并检查 `sys.user.0.ce_available`。
++捕获完成后应关闭 `persist.sys.r0dump.fusion.enabled`，避免下一次实验继续消耗 512 个 artifact 配额。
++
+ #### 一键导出并修复最新产物
+ 
+ `tools/export_latest.py` 通过普通 `adb shell` 权限读取指定包的 external-files 目录，从包含至少一个 artifact
+-- 
+2.43.0
+

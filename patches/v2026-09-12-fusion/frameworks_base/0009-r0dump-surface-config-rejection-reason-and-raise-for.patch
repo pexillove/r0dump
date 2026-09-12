@@ -1,0 +1,57 @@
+From 9687f4852d6bba0d396ad9773b69eb22952ac139 Mon Sep 17 00:00:00 2001
+From: Ivory <contact@ivory.cafe>
+Date: Thu, 10 Sep 2026 22:03:23 +0800
+Subject: [PATCH 9/9] r0dump: surface config-rejection reason and raise
+ force-invoke cap
+
+Log the caught exception when per-process config reading fails so the
+specific rejected field (e.g. walk_namespace_prefix) reaches logcat
+instead of a generic "Unable to read process configuration". Raise the
+force_max_calls cap from 8 to 10,000,000 to match walk_max_methods, and
+update the boundary test accordingly.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Change-Id: I33dac8b32bd5ec2a8be495bd0bc5e4d251a42edb
+---
+ core/java/android/app/r0dump_FusionConfig.java                | 4 ++--
+ .../coretests/src/android/app/r0dump_FusionConfigTest.java    | 2 +-
+ 2 files changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/core/java/android/app/r0dump_FusionConfig.java b/core/java/android/app/r0dump_FusionConfig.java
+index 7050b271b..c82376c15 100644
+--- a/core/java/android/app/r0dump_FusionConfig.java
++++ b/core/java/android/app/r0dump_FusionConfig.java
+@@ -193,7 +193,7 @@ public final class r0dump_FusionConfig {
+     try {
+       config = r0dump_readPersisted(SYSTEM_PROPERTIES);
+     } catch (RuntimeException e) {
+-      Slog.w(TAG, "Unable to read process configuration");
++      Slog.w(TAG, "Unable to read process configuration", e);
+       return null;
+     }
+     if (config == null) {
+@@ -779,7 +779,7 @@ public final class r0dump_FusionConfig {
+         || walkMaxMethods > 10000000) {
+       throw r0dump_invalid("walk_limits");
+     }
+-    if (forceMaxCalls == 0 || forceMaxCalls > 8) {
++    if (forceMaxCalls == 0 || forceMaxCalls > 10000000) {
+       throw r0dump_invalid("force_max_calls");
+     }
+     if (forceInvokeEnabled) {
+diff --git a/core/tests/coretests/src/android/app/r0dump_FusionConfigTest.java b/core/tests/coretests/src/android/app/r0dump_FusionConfigTest.java
+index acca0732c..396d72930 100644
+--- a/core/tests/coretests/src/android/app/r0dump_FusionConfigTest.java
++++ b/core/tests/coretests/src/android/app/r0dump_FusionConfigTest.java
+@@ -575,7 +575,7 @@ public class r0dump_FusionConfigTest {
+     r0dump_assertInvalid(r0dump_validJson().put("manifest_max_attribute_length", 4097).toString());
+     r0dump_assertInvalid(r0dump_validJson().put("walk_max_classes", 1000001).toString());
+     r0dump_assertInvalid(r0dump_validJson().put("walk_max_methods", 10000001).toString());
+-    r0dump_assertInvalid(r0dump_validJson().put("force_max_calls", 9).toString());
++    r0dump_assertInvalid(r0dump_validJson().put("force_max_calls", 10000001).toString());
+   }
+ 
+   private static void r0dump_assertInvalid(String rawConfig) {
+-- 
+2.43.0
+

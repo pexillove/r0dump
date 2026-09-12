@@ -1,0 +1,54 @@
+From b593d2eecb7c020b31b91c5eac65a6860f9ae729 Mon Sep 17 00:00:00 2001
+From: Ivory <contact@ivory.cafe>
+Date: Wed, 2 Sep 2026 07:44:42 +0800
+Subject: [PATCH 15/21] Normalize tagged header addresses before readability
+ checks
+
+Constraint: Arm64 protected DexFile pointers may carry top-byte tags
+Rejected: Treat tagged addresses as raw /proc/self/maps keys | suppresses safe header count capture
+Confidence: medium
+Scope-risk: narrow
+Directive: Keep pointer normalization limited to diagnostic address validation
+Tested: m com.android.art -j8; device replacement and com.VCB process smoke
+Not-tested: Fresh manager-created targeted run after property-only configuration
+Change-Id: Ib4ec50894fef133c90753367b6d7cd28b0de1d75
+---
+ runtime/r0dump/r0dump_capture.cc | 13 ++++++++++---
+ 1 file changed, 10 insertions(+), 3 deletions(-)
+
+diff --git a/runtime/r0dump/r0dump_capture.cc b/runtime/r0dump/r0dump_capture.cc
+index 6718f3f..6f9fcda 100644
+--- a/runtime/r0dump/r0dump_capture.cc
++++ b/runtime/r0dump/r0dump_capture.cc
+@@ -204,6 +204,12 @@ bool r0dump_IsReadableSpan(const uint8_t* begin, size_t size) {
+   return false;
+ }
+ 
++uintptr_t r0dump_UntagAddress(uintptr_t address) {
++  // Android arm64 user virtual addresses currently use at most 56 bits; strip a possible
++  // top-byte/MTE tag before looking the address up in /proc/self/maps.
++  return address & UINT64_C(0x00ffffffffffffff);
++}
++
+ void r0dump_AnnotateLogicalCopy(r0dump_RecordMetadata* metadata,
+                                 bool complete,
+                                 size_t copied_bytes) {
+@@ -514,11 +520,12 @@ r0dump_RecordMetadata r0dump_DexMetadata(const DexFile& dex) {
+   // remains metadata-only; bytes are copied through the guarded kDexData path and validated by the
+   // host before any pointer is dereferenced.
+   DexFile::R0dumpRuntimeView runtime = dex.GetR0dumpRuntimeView();
+-  if (runtime.header != 0u &&
+-      r0dump_IsReadableSpan(reinterpret_cast<const uint8_t*>(runtime.header),
++  const uintptr_t header_address = r0dump_UntagAddress(runtime.header);
++  if (header_address != 0u &&
++      r0dump_IsReadableSpan(reinterpret_cast<const uint8_t*>(header_address),
+                             sizeof(DexFile::Header))) {
+     DexFile::Header header = {};
+-    std::memcpy(&header, reinterpret_cast<const void*>(runtime.header), sizeof(header));
++    std::memcpy(&header, reinterpret_cast<const void*>(header_address), sizeof(header));
+     runtime.string_ids_count = header.string_ids_size_;
+     runtime.type_ids_count = header.type_ids_size_;
+     runtime.field_ids_count = header.field_ids_size_;
+-- 
+2.43.0
+

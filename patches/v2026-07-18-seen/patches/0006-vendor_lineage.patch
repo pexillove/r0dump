@@ -1,0 +1,34 @@
+diff --git a/vendor/lineage/config/common.mk b/vendor/lineage/config/common.mk
+index 579d6bfe719b8088021bbf46469a360c439c1156..603a764ee45852e360a9a22856ba6c6bb9d57f62 100644
+--- a/vendor/lineage/config/common.mk
++++ b/vendor/lineage/config/common.mk
+@@ -159,7 +159,7 @@ endif
+ # R0DUMP-only test branch: keep the integration surface limited to the manager app.
+ PRODUCT_PACKAGES += \
+     R0DUMPManager \
+-    privapp_permissions_com_android_far0tmanager
++    privapp_permissions_com_android_r0dumpmanager
+ 
+ PRODUCT_PACKAGES += \
+     LineageSettingsProvider \
+@@ -307,4 +307,4 @@ include vendor/lineage/config/version.mk
+ -include vendor/lineage/config/partner_gms.mk
+ 
+ # R0DUMP runtime gate consumed by ActivityThread; keep true only on R0DUMP test builds.
+-PRODUCT_SYSTEM_PROPERTIES += persist.far0t.build_enabled=true
++PRODUCT_SYSTEM_PROPERTIES += persist.r0dump.build_enabled=true
+diff --git a/vendor/lineage/config/version.mk b/vendor/lineage/config/version.mk
+index 44a96b7f0f8af60834b07e479e8cc55da6901d08..cfb1d083b7a143599adc20cf5b5df7da169c68d1 100644
+--- a/vendor/lineage/config/version.mk
++++ b/vendor/lineage/config/version.mk
+@@ -35,8 +35,8 @@ LINEAGE_VERSION_SUFFIX := $(LINEAGE_BUILD_DATE)-$(LINEAGE_BUILDTYPE)$(LINEAGE_EX
+ LINEAGE_VERSION := $(PRODUCT_VERSION_MAJOR).$(PRODUCT_VERSION_MINOR)-$(LINEAGE_VERSION_SUFFIX)
+ 
+ # Display version
+-# R0DUMP keeps the build-system property value space-free; Settings renders it as "R0DUMP 14".
+-LINEAGE_DISPLAY_VERSION := R0DUMP_14
++# R0DUMP keeps the build-system property value space-free; Settings renders it as "R0DUMP 16".
++LINEAGE_DISPLAY_VERSION := R0DUMP_16
+ 
+ # LineageOS version properties
+ PRODUCT_PRODUCT_PROPERTIES += \

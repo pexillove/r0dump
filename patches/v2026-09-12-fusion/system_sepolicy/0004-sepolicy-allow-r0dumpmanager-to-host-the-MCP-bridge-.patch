@@ -1,0 +1,35 @@
+From b084579bd9b1620978f239b1a8922bdc12dab0e3 Mon Sep 17 00:00:00 2001
+From: Ivory <contact@ivory.cafe>
+Date: Fri, 11 Sep 2026 21:33:11 +0800
+Subject: [PATCH 4/4] sepolicy: allow r0dumpmanager to host the MCP bridge
+ socket (userdebug)
+
+Under userdebug/eng only, let r0dump_manager_app create/bind/listen/accept its
+abstract 'r0dump_mcp' unix stream socket and let the shell domain (where adb
+launches r0dump_mcp_bridge) connectto it, so the in-app MCP server is reachable
+over adb without UI automation.
+
+Change-Id: I8ea4b6a648d5ae24ed14c689249f8a3ee24343bc
+---
+ private/r0dump_manager_app.te | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/private/r0dump_manager_app.te b/private/r0dump_manager_app.te
+index 836acb4..9171c21 100644
+--- a/private/r0dump_manager_app.te
++++ b/private/r0dump_manager_app.te
+@@ -12,3 +12,11 @@ allow r0dump_manager_app system_api_service:service_manager find;
+ set_prop(r0dump_manager_app, r0dump_fusion_prop)
+ get_prop(appdomain, r0dump_fusion_prop)
+ get_prop(system_server, r0dump_fusion_prop)
++
++# MCP bridge: the app hosts an abstract-namespace stream socket ("r0dump_mcp")
++# that the r0dump_mcp_bridge relay (spawned in the shell domain by adb exec-out)
++# connects to. Gate this to userdebug/eng where adb automation is expected.
++userdebug_or_eng(`
++    allow r0dump_manager_app self:unix_stream_socket { create bind listen accept read write getopt setopt shutdown };
++    allow shell r0dump_manager_app:unix_stream_socket connectto;
++')
+-- 
+2.43.0
+

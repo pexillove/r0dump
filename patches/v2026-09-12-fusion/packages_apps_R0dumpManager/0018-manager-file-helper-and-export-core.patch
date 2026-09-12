@@ -1,0 +1,254 @@
+From dba75c9efd91bd8b329ecce460faa4badbf8a62f Mon Sep 17 00:00:00 2001
+From: Ivory <contact@ivory.cafe>
+Date: Thu, 10 Sep 2026 21:46:41 +0800
+Subject: [PATCH 18/32] manager: file helper and export core
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ helper/r0dump_export_core.cpp      | 66 +++++++++++++++++++++++++++
+ helper/r0dump_file_helper.cpp      |  2 +-
+ helper/r0dump_file_helper_core.cpp |  2 +-
+ helper/r0dump_file_helper_test.cpp | 71 ++++++++++++++++++++++++++++--
+ 4 files changed, 136 insertions(+), 5 deletions(-)
+
+diff --git a/helper/r0dump_export_core.cpp b/helper/r0dump_export_core.cpp
+index 9f0f74a..8a305e7 100644
+--- a/helper/r0dump_export_core.cpp
++++ b/helper/r0dump_export_core.cpp
+@@ -800,6 +800,20 @@ std::optional<std::string> MethodIdentity(const Json::Value &record) {
+   return std::nullopt;
+ }
+ 
++std::optional<std::string> ExecutionPathIdentity(const Json::Value &record) {
++  if (record["dex_object_id"].isNull() || !record["method_index"].isUInt()) {
++    return std::nullopt;
++  }
++  std::string key = record["dex_object_id"].asString() + "\n" +
++                    std::to_string(record["method_index"].asUInt()) + "\n";
++  if (record["active_attempt_id"].isIntegral()) {
++    key += record["active_attempt_id"].asString();
++  } else {
++    key += "null";
++  }
++  return key;
++}
++
+ std::vector<fs::path> SortedJsonRecords(const fs::path &records) {
+   std::vector<fs::path> paths;
+   std::error_code error;
+@@ -1194,6 +1208,57 @@ ProcessSummary RepairProcess(const fs::path &process, const fs::path &output) {
+     item["output"] = fs::relative(partial, output, error).generic_string();
+   }
+ 
++  std::map<std::string, Json::Value> execution_paths;
++  std::map<std::string, std::vector<std::string>> execution_hashes;
++  std::vector<std::string> execution_path_order;
++  for (const Discovered &entry : discovered) {
++    const std::string phase = RecordString(entry.record, "observation_phase");
++    const std::optional<std::string> identity = ExecutionPathIdentity(entry.record);
++    if (phase.empty() || !identity.has_value()) {
++      continue;
++    }
++    auto [found, inserted] = execution_paths.try_emplace(*identity, Json::Value(Json::objectValue));
++    Json::Value &path = found->second;
++    if (inserted) {
++      execution_path_order.push_back(*identity);
++      path["dex_object_id"] = entry.record["dex_object_id"];
++      path["method_index"] = entry.record["method_index"];
++      path["active_attempt_id"] = entry.record["active_attempt_id"];
++      const std::string entry_kind = RecordString(entry.record, "entry_kind");
++      path["first_entry_kind"] = entry_kind.empty() ? "unknown" : entry_kind;
++      path["observed_phases"] = Json::Value(Json::arrayValue);
++      path["first_artifact_fast_hash"] = Json::Value(Json::nullValue);
++      path["last_artifact_fast_hash"] = Json::Value(Json::nullValue);
++      path["code_item_changed"] = "unknown";
++    }
++    bool phase_seen = false;
++    for (const Json::Value &observed : path["observed_phases"]) {
++      phase_seen = phase_seen || observed.asString() == phase;
++    }
++    if (!phase_seen) {
++      path["observed_phases"].append(phase);
++    }
++    const std::string fast_hash = RecordString(entry.record, "artifact_fast_hash");
++    if (IsCodeItem(entry.record) && entry.artifact.has_value() && !entry.digest.empty() &&
++        !fast_hash.empty()) {
++      execution_hashes[*identity].push_back(fast_hash);
++    }
++  }
++
++  Json::Value method_execution_paths(Json::arrayValue);
++  for (const std::string &identity : execution_path_order) {
++    Json::Value &path = execution_paths[identity];
++    const std::vector<std::string> &hashes = execution_hashes[identity];
++    if (!hashes.empty()) {
++      path["first_artifact_fast_hash"] = hashes.front();
++      path["last_artifact_fast_hash"] = hashes.back();
++    }
++    if (hashes.size() >= 2u) {
++      path["code_item_changed"] = hashes.front() != hashes.back();
++    }
++    method_execution_paths.append(path);
++  }
++
+   Json::Value report(Json::objectValue);
+   report["algorithm_version"] = kAlgorithmVersion;
+   report["input"] = process.string();
+@@ -1221,6 +1286,7 @@ ProcessSummary RepairProcess(const fs::path &process, const fs::path &output) {
+   }
+   report["record_count"] = summary.record_count;
+   report["reconstructions"] = reconstructions;
++  report["method_execution_paths"] = method_execution_paths;
+   for (const Json::Value &reconstruction : reconstructions) {
+     if (reconstruction["output"].isString()) {
+       usable_outputs.insert(reconstruction["output"].asString());
+diff --git a/helper/r0dump_file_helper.cpp b/helper/r0dump_file_helper.cpp
+index 37238f4..04da4d5 100644
+--- a/helper/r0dump_file_helper.cpp
++++ b/helper/r0dump_file_helper.cpp
+@@ -259,7 +259,7 @@ bool HandleClient(int client_fd) {
+     std::string_view package_name;
+     if (request.version != kExportProtocolVersion ||
+         request.size != sizeof(ExportRequest) || request.user_id != 0u ||
+-        request.requester_uid < 10000u || request.apk_count == 0u ||
++        request.requester_uid == 0u || request.apk_count == 0u ||
+         request.apk_count > kMaxApkCount ||
+         received_fds.size() != request.apk_count ||
+         !ReadFixedString(request.package_name, sizeof(request.package_name),
+diff --git a/helper/r0dump_file_helper_core.cpp b/helper/r0dump_file_helper_core.cpp
+index 1cd300d..657edfb 100644
+--- a/helper/r0dump_file_helper_core.cpp
++++ b/helper/r0dump_file_helper_core.cpp
+@@ -269,7 +269,7 @@ bool ReadFixedString(const char *value, size_t capacity,
+ Status PrepareDirectoryTreeAt(int root_fd, const Request &request,
+                               const Ownership &ownership, int *out_process_fd) {
+   if (root_fd < 0 || out_process_fd == nullptr || request.user_id != 0u ||
+-      request.target_uid < 10000u || request.target_pid == 0u) {
++      request.target_uid == 0u || request.target_pid == 0u) {
+     return Status::kProtocolError;
+   }
+   *out_process_fd = -1;
+diff --git a/helper/r0dump_file_helper_test.cpp b/helper/r0dump_file_helper_test.cpp
+index 4fdb665..85105b1 100644
+--- a/helper/r0dump_file_helper_test.cpp
++++ b/helper/r0dump_file_helper_test.cpp
+@@ -3,6 +3,7 @@
+ 
+ #include <fcntl.h>
+ #include <gtest/gtest.h>
++#include <json/json.h>
+ #include <sys/stat.h>
+ #include <unistd.h>
+ #include <ziparchive/zip_archive.h>
+@@ -11,7 +12,9 @@
+ #include <cstring>
+ #include <filesystem>
+ #include <fstream>
++#include <memory>
+ #include <string>
++#include <vector>
+ 
+ namespace r0dump::file_helper {
+ namespace {
+@@ -84,6 +87,29 @@ TEST_F(HelperTest, CreatesSetgidTreeAndReturnsProcessDirectory) {
+   }
+ }
+ 
++TEST_F(HelperTest, AcceptsSystemUidForTargetProcess) {
++  Request request = RequestFor();
++  request.target_uid = 1000u;
++  int process_fd = -1;
++  EXPECT_EQ(PrepareDirectoryTreeAt(root_fd_, request,
++                                   {geteuid(), geteuid(), getegid()},
++                                   &process_fd),
++            Status::kOk);
++  EXPECT_GE(process_fd, 0);
++  close(process_fd);
++}
++
++TEST_F(HelperTest, RejectsZeroTargetUid) {
++  Request request = RequestFor();
++  request.target_uid = 0u;
++  int process_fd = -1;
++  EXPECT_EQ(PrepareDirectoryTreeAt(root_fd_, request,
++                                   {geteuid(), geteuid(), getegid()},
++                                   &process_fd),
++            Status::kProtocolError);
++  EXPECT_EQ(process_fd, -1);
++}
++
+ TEST_F(HelperTest, RejectsDuplicateProcessDirectoryWithoutReusingIt) {
+   int process_fd = -1;
+   Request request = RequestFor();
+@@ -154,9 +180,19 @@ TEST_F(HelperTest, ExportLatestPackagesRepairReportApkAndManifest) {
+   std::ofstream(process + "/session.json") << "{}\n";
+   std::ofstream(process + "/artifacts/bad.dex", std::ios::binary)
+       << "not-a-dex";
++  std::ofstream(process + "/artifacts/before.codeitem.raw", std::ios::binary)
++      << "before";
++  std::ofstream(process + "/artifacts/nterp.codeitem.raw", std::ios::binary)
++      << "after";
+   std::ofstream(process + "/records/000001.json")
+       << R"({"capture_kind":"dexfile","artifact_relative_path":"artifacts/bad.dex","site":"test","capture_point_name":"test.point"})"
+       << "\n";
++  std::ofstream(process + "/records/000002.json")
++      << R"({"capture_kind":"codeitem","artifact_relative_path":"artifacts/before.codeitem.raw","artifact_fast_hash":"1111","dex_object_id":99,"method_index":7,"active_attempt_id":3,"entry_kind":"nterp","observation_phase":"before_dispatch"})"
++      << "\n";
++  std::ofstream(process + "/records/000003.json")
++      << R"({"capture_kind":"codeitem","artifact_relative_path":"artifacts/nterp.codeitem.raw","artifact_fast_hash":"2222","dex_object_id":99,"method_index":7,"active_attempt_id":3,"entry_kind":"nterp","observation_phase":"nterp_entry"})"
++      << "\n";
+ 
+   const std::string apk = root_ + "/base.apk";
+   FILE *apk_file = fopen(apk.c_str(), "wb");
+@@ -177,9 +213,9 @@ TEST_F(HelperTest, ExportLatestPackagesRepairReportApkAndManifest) {
+             Status::kOk);
+   close(apk_fd);
+   EXPECT_EQ(summary.run_id, "run-1");
+-  EXPECT_EQ(summary.remote_artifact_count, 1u);
+-  EXPECT_EQ(summary.record_count, 1u);
+-  EXPECT_EQ(summary.partial, 1u);
++  EXPECT_EQ(summary.remote_artifact_count, 3u);
++  EXPECT_EQ(summary.record_count, 3u);
++  EXPECT_EQ(summary.partial, 3u);
+   EXPECT_TRUE(std::filesystem::is_regular_file(summary.archive_path));
+   EXPECT_TRUE(
+       std::filesystem::is_regular_file(summary.archive_path + ".sha256"));
+@@ -197,6 +233,35 @@ TEST_F(HelperTest, ExportLatestPackagesRepairReportApkAndManifest) {
+                       "report.json",
+                       &report_entry),
+             0);
++  std::vector<uint8_t> report_bytes(report_entry.uncompressed_length);
++  ASSERT_EQ(ExtractToMemory(archive,
++                            &report_entry,
++                            report_bytes.data(),
++                            report_entry.uncompressed_length),
++            0);
++  const std::string report_text(report_bytes.begin(), report_bytes.end());
++  Json::CharReaderBuilder json_builder;
++  std::unique_ptr<Json::CharReader> json_reader(json_builder.newCharReader());
++  Json::Value report;
++  std::string json_errors;
++  ASSERT_TRUE(json_reader->parse(report_text.data(),
++                                 report_text.data() + report_text.size(),
++                                 &report,
++                                 &json_errors))
++      << json_errors;
++  const Json::Value &paths = report["method_execution_paths"];
++  ASSERT_TRUE(paths.isArray());
++  ASSERT_EQ(paths.size(), 1u);
++  EXPECT_EQ(paths[0]["dex_object_id"].asUInt64(), 99u);
++  EXPECT_EQ(paths[0]["method_index"].asUInt(), 7u);
++  EXPECT_EQ(paths[0]["active_attempt_id"].asUInt64(), 3u);
++  EXPECT_EQ(paths[0]["first_entry_kind"].asString(), "nterp");
++  ASSERT_EQ(paths[0]["observed_phases"].size(), 2u);
++  EXPECT_EQ(paths[0]["observed_phases"][0].asString(), "before_dispatch");
++  EXPECT_EQ(paths[0]["observed_phases"][1].asString(), "nterp_entry");
++  EXPECT_EQ(paths[0]["first_artifact_fast_hash"].asString(), "1111");
++  EXPECT_EQ(paths[0]["last_artifact_fast_hash"].asString(), "2222");
++  EXPECT_TRUE(paths[0]["code_item_changed"].asBool());
+   CloseArchive(archive);
+ }
+ 
+-- 
+2.43.0
+

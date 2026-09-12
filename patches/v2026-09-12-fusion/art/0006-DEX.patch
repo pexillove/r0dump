@@ -1,0 +1,71 @@
+From e959b51ba46bf5f4f6cf46f538a86eec01c93fd5 Mon Sep 17 00:00:00 2001
+From: Ivory <contact@ivory.cafe>
+Date: Tue, 1 Sep 2026 09:28:44 +0800
+Subject: [PATCH 06/21] =?UTF-8?q?=E7=A1=AE=E4=BF=9D=E4=BF=AE=E5=A4=8D?=
+ =?UTF-8?q?=E5=90=8E=E7=9A=84=20DEX=20=E9=80=9A=E8=BF=87=E5=AE=8C=E6=95=B4?=
+ =?UTF-8?q?=E6=80=A7=E6=A0=A1=E9=AA=8C?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+主机修复器在处理 verify 拒绝或 header checksum 异常的 DEX 时明确重算签名与 Adler-32，并在报告中记录修复前后有效性。\n\nConstraint: 仅对结构完整的标准 DEX 输出修复结果，CompactDex 和越界数据继续 fail closed。\nRejected: 忽略 checksum 错误继续交给 dexdump/jadx | 会产生不可验证的输出。\nConfidence: high\nScope-risk: narrow\nDirective: 任何 DEX 修复字段变更都必须同时更新 checksum/signature 回归测试。\nTested: art/tools/r0dump 15/15 tests。\nNot-tested: 本次变更未在设备上重新装机验证。
+
+Change-Id: I60881c039b2ad618051a83fe015f388715b42619
+---
+ tools/r0dump/r0dump_host_repair.py      | 7 ++++++-
+ tools/r0dump/test_r0dump_host_repair.py | 6 ++++++
+ 2 files changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/tools/r0dump/r0dump_host_repair.py b/tools/r0dump/r0dump_host_repair.py
+index 09b670d..77945cd 100755
+--- a/tools/r0dump/r0dump_host_repair.py
++++ b/tools/r0dump/r0dump_host_repair.py
+@@ -152,9 +152,11 @@ def r0dump_repair_dexfixed(data: bytes) -> tuple[bytes | None, dict[str, Any]]:
+     repaired = bytearray(data[: layout.file_size])
+     original_signature = bytes(repaired[12:32])
+     original_checksum = r0dump_read_u32(repaired, 8)
++    expected_checksum_before = zlib.adler32(repaired[12:]) & 0xFFFFFFFF
+     signature = hashlib.sha1(repaired[32:]).digest()
+     repaired[12:32] = signature
+-    struct.pack_into("<I", repaired, 8, zlib.adler32(repaired[12:]) & 0xFFFFFFFF)
++    expected_checksum_after = zlib.adler32(repaired[12:]) & 0xFFFFFFFF
++    struct.pack_into("<I", repaired, 8, expected_checksum_after)
+     changed = []
+     if original_signature != signature:
+         changed.append("signature")
+@@ -165,6 +167,9 @@ def r0dump_repair_dexfixed(data: bytes) -> tuple[bytes | None, dict[str, Any]]:
+         "kind": "standard",
+         "file_size": layout.file_size,
+         "map_off": layout.map_off,
++        "checksum_valid_before": original_checksum == expected_checksum_before,
++        "checksum_repaired": original_checksum != expected_checksum_after,
++        "checksum_valid_after": r0dump_read_u32(repaired, 8) == expected_checksum_after,
+         "modified_fields": changed,
+     }
+ 
+diff --git a/tools/r0dump/test_r0dump_host_repair.py b/tools/r0dump/test_r0dump_host_repair.py
+index 837ed53..66162ed 100644
+--- a/tools/r0dump/test_r0dump_host_repair.py
++++ b/tools/r0dump/test_r0dump_host_repair.py
+@@ -148,12 +148,18 @@ class r0dump_HostRepairTest(unittest.TestCase):
+         repaired, details = r0dump_repair_dexfixed(original)
+         self.assertIsNotNone(repaired)
+         self.assertEqual(details["trust"], "repaired")
++        self.assertFalse(details["checksum_valid_before"])
++        self.assertTrue(details["checksum_repaired"])
++        self.assertTrue(details["checksum_valid_after"])
+         self.assertEqual(repaired[:8], original[:8])
+         self.assertEqual(repaired[32:], original[32:])
+         self.assertIsNone(r0dump_validate_dex(repaired).reason)
+         second, second_details = r0dump_repair_dexfixed(repaired)
+         self.assertEqual(second, repaired)
+         self.assertEqual(second_details["trust"], "verified")
++        self.assertTrue(second_details["checksum_valid_before"])
++        self.assertFalse(second_details["checksum_repaired"])
++        self.assertTrue(second_details["checksum_valid_after"])
+ 
+     def r0dump_test_code_item_is_backfilled_by_unique_method_identity(self):
+         with tempfile.TemporaryDirectory() as temp:
+-- 
+2.43.0
+

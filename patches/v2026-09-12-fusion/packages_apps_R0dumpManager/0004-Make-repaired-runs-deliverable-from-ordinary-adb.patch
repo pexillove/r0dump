@@ -1,0 +1,638 @@
+From fe337a36675f61fb01a5706540e04bab9f3b8b0a Mon Sep 17 00:00:00 2001
+From: Ivory <contact@ivory.cafe>
+Date: Mon, 31 Aug 2026 16:36:51 +0800
+Subject: [PATCH 04/32] Make repaired runs deliverable from ordinary adb
+
+Select the newest artifact-bearing run, pull it atomically, invoke the ART repairer per process, summarize actionable partial reasons, and package raw evidence plus repaired outputs into a checksummed ZIP.
+
+Constraint: The final artifact must be a ZIP readable through ordinary adb shell without adb root.
+Rejected: Manager-app parsing or a privileged export service | host tooling keeps repair outside the production UI and preserves raw runs
+Confidence: high
+Scope-risk: narrow
+Directive: Keep exports non-overwriting, raw-preserving, path-confined, and atomically packaged.
+Tested: 7 exporter tests; Manager source contracts; real Coolapk export produced a valid 1219-member ZIP with 302 codeitems backfilled
+Not-tested: JADX validation was not run
+---
+ IMPLEMENTATION.md           |  35 +++
+ tools/export_latest.py      | 414 ++++++++++++++++++++++++++++++++++++
+ tools/test_export_latest.py | 141 ++++++++++++
+ 3 files changed, 590 insertions(+)
+ create mode 100755 tools/export_latest.py
+ create mode 100755 tools/test_export_latest.py
+
+diff --git a/IMPLEMENTATION.md b/IMPLEMENTATION.md
+index e5a476e..782dfd0 100644
+--- a/IMPLEMENTATION.md
++++ b/IMPLEMENTATION.md
+@@ -1408,6 +1408,41 @@ packages/apps/R0dumpManager/tools/deploy_userdebug.sh \
+ `com.android.art.capex` 整体替换，禁止直接写只读 `/apex/com.android.art` 挂载点。脚本只允许在
+ `ro.build.type=userdebug|eng` 且 `ro.debuggable=1` 的设备运行，避免把开发替换流程误用于发布设备。
+ 
++#### 一键导出并修复最新产物
++
++`tools/export_latest.py` 通过普通 `adb shell` 权限读取指定包的 external-files 目录，从包含至少一个 artifact
++且存在 `session.json` 的 run 中，按 artifact 最新修改时间选择最新 run，完整拉取后再在主机端处理：
++
++```bash
++python3 packages/apps/R0dumpManager/tools/export_latest.py com.coolapk.market
++
++# 多设备时显式指定序列号和输出根目录
++python3 packages/apps/R0dumpManager/tools/export_latest.py \
++  -s f5e3adbc \
++  -o /path/to/exports \
++  --dexdump out/host/linux-x86/bin/dexdump \
++  com.coolapk.market
++```
++
++默认展开结果位于 `r0dump-exports/<package>/<run_id>/`。设备端原始 run 和本地 raw artifact 永不修改；脚本按
++process 调用既有 `art/tools/r0dump/r0dump_host_repair.py`，在 `process-*/host-repair/` 下生成去重的 `blobs/`、
++保守修复的 `repaired/*.dexfixed.dex`、不能安全修复的 `partial/*.json`、`inputs.json` 和 `report.json`。
++修复器只在 DEX header、section range 和 map list 完整自洽时重算 SHA-1 signature 与 Adler-32 checksum；
++对 `*.codeitem.raw`，Python 修复器通过已有的 `method_index`、class、method 和 descriptor，在所有完整 DEX
++中解析 method/class_data 并要求目标唯一；只有原始与捕获 code item 的完整 span 长度相同、偏移和边界均一致且
++同一方法不存在字节冲突时才原位回填，随后重新计算 signature/checksum，输出 `*.codeitem.dex`。CompactDex、
++截断 blob、目标缺失/不唯一、长度变化、冲突 code item 或缺少重建输入的 dexdata 明确标记为 partial，不做猜测性重建。
++
++要在设备 run 中产生 codeitem，至少启用实际会捕获方法体的点位，例如主动 walk 使用 bit 40
++`Walk.executable.method`；仅启用 bit 39 `Walk.cookie.dex` 只会得到 DEX。bit 41
++`ForceInvoke.no_execute` 还要求 `force_invoke_enabled=true` 才会产生强制调用 codeitem。
++
++run 根目录中的 `export-report.json` 记录设备、包名、远端 run、产物数量及各 process 的 verified/repaired/partial
++统计和 codeitem 回填数量。最后生成 `r0dump-exports/<package>/<run_id>.zip` 及对应 `.zip.sha256`，ZIP 内
++固定以 `<package>/<run_id>/` 为根并同时包含原始 run、修复结果和报告。脚本支持 `ADB`、`ADB_SERIAL`
++环境变量，以及 `--run-id`、`--no-repair`、`--dexdump`、`--jadx` 和 `--verbose` 参数；目标目录或 ZIP
++已存在时拒绝覆盖，拉取失败时清理 `.partial-*` 临时目录。整个流程不需要 `adb root`。
++
+ SELinux 增量替换是不可拆分事务，必须同时包含：
+ 
+ - `/system/etc/selinux/plat_sepolicy_and_mapping.sha256`；
+diff --git a/tools/export_latest.py b/tools/export_latest.py
+new file mode 100755
+index 0000000..8041413
+--- /dev/null
++++ b/tools/export_latest.py
+@@ -0,0 +1,414 @@
++#!/usr/bin/env python3
++"""Export the newest R0dump run for a package through adb and repair it locally."""
++
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++from pathlib import Path, PurePosixPath
++import re
++import shutil
++import shlex
++import subprocess
++import sys
++import tempfile
++import zipfile
++from dataclasses import dataclass
++from datetime import datetime, timezone
++from typing import Any, Sequence
++
++
++AOSP_ROOT = Path(__file__).resolve().parents[4]
++HOST_REPAIR_DIR = AOSP_ROOT / "art" / "tools" / "r0dump"
++sys.path.insert(0, str(HOST_REPAIR_DIR))
++
++try:
++    from r0dump_host_repair import R0DUMP_ALGORITHM_VERSION, r0dump_repair_run
++except ImportError as exc:  # pragma: no cover - only possible outside the source tree.
++    raise SystemExit(f"无法加载 {HOST_REPAIR_DIR / 'r0dump_host_repair.py'}：{exc}") from exc
++
++
++PACKAGE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+$")
++REMOTE_TEMPLATE = "/sdcard/Android/data/{package}/files/r0dump-fusion/runs"
++
++
++class ExportError(RuntimeError):
++    """An expected user-facing export failure."""
++
++
++@dataclass(frozen=True)
++class RunCandidate:
++    latest_artifact_mtime: int
++    artifact_count: int
++    remote_path: str
++
++    @property
++    def run_id(self) -> str:
++        return PurePosixPath(self.remote_path).name
++
++
++class AdbClient:
++    def __init__(self, adb: str, serial: str | None, verbose: bool = False) -> None:
++        self._prefix = [adb]
++        if serial:
++            self._prefix.extend(["-s", serial])
++        self.verbose = verbose
++
++    def run(self, *args: str, capture: bool = True) -> subprocess.CompletedProcess[str]:
++        command = [*self._prefix, *args]
++        if self.verbose:
++            print("+", shlex.join(command), file=sys.stderr)
++        try:
++            return subprocess.run(
++                command,
++                check=True,
++                text=True,
++                stdout=subprocess.PIPE if capture else None,
++                stderr=subprocess.PIPE if capture else None,
++            )
++        except FileNotFoundError as exc:
++            raise ExportError(f"找不到 adb：{self._prefix[0]}") from exc
++        except subprocess.CalledProcessError as exc:
++            details = (exc.stderr or exc.stdout or "").strip()
++            suffix = f"：{details}" if details else ""
++            raise ExportError(f"adb 命令失败（exit {exc.returncode}）{suffix}") from exc
++
++    def ensure_device(self) -> str:
++        state = self.run("get-state").stdout.strip()
++        if state != "device":
++            raise ExportError(f"设备状态不可用：{state or 'unknown'}")
++        return self.run("get-serialno").stdout.strip()
++
++    def shell(self, script: str) -> str:
++        return self.run("shell", script).stdout
++
++    def pull(self, remote: str, local_directory: Path) -> None:
++        self.run("pull", remote, str(local_directory), capture=False)
++
++
++def validate_package_name(package: str) -> str:
++    if not PACKAGE_RE.fullmatch(package):
++        raise ExportError(f"无效包名：{package!r}")
++    return package
++
++
++def remote_runs_root(package: str) -> str:
++    return REMOTE_TEMPLATE.format(package=validate_package_name(package))
++
++
++def candidate_script(root: str) -> str:
++    quoted_root = shlex.quote(root)
++    return f"""
++root={quoted_root}
++for run in "$root"/*; do
++  [ -d "$run" ] || continue
++  newest=0
++  count=0
++  for process in "$run"/process-*; do
++    [ -f "$process/session.json" ] || continue
++    for artifact in "$process"/artifacts/*; do
++      [ -f "$artifact" ] || continue
++      mtime=$(stat -c %Y "$artifact" 2>/dev/null) || continue
++      [ "$mtime" -gt "$newest" ] && newest=$mtime
++      count=$((count + 1))
++    done
++  done
++  [ "$count" -gt 0 ] && printf '%s\\t%s\\t%s\\n' "$newest" "$count" "$run"
++done
++exit 0
++""".strip()
++
++
++def parse_candidates(output: str, root: str) -> list[RunCandidate]:
++    expected_parent = PurePosixPath(root)
++    candidates: list[RunCandidate] = []
++    for line in output.splitlines():
++        if not line.strip():
++            continue
++        fields = line.split("\t", 2)
++        if len(fields) != 3:
++            raise ExportError(f"无法解析设备返回的 run 信息：{line!r}")
++        try:
++            mtime = int(fields[0])
++            count = int(fields[1])
++        except ValueError as exc:
++            raise ExportError(f"设备返回了无效的 run 统计：{line!r}") from exc
++        remote_path = fields[2]
++        path = PurePosixPath(remote_path)
++        if path.parent != expected_parent or not path.name or count <= 0 or mtime < 0:
++            raise ExportError(f"设备返回了越界的 run 路径：{remote_path!r}")
++        candidates.append(RunCandidate(mtime, count, remote_path))
++    return candidates
++
++
++def select_run(candidates: Sequence[RunCandidate], run_id: str | None) -> RunCandidate:
++    if not candidates:
++        raise ExportError("目标包下没有包含产物的 run")
++    if run_id is not None:
++        matches = [candidate for candidate in candidates if candidate.run_id == run_id]
++        if not matches:
++            raise ExportError(f"找不到包含产物的 run：{run_id}")
++        return matches[0]
++    return max(candidates, key=lambda candidate: (candidate.latest_artifact_mtime, candidate.run_id))
++
++
++def resolve_optional_tool(value: str | None, name: str) -> str | None:
++    if value is None:
++        return None
++    discovered = shutil.which(value)
++    if discovered:
++        return str(Path(discovered).resolve())
++    path = Path(value).expanduser().resolve()
++    if not path.is_file() or not os.access(path, os.X_OK):
++        raise ExportError(f"{name} 不存在或不可执行：{value}")
++    return str(path)
++
++
++def repair_summary(report: dict[str, Any]) -> dict[str, Any]:
++    records = report.get("records", [])
++    partial_records = [
++        item
++        for item in records
++        if item.get("trust") == "partial" or item.get("status") == "partial"
++    ]
++    partial_reasons: dict[str, int] = {}
++    for item in partial_records:
++        reason = str(item.get("reason") or "unspecified")
++        if reason == "capture_dropped" and item.get("drop_reason"):
++            reason = f"{reason}:{item['drop_reason']}"
++        partial_reasons[reason] = partial_reasons.get(reason, 0) + 1
++    return {
++        "verified": sum(item.get("trust") == "verified" for item in records),
++        "repaired": sum(item.get("trust") == "repaired" for item in records),
++        "partial": len(partial_records),
++        "usable_outputs": len(
++            {
++                item.get("output")
++                for item in records
++                if item.get("trust") in ("verified", "repaired") and item.get("output")
++            }
++        ),
++        "codeitems_backfilled": sum(
++            item.get("output_kind") == "codeitem_backfill" and item.get("trust") == "repaired"
++            for item in records
++        ),
++        "reconstructed_dex": sum(
++            reconstruction.get("output") is not None
++            for reconstruction in report.get("reconstructions", [])
++        ),
++        "partial_reasons": dict(sorted(partial_reasons.items())),
++    }
++
++
++def repair_export(
++    run_directory: Path,
++    dexdump: str | None = None,
++    jadx: str | None = None,
++) -> list[dict[str, Any]]:
++    process_reports: list[dict[str, Any]] = []
++    process_directories = sorted(
++        path
++        for path in run_directory.glob("process-*")
++        if path.is_dir() and (path / "session.json").is_file()
++    )
++    if not process_directories:
++        raise ExportError("导出的 run 不包含有效 process 目录")
++
++    for process_directory in process_directories:
++        output_directory = process_directory / "host-repair"
++        try:
++            report = r0dump_repair_run(process_directory, output_directory, dexdump, jadx)
++            process_reports.append(
++                {
++                    "process": process_directory.name,
++                    "status": "ok",
++                    "algorithm_version": R0DUMP_ALGORITHM_VERSION,
++                    "record_count": report.get("record_count", 0),
++                    "summary": repair_summary(report),
++                    "report": (output_directory / "report.json").relative_to(run_directory).as_posix(),
++                    "inputs": (output_directory / "inputs.json").relative_to(run_directory).as_posix(),
++                }
++            )
++        # Preserve the raw export and surface a per-process diagnostic even if
++        # a malformed record triggers an unexpected parser failure.
++        except Exception as exc:
++            process_reports.append(
++                {"process": process_directory.name, "status": "error", "error": str(exc)}
++            )
++    return process_reports
++
++
++def write_export_report(
++    run_directory: Path,
++    package: str,
++    serial: str,
++    candidate: RunCandidate,
++    process_reports: Sequence[dict[str, Any]],
++    archive_name: str,
++) -> Path:
++    report = {
++        "schema": 1,
++        "exported_at": datetime.now(timezone.utc).isoformat(),
++        "device_serial": serial,
++        "package": package,
++        "run_id": candidate.run_id,
++        "remote_path": candidate.remote_path,
++        "remote_artifact_count": candidate.artifact_count,
++        "archive": archive_name,
++        "process_reports": list(process_reports),
++    }
++    path = run_directory / "export-report.json"
++    temporary = run_directory / ".export-report.json.tmp"
++    temporary.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
++    temporary.replace(path)
++    return path
++
++
++def sha256_file(path: Path) -> str:
++    digest = hashlib.sha256()
++    with path.open("rb") as stream:
++        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
++            digest.update(chunk)
++    return digest.hexdigest()
++
++
++def create_archive(run_directory: Path, package: str, archive: Path) -> tuple[Path, Path]:
++    temporary = archive.with_name(f".{archive.name}.partial")
++    checksum_path = archive.with_suffix(archive.suffix + ".sha256")
++    if archive.exists() or checksum_path.exists():
++        raise ExportError(f"ZIP 或校验文件已存在，不会覆盖：{archive}")
++    try:
++        with zipfile.ZipFile(
++            temporary,
++            "w",
++            compression=zipfile.ZIP_DEFLATED,
++            compresslevel=6,
++            allowZip64=True,
++        ) as output:
++            for path in sorted(run_directory.rglob("*")):
++                if path.is_symlink():
++                    raise ExportError(f"导出目录包含不允许打包的符号链接：{path}")
++                if not path.is_file():
++                    continue
++                relative = path.relative_to(run_directory)
++                archive_name = (PurePosixPath(package) / run_directory.name / relative.as_posix()).as_posix()
++                output.write(path, archive_name)
++        temporary.replace(archive)
++    finally:
++        temporary.unlink(missing_ok=True)
++    checksum = sha256_file(archive)
++    checksum_temporary = checksum_path.with_name(f".{checksum_path.name}.partial")
++    checksum_temporary.write_text(f"{checksum}  {archive.name}\n", encoding="utf-8")
++    checksum_temporary.replace(checksum_path)
++    return archive, checksum_path
++
++
++def export_latest(args: argparse.Namespace) -> Path:
++    package = validate_package_name(args.package)
++    client = AdbClient(args.adb, args.serial, args.verbose)
++    serial = client.ensure_device()
++    root = remote_runs_root(package)
++    candidate = select_run(parse_candidates(client.shell(candidate_script(root)), root), args.run_id)
++    dexdump = None if args.no_repair else resolve_optional_tool(args.dexdump, "dexdump")
++    jadx = None if args.no_repair else resolve_optional_tool(args.jadx, "jadx")
++
++    output_root = Path(args.output).expanduser().resolve()
++    package_directory = output_root / package
++    destination = package_directory / candidate.run_id
++    archive = package_directory / f"{candidate.run_id}.zip"
++    checksum_path = archive.with_suffix(archive.suffix + ".sha256")
++    if destination.exists() or archive.exists() or checksum_path.exists():
++        raise ExportError(f"导出目录或 ZIP 已存在，不会覆盖：{destination}")
++    package_directory.mkdir(parents=True, exist_ok=True)
++
++    temporary = Path(tempfile.mkdtemp(prefix=f".{candidate.run_id}.partial-", dir=package_directory))
++    try:
++        client.pull(candidate.remote_path, temporary)
++        pulled = temporary / candidate.run_id
++        if not pulled.is_dir():
++            raise ExportError(f"adb pull 未生成预期目录：{pulled}")
++        if not any(pulled.glob("process-*/session.json")):
++            raise ExportError("导出的 run 缺少 process session.json")
++        if not any(pulled.glob("process-*/artifacts/*")):
++            raise ExportError("导出的 run 不包含产物")
++        pulled.rename(destination)
++    finally:
++        shutil.rmtree(temporary, ignore_errors=True)
++
++    process_reports: list[dict[str, Any]] = []
++    if not args.no_repair:
++        process_reports = repair_export(destination, dexdump, jadx)
++    report_path = write_export_report(
++        destination, package, serial, candidate, process_reports, archive.name
++    )
++    archive_path, archive_checksum_path = create_archive(destination, package, archive)
++
++    print(f"设备：{serial}")
++    print(f"包名：{package}")
++    print(f"run：{candidate.run_id}（{candidate.artifact_count} 个设备端产物）")
++    print(f"导出：{destination}")
++    if args.no_repair:
++        print("主机修复：已跳过")
++    else:
++        for item in process_reports:
++            if item["status"] == "ok":
++                summary = item["summary"]
++                print(
++                    f"{item['process']}：{summary['verified']} verified，"
++                    f"{summary['repaired']} repaired，{summary['partial']} partial，"
++                    f"{summary['usable_outputs']} 个去重可用 DEX，"
++                    f"{summary['codeitems_backfilled']} 条 codeitem 已回填"
++                )
++                if summary["partial_reasons"]:
++                    reasons = "，".join(
++                        f"{reason}={count}"
++                        for reason, count in summary["partial_reasons"].items()
++                    )
++                    print(f"  partial 原因：{reasons}")
++            else:
++                print(f"{item['process']}：修复失败：{item['error']}", file=sys.stderr)
++    print(f"报告：{report_path}")
++    print(f"ZIP：{archive_path}")
++    print(f"SHA-256：{archive_checksum_path}")
++    if any(item["status"] != "ok" for item in process_reports):
++        raise ExportError(f"原始 run 已导出，但至少一个 process 修复失败：{destination}")
++    return archive_path
++
++
++def build_parser() -> argparse.ArgumentParser:
++    parser = argparse.ArgumentParser(
++        description="通过 adb 导出指定包最新的 R0dump run，并调用主机修复器处理。"
++    )
++    parser.add_argument("package", help="目标 Android 包名，例如 com.coolapk.market")
++    parser.add_argument(
++        "-o",
++        "--output",
++        default="r0dump-exports",
++        help="导出根目录（默认：./r0dump-exports）",
++    )
++    parser.add_argument("-s", "--serial", default=os.environ.get("ADB_SERIAL"), help="adb 设备序列号")
++    parser.add_argument("--adb", default=os.environ.get("ADB", "adb"), help="adb 可执行文件")
++    parser.add_argument("--run-id", help="导出指定 run；默认按最新产物修改时间选择")
++    parser.add_argument("--no-repair", action="store_true", help="只导出，不运行主机修复器")
++    parser.add_argument("--dexdump", help="可选 dexdump 路径；对 repaired DEX 做解析校验")
++    parser.add_argument("--jadx", help="可选 jadx 路径；对 repaired DEX 做反编译验证")
++    parser.add_argument("-v", "--verbose", action="store_true", help="打印执行的 adb 命令")
++    return parser
++
++
++def main(argv: Sequence[str] | None = None) -> int:
++    try:
++        export_latest(build_parser().parse_args(argv))
++        return 0
++    except ExportError as exc:
++        print(f"错误：{exc}", file=sys.stderr)
++        return 1
++    except KeyboardInterrupt:
++        print("已取消", file=sys.stderr)
++        return 130
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tools/test_export_latest.py b/tools/test_export_latest.py
+new file mode 100755
+index 0000000..86b68eb
+--- /dev/null
++++ b/tools/test_export_latest.py
+@@ -0,0 +1,141 @@
++#!/usr/bin/env python3
++
++from __future__ import annotations
++
++import json
++from pathlib import Path
++import sys
++import tempfile
++import unittest
++import zipfile
++
++
++sys.path.insert(0, str(Path(__file__).resolve().parent))
++
++import export_latest  # noqa: E402
++
++
++class ExportLatestTest(unittest.TestCase):
++    def test_parse_and_select_newest_candidate(self) -> None:
++        root = "/sdcard/Android/data/com.example.app/files/r0dump-fusion/runs"
++        candidates = export_latest.parse_candidates(
++            f"100\t2\t{root}/older\n200\t1\t{root}/newer\n", root
++        )
++        self.assertEqual("newer", export_latest.select_run(candidates, None).run_id)
++        self.assertEqual("older", export_latest.select_run(candidates, "older").run_id)
++        self.assertTrue(export_latest.candidate_script(root).endswith("exit 0"))
++
++    def test_rejects_invalid_package_and_remote_path(self) -> None:
++        with self.assertRaises(export_latest.ExportError):
++            export_latest.validate_package_name("com.example;id")
++        root = "/sdcard/Android/data/com.example.app/files/r0dump-fusion/runs"
++        with self.assertRaises(export_latest.ExportError):
++            export_latest.parse_candidates("1\t1\t/sdcard/other/run\n", root)
++
++    def test_repairs_each_process_with_existing_host_repair(self) -> None:
++        with tempfile.TemporaryDirectory() as directory:
++            run = Path(directory) / "run"
++            process = run / "process-42"
++            (process / "records").mkdir(parents=True)
++            (process / "artifacts").mkdir()
++            (process / "session.json").write_text("{}\n", encoding="utf-8")
++            (process / "artifacts" / "000001.buffer.raw").write_bytes(b"not-a-dex")
++            (process / "records" / "000001.json").write_text(
++                json.dumps(
++                    {
++                        "capture_kind": "buffer",
++                        "artifact_relative_path": "artifacts/000001.buffer.raw",
++                    }
++                ),
++                encoding="utf-8",
++            )
++
++            reports = export_latest.repair_export(run)
++
++            self.assertEqual(1, len(reports))
++            self.assertEqual("ok", reports[0]["status"])
++            self.assertEqual(0, reports[0]["summary"]["verified"])
++            self.assertEqual(0, reports[0]["summary"]["repaired"])
++            self.assertEqual(1, reports[0]["summary"]["partial"])
++            self.assertEqual(0, reports[0]["summary"]["usable_outputs"])
++            self.assertEqual(
++                {"missing_dex_magic": 1}, reports[0]["summary"]["partial_reasons"]
++            )
++            report = run / reports[0]["report"]
++            self.assertTrue(report.is_file())
++            self.assertEqual("missing_dex_magic", json.loads(report.read_text())["records"][0]["reason"])
++
++    def test_missing_process_is_an_error(self) -> None:
++        with tempfile.TemporaryDirectory() as directory:
++            with self.assertRaises(export_latest.ExportError):
++                export_latest.repair_export(Path(directory))
++
++    def test_optional_tool_must_be_executable(self) -> None:
++        self.assertTrue(Path(export_latest.resolve_optional_tool(sys.executable, "python")).is_absolute())
++        with tempfile.TemporaryDirectory() as directory:
++            not_executable = Path(directory) / "tool"
++            not_executable.write_text("tool", encoding="utf-8")
++            with self.assertRaises(export_latest.ExportError):
++                export_latest.resolve_optional_tool(str(not_executable), "test tool")
++
++    def test_summary_counts_missing_artifact_as_partial(self) -> None:
++        summary = export_latest.repair_summary(
++            {
++                "records": [
++                    {"trust": "verified", "output": "repaired/a.dex"},
++                    {
++                        "trust": "repaired",
++                        "output": "repaired/b.dex",
++                        "output_kind": "codeitem_backfill",
++                    },
++                    {"trust": "partial"},
++                    {
++                        "status": "partial",
++                        "reason": "capture_dropped",
++                        "drop_reason": "pool_unavailable",
++                    },
++                ],
++                "reconstructions": [{"output": "repaired/b.dex"}],
++            }
++        )
++        self.assertEqual(1, summary["verified"])
++        self.assertEqual(1, summary["repaired"])
++        self.assertEqual(2, summary["partial"])
++        self.assertEqual(2, summary["usable_outputs"])
++        self.assertEqual(1, summary["codeitems_backfilled"])
++        self.assertEqual(1, summary["reconstructed_dex"])
++        self.assertEqual(
++            {"capture_dropped:pool_unavailable": 1, "unspecified": 1},
++            summary["partial_reasons"],
++        )
++
++    def test_archive_contains_run_and_has_sha256_sidecar(self) -> None:
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            run = root / "com.example.app" / "run-1"
++            (run / "process-1" / "artifacts").mkdir(parents=True)
++            (run / "export-report.json").write_text("{}\n", encoding="utf-8")
++            (run / "process-1" / "artifacts" / "one.dex.raw").write_bytes(b"dex")
++            archive = run.parent / "run-1.zip"
++
++            archive_path, checksum_path = export_latest.create_archive(
++                run, "com.example.app", archive
++            )
++
++            self.assertTrue(archive_path.is_file())
++            self.assertEqual(
++                f"{export_latest.sha256_file(archive)}  run-1.zip\n",
++                checksum_path.read_text(encoding="utf-8"),
++            )
++            with zipfile.ZipFile(archive) as value:
++                self.assertEqual(
++                    [
++                        "com.example.app/run-1/export-report.json",
++                        "com.example.app/run-1/process-1/artifacts/one.dex.raw",
++                    ],
++                    sorted(value.namelist()),
++                )
++
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.43.0
+

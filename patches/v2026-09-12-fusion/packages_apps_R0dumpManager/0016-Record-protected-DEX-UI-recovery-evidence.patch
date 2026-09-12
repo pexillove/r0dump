@@ -1,0 +1,48 @@
+From 56334aa3bf5c0695733a791b65d2a43834810e31 Mon Sep 17 00:00:00 2001
+From: Ivory <contact@ivory.cafe>
+Date: Wed, 2 Sep 2026 08:02:39 +0800
+Subject: [PATCH 16/32] Record protected DEX UI recovery evidence
+
+Targeted Manager-driven UI capture now has reproducible evidence for logical DEX recovery and CodeItem backfill, including the explicit artifact-limit boundary.
+
+Constraint: Preserve conservative reconstruction and document device evidence without claiming unlimited coverage.
+Rejected: Treating 500 backfilled CodeItems as full UI coverage | 512-artifact and active-entry limits remain observable.
+Confidence: high
+Scope-risk: narrow
+Directive: Keep future experiments Manager-published and report partial reasons verbatim.
+Tested: unzip -t on 1549 entries; ZIP SHA-256 verification; Manager publish/launch smoke on f5e3adbc.
+Not-tested: Full Framework test suite remains blocked by its pre-existing API signature drift.
+---
+ IMPLEMENTATION.md | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/IMPLEMENTATION.md b/IMPLEMENTATION.md
+index 5ea7305..16857c4 100644
+--- a/IMPLEMENTATION.md
++++ b/IMPLEMENTATION.md
+@@ -1306,6 +1306,22 @@ rename，但 `fsync(O_PATH directory fd)` 返回 `EBADF`，从而误报 `run_deg
+ - 导出目录为 `02770`、ZIP 和校验文件为 `0660`；SELinux 保持 Enforcing，导出阶段无 helper AVC、无
+   system_server/helper crash；Manager 显示同一 run 的修复统计和最终 Downloads 路径。
+ 
++#### 12.0.3 受保护 DEX 的 UI 定向回归
++
++在 ART CAPEX 完成 top-byte/tag 地址归一化和分段逻辑 DEX 读取后，使用 Manager 正常认证、发布并启动
++`com.VCB`，目标前缀为 `com.VCB.ui.`。本次配置只选择 bit 39 `Walk.cookie.dex` 与 bit 40
++`Walk.executable.method`（mask `0x0000018000000000`），刻意关闭 bit 3/5 的全量建立快照，避免它们先消耗
++artifact 配额。设备为 OnePlus 9（`f5e3adbc`），实际 run 为 `20260819T022922Z-VCB-custom`；日志证明配置由
++Manager publish 生效，应用保持存活，并完成 `walk_completed`（514 个类候选、512 个方法候选、512 个
++CodeItem 捕获）。
++
++随后通过普通导出脚本拉取 run 并在主机端修复，结果为 9 个 verified、500 个 repaired、13 个 partial、
++10 个去重可用 DEX，且完成 500 条 CodeItem 回填。partial 原因明确记录为 12 条 `active_entry_limit` 和
++1 条 `data_range_out_of_bounds`，没有猜测性重建。生成的 ZIP 包含 `metadata/manifest.json`、原始 artifacts、
++修复报告和回填结果；`unzip -t` 对 1549 个 entry 通过，`.zip.sha256` 校验为 `OK`。该证据同时确认：
++受保护 DEX 的逻辑视图与 CodeItem 回填链路已经可用，但 512 条 artifact 上限仍是完整覆盖所有 UI 方法的
++明确边界，不能将本次 500 条回填误写为“无上限全量导出”。
++
+ ### T1: Schema 单元测试
+ 
+ - 34 字段完整 JSON round-trip；
+-- 
+2.43.0
+

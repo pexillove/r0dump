@@ -1,0 +1,36 @@
+From 30c42e1d87dfc52a65d8cd144994a7f9029774fe Mon Sep 17 00:00:00 2001
+From: Ivory <contact@ivory.cafe>
+Date: Thu, 10 Sep 2026 22:03:23 +0800
+Subject: [PATCH 20/21] r0dump: raise force-invoke call cap to the method
+ budget
+
+kR0dumpForceCallsHardLimit was 8, making force_max_calls the binding
+limit for a full-package force-materialize even though walk_max_methods
+(10M) is the real budget. Raise the cap to 10,000,000 so the walk
+budgets govern; the default stays 1 (opt-in), preserving safe-by-default.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Change-Id: Ib88ef5df21c36a5df9383cc7ff3a5e960a072da7
+---
+ runtime/r0dump/r0dump_config.h | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/runtime/r0dump/r0dump_config.h b/runtime/r0dump/r0dump_config.h
+index 2d5706a..97c7e9b 100644
+--- a/runtime/r0dump/r0dump_config.h
++++ b/runtime/r0dump/r0dump_config.h
+@@ -51,7 +51,10 @@ inline constexpr uint32_t kR0dumpManifestXmlDepthHardLimit = 256u;
+ inline constexpr uint32_t kR0dumpManifestAttributeLengthHardLimit = 4096u;
+ inline constexpr uint32_t kR0dumpWalkClassesHardLimit = 1000000u;
+ inline constexpr uint32_t kR0dumpWalkMethodsHardLimit = 10000000u;
+-inline constexpr uint32_t kR0dumpForceCallsHardLimit = 8u;
++// Force-invoke is opt-in and defaults to a single call; the cap is the global
++// attempt budget for a whole walk, so it tracks the method budget rather than a
++// tiny fixed ceiling that would make it the binding limit for full-package dumps.
++inline constexpr uint32_t kR0dumpForceCallsHardLimit = 10000000u;
+ enum class r0dump_WalkStart : uint8_t {
+   kAfterApplicationOnCreate,
+   kAfterFirstActivityOnCreate,
+-- 
+2.43.0
+

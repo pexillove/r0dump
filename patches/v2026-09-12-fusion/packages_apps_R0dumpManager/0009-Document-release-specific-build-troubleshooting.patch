@@ -1,0 +1,45 @@
+From 0ad88dfb3f660750911159f801baffb42f38f681 Mon Sep 17 00:00:00 2001
+From: Ivory <contact@ivory.cafe>
+Date: Tue, 1 Sep 2026 22:24:35 +0800
+Subject: [PATCH 09/32] Document release-specific build troubleshooting
+
+Prevent false dependency diagnoses by recording the required bp4a release combination and clean Soong verification sequence for the device build.\n\nConstraint: Existing successful artifacts were produced with TARGET_RELEASE=bp4a.\nRejected: Adding unrelated vendor_available properties to bypass bootstrap errors | The root cause was a mismatched release graph.\nConfidence: high\nScope-risk: narrow\nDirective: Check lunch output and release identity before changing dependency metadata.\nTested: Markdown diff --check.\nNot-tested: The in-progress bp4a build and device replacement.
+---
+ IMPLEMENTATION.md | 21 +++++++++++++++++++++
+ 1 file changed, 21 insertions(+)
+
+diff --git a/IMPLEMENTATION.md b/IMPLEMENTATION.md
+index c59c0b7..74f613e 100644
+--- a/IMPLEMENTATION.md
++++ b/IMPLEMENTATION.md
+@@ -1472,6 +1472,27 @@ packages/apps/R0dumpManager/tools/deploy_userdebug.sh \
+ `com.android.art.capex` 整体替换，禁止直接写只读 `/apex/com.android.art` 挂载点。脚本只允许在
+ `ro.build.type=userdebug|eng` 且 `ro.debuggable=1` 的设备运行，避免把开发替换流程误用于发布设备。
+ 
++#### 构建 release 选择的排障经验
++
++本项目同一产品存在多个 `TARGET_RELEASE` 配置。OnePlus 9 当前设备和历史成功构建使用的是：
++
++```bash
++source build/envsetup.sh
++lunch lineage_lemonade-bp4a-userdebug
++```
++
++这里的 `bp4a` 不是可有可无的标签。误用 `lineage_lemonade-trunk_staging-userdebug`，或在不同产品之间
++复用同一个 `out/`，会让 Soong 重新解析另一套 vendor/source-root 依赖图，表现为 `libjxl`、protobuf、
++Oplus Rust 等“缺少变体/重复模块”错误。它们与 r0dump-fusion 的新增代码或依赖无关；历史日志
++`out/r0dump-fusion-art-rebuild-3.log`、`out/r0dump-fusion-d102-capex-build.log` 已证明 `bp4a` 图可正常完成
++ART APEX 构建。
++
++每次编译前必须检查输出中的 `PLATFORM_VERSION`、`TARGET_PRODUCT`、`TARGET_RELEASE` 和
++`PRODUCT_SOURCE_ROOT_DIRS`，确认与设备/历史产物一致；切换产品或 release 后不得直接复用旧的 Soong 图。
++推荐先执行 `m nothing -j2` 展开依赖，再用 `j8` 编译目标。若错误只出现在 bootstrap 的 vendor 变体解析阶段，
++先回到正确的 `lunch` 组合并检查生成目录，不要为绕过错误给无关库追加 `vendor_available`，也不要把临时
++构建规避改入功能提交。
++
+ #### 一键导出并修复最新产物
+ 
+ `tools/export_latest.py` 通过普通 `adb shell` 权限读取指定包的 external-files 目录，从包含至少一个 artifact
+-- 
+2.43.0
+

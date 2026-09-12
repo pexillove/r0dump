@@ -1,0 +1,488 @@
+From 7d2d1388440f2565120d1493c3233e476bc45fca Mon Sep 17 00:00:00 2001
+From: Ivory <contact@ivory.cafe>
+Date: Wed, 2 Sep 2026 07:26:10 +0800
+Subject: [PATCH 14/21] Preserve protected logical DEX evidence for UI recovery
+
+Constraint: Protected DexFile ranges may be split and non-contiguous
+Rejected: Direct DataBegin/DataSize memcpy | caused SIGSEGV on protected com.VCB data
+Confidence: medium
+Scope-risk: moderate
+Directive: Keep host promotion gated by runtime table provenance, object identity, and reachability validation
+Tested: m com.android.art -j8; ART source tests; 19 host Python tests; device smoke after deployment
+Not-tested: A fresh targeted run with all UI CodeItem artifacts retained
+Change-Id: I5935004b9408ae2a00a698c91bc0061103b63894
+---
+ libdexfile/dex/dex_file.h               |  37 ++++
+ runtime/r0dump/r0dump_capture.cc        | 242 +++++++++++++++++-------
+ tools/r0dump/r0dump_host_repair.py      |  18 +-
+ tools/r0dump/test_r0dump_host_repair.py |  36 ++++
+ 4 files changed, 261 insertions(+), 72 deletions(-)
+
+diff --git a/libdexfile/dex/dex_file.h b/libdexfile/dex/dex_file.h
+index 20dbf57..bee012e 100644
+--- a/libdexfile/dex/dex_file.h
++++ b/libdexfile/dex/dex_file.h
+@@ -20,6 +20,7 @@
+ #include <android-base/logging.h>
+ 
+ #include <array>
++#include <cstdint>
+ #include <memory>
+ #include <optional>
+ #include <string>
+@@ -821,6 +822,42 @@ class DexFile {
+ 
+   size_t DataSize() const { return data_.size(); }
+ 
++  // Snapshot the private table layout for diagnostic consumers.  This is provenance only: callers
++  // must validate every range before dereferencing the addresses or promoting the bytes to a DEX.
++  struct R0dumpRuntimeView final {
++    uintptr_t begin = 0u;
++    uintptr_t data_begin = 0u;
++    size_t data_size = 0u;
++    uintptr_t header = 0u;
++    uintptr_t string_ids = 0u;
++    uintptr_t type_ids = 0u;
++    uintptr_t field_ids = 0u;
++    uintptr_t method_ids = 0u;
++    uintptr_t proto_ids = 0u;
++    uintptr_t class_defs = 0u;
++    uint32_t string_ids_count = 0u;
++    uint32_t type_ids_count = 0u;
++    uint32_t field_ids_count = 0u;
++    uint32_t method_ids_count = 0u;
++    uint32_t proto_ids_count = 0u;
++    uint32_t class_defs_count = 0u;
++  };
++
++  R0dumpRuntimeView GetR0dumpRuntimeView() const {
++    R0dumpRuntimeView view;
++    view.begin = reinterpret_cast<uintptr_t>(begin_);
++    view.data_begin = reinterpret_cast<uintptr_t>(data_.data());
++    view.data_size = data_.size();
++    view.header = reinterpret_cast<uintptr_t>(header_);
++    view.string_ids = reinterpret_cast<uintptr_t>(string_ids_);
++    view.type_ids = reinterpret_cast<uintptr_t>(type_ids_);
++    view.field_ids = reinterpret_cast<uintptr_t>(field_ids_);
++    view.method_ids = reinterpret_cast<uintptr_t>(method_ids_);
++    view.proto_ids = reinterpret_cast<uintptr_t>(proto_ids_);
++    view.class_defs = reinterpret_cast<uintptr_t>(class_defs_);
++    return view;
++  }
++
+   template <typename T>
+   const T* DataPointer(size_t offset) const {
+     return (offset != 0u) ? NonNullDataPointer<T>(offset) : nullptr;
+diff --git a/runtime/r0dump/r0dump_capture.cc b/runtime/r0dump/r0dump_capture.cc
+index f3e90ad..6718f3f 100644
+--- a/runtime/r0dump/r0dump_capture.cc
++++ b/runtime/r0dump/r0dump_capture.cc
+@@ -24,6 +24,7 @@
+ #include <cstdio>
+ #include <memory>
+ #include <mutex>
++#include <new>
+ #include <optional>
+ #include <string_view>
+ #include <sys/uio.h>
+@@ -203,6 +204,92 @@ bool r0dump_IsReadableSpan(const uint8_t* begin, size_t size) {
+   return false;
+ }
+ 
++void r0dump_AnnotateLogicalCopy(r0dump_RecordMetadata* metadata,
++                                bool complete,
++                                size_t copied_bytes) {
++  if (metadata == nullptr || metadata->runtime_view_json.empty()) {
++    return;
++  }
++  const size_t closing = metadata->runtime_view_json.find_last_of('}');
++  if (closing == std::string::npos) {
++    return;
++  }
++  metadata->runtime_view_json.insert(
++      closing,
++      ",\"logical_data_complete\":" + std::string(complete ? "true" : "false") +
++          ",\"logical_data_copied_bytes\":" + std::to_string(copied_bytes));
++}
++
++// Copy a logical DexFile data range without ever dereferencing an address that is not covered by
++// a readable mapping. Protected loaders may scatter this range across anonymous mappings and leave
++// guard gaps between them.  Gaps remain zero-filled and are reported to the caller via `complete`;
++// host-side reconstruction still validates all table references before accepting the image.
++std::unique_ptr<uint8_t[]> r0dump_CopyLogicalData(const uint8_t* begin,
++                                                  size_t size,
++                                                  bool* complete,
++                                                  size_t* copied_bytes) {
++  if (complete == nullptr || copied_bytes == nullptr || begin == nullptr || size == 0u ||
++      size > UINTPTR_MAX - reinterpret_cast<uintptr_t>(begin)) {
++    return nullptr;
++  }
++  std::unique_ptr<uint8_t[]> copy(new (std::nothrow) uint8_t[size]());
++  if (copy == nullptr) {
++    return nullptr;
++  }
++  const uintptr_t start = reinterpret_cast<uintptr_t>(begin);
++  const uintptr_t end = start + size;
++  *complete = true;
++  *copied_bytes = 0u;
++  FILE* maps = fopen("/proc/self/maps", "re");
++  if (maps == nullptr) {
++    return nullptr;
++  }
++  uintptr_t cursor = start;
++  char line[768] = {};
++  while (fgets(line, sizeof(line), maps) != nullptr) {
++    uintptr_t map_start = 0u;
++    uintptr_t map_end = 0u;
++    char permissions[5] = {};
++    if (sscanf(line, "%" SCNxPTR "-%" SCNxPTR " %4s", &map_start, &map_end, permissions) !=
++            3 ||
++        map_end <= start || map_start >= end || map_end <= map_start) {
++      continue;
++    }
++    const uintptr_t segment_start = std::max(start, map_start);
++    const uintptr_t segment_end = std::min(end, map_end);
++    if (segment_start > cursor) {
++      *complete = false;
++    }
++    if (permissions[0] != 'r') {
++      *complete = false;
++      cursor = std::max(cursor, segment_end);
++      continue;
++    }
++    const size_t segment_size = static_cast<size_t>(segment_end - segment_start);
++    const size_t local_offset = static_cast<size_t>(segment_start - start);
++    const iovec local = {copy.get() + local_offset, segment_size};
++    const iovec remote = {reinterpret_cast<void*>(segment_start), segment_size};
++    ssize_t read_bytes;
++    do {
++      read_bytes = process_vm_readv(getpid(), &local, 1u, &remote, 1u, 0u);
++    } while (read_bytes < 0 && errno == EINTR);
++    if (read_bytes != static_cast<ssize_t>(segment_size)) {
++      *complete = false;
++      if (read_bytes > 0) {
++        *copied_bytes += static_cast<size_t>(read_bytes);
++      }
++    } else {
++      *copied_bytes += segment_size;
++    }
++    cursor = std::max(cursor, segment_end);
++  }
++  fclose(maps);
++  if (cursor < end) {
++    *complete = false;
++  }
++  return copy;
++}
++
+ bool r0dump_GetCodeItemSpan(const DexFile& dex_file,
+                             const dex::CodeItem* code_item,
+                             size_t max_code_item_bytes,
+@@ -423,60 +510,64 @@ r0dump_RecordMetadata r0dump_DexMetadata(const DexFile& dex) {
+   if (dex.DataBegin() != nullptr) {
+     metadata.data_begin = reinterpret_cast<uintptr_t>(dex.DataBegin());
+   }
+-  // Preserve the old r0dump logical-view contract when the header's ID tables
+-  // are all addressable from DataBegin. This is deliberately metadata-only;
+-  // the bytes are captured through kDexData and validated by the host.
+-  const DexFile::Header& header = dex.GetHeader();
+-  const uint8_t* data_begin = dex.DataBegin();
+-  const uint8_t* dex_begin = dex.Begin();
+-  const size_t data_size = dex.DataSize();
+-  const bool has_logical_base = data_begin != nullptr && data_size != 0u;
+-  const auto in_logical_image = [&](uint32_t offset, uint32_t count, size_t item_size) {
+-    if (!has_logical_base || dex_begin == nullptr) {
+-      return false;
+-    }
+-    if (count == 0u) {
+-      return true;
+-    }
+-    if (offset < header.data_off_) {
++  // Preserve the old r0dump logical-view contract using ART's actual private table pointers. This
++  // remains metadata-only; bytes are copied through the guarded kDexData path and validated by the
++  // host before any pointer is dereferenced.
++  DexFile::R0dumpRuntimeView runtime = dex.GetR0dumpRuntimeView();
++  if (runtime.header != 0u &&
++      r0dump_IsReadableSpan(reinterpret_cast<const uint8_t*>(runtime.header),
++                            sizeof(DexFile::Header))) {
++    DexFile::Header header = {};
++    std::memcpy(&header, reinterpret_cast<const void*>(runtime.header), sizeof(header));
++    runtime.string_ids_count = header.string_ids_size_;
++    runtime.type_ids_count = header.type_ids_size_;
++    runtime.field_ids_count = header.field_ids_size_;
++    runtime.method_ids_count = header.method_ids_size_;
++    runtime.proto_ids_count = header.proto_ids_size_;
++    runtime.class_defs_count = header.class_defs_size_;
++  }
++  const uintptr_t logical_begin = runtime.data_begin;
++  const size_t logical_size = runtime.data_size;
++  const auto pointer_in_logical_image = [&](uintptr_t pointer, uint32_t count, size_t item_size) {
++    if (logical_begin == 0u || logical_size == 0u || pointer < logical_begin ||
++        pointer - logical_begin > logical_size) {
+       return false;
+     }
+-    const uint64_t relative = static_cast<uint64_t>(offset) - header.data_off_;
+-    return relative <= data_size &&
+-           static_cast<uint64_t>(count) * item_size <= data_size - relative;
++    const uint64_t relative = static_cast<uint64_t>(pointer - logical_begin);
++    return static_cast<uint64_t>(count) * item_size <= logical_size - relative;
+   };
+-  if (in_logical_image(header.string_ids_off_, header.string_ids_size_, 4u) &&
+-      in_logical_image(header.type_ids_off_, header.type_ids_size_, 4u) &&
+-      in_logical_image(header.proto_ids_off_, header.proto_ids_size_, 12u) &&
+-      in_logical_image(header.field_ids_off_, header.field_ids_size_, 8u) &&
+-      in_logical_image(header.method_ids_off_, header.method_ids_size_, 8u) &&
+-      in_logical_image(header.class_defs_off_, header.class_defs_size_, 32u)) {
+-    char base[32];
+-    std::snprintf(base, sizeof(base), "0x%llx",
+-                  static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(data_begin)));
+-    const auto pointer = [&](uint32_t offset, uint32_t count) {
+-      char value[32];
+-      const uintptr_t address = count == 0u
+-                                    ? reinterpret_cast<uintptr_t>(data_begin)
+-                                    : reinterpret_cast<uintptr_t>(dex_begin) + offset;
++  if (pointer_in_logical_image(runtime.string_ids, runtime.string_ids_count, 4u) &&
++      pointer_in_logical_image(runtime.type_ids, runtime.type_ids_count, 4u) &&
++      pointer_in_logical_image(runtime.proto_ids, runtime.proto_ids_count, 12u) &&
++      pointer_in_logical_image(runtime.field_ids, runtime.field_ids_count, 8u) &&
++      pointer_in_logical_image(runtime.method_ids, runtime.method_ids_count, 8u) &&
++      pointer_in_logical_image(runtime.class_defs, runtime.class_defs_count, 32u)) {
++    char value[32];
++    const auto hex = [&](uintptr_t address) {
+       std::snprintf(value, sizeof(value), "0x%llx",
+                     static_cast<unsigned long long>(address));
+       return std::string(value);
+     };
+-    metadata.runtime_view_json = "{\"data_begin\":\"" + std::string(base) +
+-        "\",\"string_ids\":\"" + pointer(header.string_ids_off_, header.string_ids_size_) +
+-        "\",\"type_ids\":\"" + pointer(header.type_ids_off_, header.type_ids_size_) +
+-        "\",\"proto_ids\":\"" + pointer(header.proto_ids_off_, header.proto_ids_size_) +
+-        "\",\"field_ids\":\"" + pointer(header.field_ids_off_, header.field_ids_size_) +
+-        "\",\"method_ids\":\"" + pointer(header.method_ids_off_, header.method_ids_size_) +
+-        "\",\"class_defs\":\"" + pointer(header.class_defs_off_, header.class_defs_size_) +
+-        "\",\"section_counts_current\":{\"string_ids\":" +
+-        std::to_string(header.string_ids_size_) + ",\"type_ids\":" +
+-        std::to_string(header.type_ids_size_) + ",\"proto_ids\":" +
+-        std::to_string(header.proto_ids_size_) + ",\"field_ids\":" +
+-        std::to_string(header.field_ids_size_) + ",\"method_ids\":" +
+-        std::to_string(header.method_ids_size_) + ",\"class_defs\":" +
+-        std::to_string(header.class_defs_size_) + "}}";
++    metadata.runtime_view_json = "{\"data_begin\":\"" + hex(logical_begin) +
++        "\",\"string_ids\":\"" + hex(runtime.string_ids) +
++        "\",\"type_ids\":\"" + hex(runtime.type_ids) +
++        "\",\"proto_ids\":\"" + hex(runtime.proto_ids) +
++        "\",\"field_ids\":\"" + hex(runtime.field_ids) +
++        "\",\"method_ids\":\"" + hex(runtime.method_ids) +
++        "\",\"class_defs\":\"" + hex(runtime.class_defs) + "\"";
++    const bool have_runtime_counts = runtime.string_ids_count != 0u || runtime.type_ids_count != 0u ||
++                                     runtime.proto_ids_count != 0u || runtime.field_ids_count != 0u ||
++                                     runtime.method_ids_count != 0u || runtime.class_defs_count != 0u;
++    if (have_runtime_counts) {
++      metadata.runtime_view_json += ",\"section_counts_current\":{\"string_ids\":" +
++          std::to_string(runtime.string_ids_count) + ",\"type_ids\":" +
++          std::to_string(runtime.type_ids_count) + ",\"proto_ids\":" +
++          std::to_string(runtime.proto_ids_count) + ",\"field_ids\":" +
++          std::to_string(runtime.field_ids_count) + ",\"method_ids\":" +
++          std::to_string(runtime.method_ids_count) + ",\"class_defs\":" +
++          std::to_string(runtime.class_defs_count) + "}";
++    }
++    metadata.runtime_view_json += "}";
+   }
+   r0dump_SetLocationMetadata(dex.GetLocation(), &metadata);
+   return metadata;
+@@ -787,19 +878,17 @@ r0dump_CaptureResult r0dump_ObserveDexSource(r0dump_Point point,
+   r0dump_CaptureKind capture_kind = r0dump_CaptureKind::kDexView;
+   std::optional<r0dump_DexFormat> format = view_format;
+   std::unique_ptr<uint8_t[]> safe_fallback_copy;
++  bool logical_copy_complete = true;
++  size_t logical_copy_bytes = 0u;
+   if (!view_bounded) {
+     capture_begin = dex.DataBegin();
+     capture_size = dex.DataSize();
+     capture_kind = r0dump_CaptureKind::kDexData;
+-    // Do not even inspect the fallback header until the first header-sized span is proven
+-    // readable.  DataBegin/DataSize may describe stale or split mappings after protection.
+-    if (r0dump_IsReadableSpan(capture_begin, sizeof(DexFile::Header))) {
+-      format = r0dump_ValidateDexImage(capture_begin, capture_size);
+-    }
+   }
+-  if (capture_begin == nullptr || capture_size < sizeof(DexFile::Header) ||
++  if (capture_begin == nullptr || capture_size == 0u ||
+       capture_size > state->max_dex_bytes || capture_size > kR0dumpMaxDexBytesHardLimit ||
+-      !r0dump_IsReadableSpan(capture_begin, capture_size) ||
++      (capture_kind == r0dump_CaptureKind::kDexView &&
++       !r0dump_IsReadableSpan(capture_begin, capture_size)) ||
+       (!format.has_value() && capture_kind == r0dump_CaptureKind::kDexView)) {
+     return r0dump_RecordDexSourceDrop(*state->staging,
+                                       context,
+@@ -807,26 +896,19 @@ r0dump_CaptureResult r0dump_ObserveDexSource(r0dump_Point point,
+                                       std::move(metadata));
+   }
+   if (capture_kind == r0dump_CaptureKind::kDexData) {
+-    safe_fallback_copy.reset(new (std::nothrow) uint8_t[capture_size]);
+-    if (safe_fallback_copy == nullptr) {
+-      return r0dump_RecordDexSourceDrop(*state->staging,
+-                                        context,
+-                                        format.value_or(r0dump_DexFormat::kNotApplicable),
+-                                        std::move(metadata));
+-    }
+-    const iovec local = {safe_fallback_copy.get(), capture_size};
+-    const iovec remote = {const_cast<uint8_t*>(capture_begin), capture_size};
+-    ssize_t copied;
+-    do {
+-      copied = process_vm_readv(getpid(), &local, 1u, &remote, 1u, 0u);
+-    } while (copied < 0 && errno == EINTR);
+-    if (copied != static_cast<ssize_t>(capture_size)) {
++    safe_fallback_copy = r0dump_CopyLogicalData(
++        capture_begin, capture_size, &logical_copy_complete, &logical_copy_bytes);
++    if (safe_fallback_copy == nullptr || logical_copy_bytes == 0u) {
+       return r0dump_RecordDexSourceDrop(*state->staging,
+                                         context,
+                                         format.value_or(r0dump_DexFormat::kNotApplicable),
+                                         std::move(metadata));
+     }
+     capture_begin = safe_fallback_copy.get();
++    r0dump_AnnotateLogicalCopy(&metadata, logical_copy_complete, logical_copy_bytes);
++    if (r0dump_IsReadableSpan(capture_begin, sizeof(DexFile::Header))) {
++      format = r0dump_ValidateDexImage(capture_begin, capture_size);
++    }
+   }
+   const uint64_t hash = r0dump_HashBytes(capture_begin, capture_size);
+   std::optional<r0dump_SubmitResult> referenced = state->staging->r0dump_TryReferenceDex(
+@@ -1276,6 +1358,9 @@ r0dump_CaptureResult r0dump_CaptureDex(r0dump_BufferPool& pool,
+   const uint8_t* begin = nullptr;
+   size_t size = 0u;
+   r0dump_DexFormat format = r0dump_DexFormat::kNotApplicable;
++  std::unique_ptr<uint8_t[]> logical_copy;
++  bool logical_copy_complete = true;
++  size_t logical_copy_bytes = 0u;
+   switch (kind) {
+     case r0dump_CaptureKind::kDexView:
+       begin = borrowed.dex.Begin();
+@@ -1285,6 +1370,15 @@ r0dump_CaptureResult r0dump_CaptureDex(r0dump_BufferPool& pool,
+     case r0dump_CaptureKind::kDexData:
+       begin = borrowed.dex.DataBegin();
+       size = borrowed.dex.DataSize();
++      if (size == 0u || size > kR0dumpMaxDexBytesHardLimit) {
++        return r0dump_RecordDexDrop(staging, context, kind, format, "invalid_range", borrowed.dex);
++      }
++      logical_copy = r0dump_CopyLogicalData(
++          begin, size, &logical_copy_complete, &logical_copy_bytes);
++      if (logical_copy == nullptr || logical_copy_bytes == 0u) {
++        return r0dump_RecordDexDrop(staging, context, kind, format, "invalid_range", borrowed.dex);
++      }
++      begin = logical_copy.get();
+       break;
+     case r0dump_CaptureKind::kBuffer:
+     case r0dump_CaptureKind::kCodeItem:
+@@ -1293,13 +1387,21 @@ r0dump_CaptureResult r0dump_CaptureDex(r0dump_BufferPool& pool,
+           staging, context, kind, format, "capture_kind_mismatch", borrowed.dex);
+   }
+   if (size > kR0dumpMaxDexBytesHardLimit ||
+-      !r0dump_IsBoundedSpan(
+-          begin, size, container->Begin(), container->End() - container->Begin()) ||
++      (kind == r0dump_CaptureKind::kDexView &&
++       (!r0dump_IsBoundedSpan(
++            begin, size, container->Begin(), container->End() - container->Begin()) ||
++        !r0dump_IsReadableSpan(begin, size))) ||
+       (kind == r0dump_CaptureKind::kDexView && format == r0dump_DexFormat::kNotApplicable)) {
+     return r0dump_RecordDexDrop(staging, context, kind, format, "invalid_range", borrowed.dex);
+   }
+   r0dump_RecordMetadata metadata = r0dump_DexMetadata(borrowed.dex);
+   metadata.class_def_index = borrowed.class_def_index;
++  if (logical_copy != nullptr) {
++    r0dump_AnnotateLogicalCopy(&metadata, logical_copy_complete, logical_copy_bytes);
++  }
++  if (logical_copy != nullptr) {
++    begin = logical_copy.get();
++  }
+   return r0dump_CopyAndSubmitDex(
+       pool, staging, begin, size, kind, format, context, std::move(metadata));
+ }
+diff --git a/tools/r0dump/r0dump_host_repair.py b/tools/r0dump/r0dump_host_repair.py
+index 711be9a..706f451 100755
+--- a/tools/r0dump/r0dump_host_repair.py
++++ b/tools/r0dump/r0dump_host_repair.py
+@@ -660,8 +660,12 @@ def r0dump_repair_run(run_dir: Path, output_dir: Path, dexdump: str | None = Non
+         dex_candidates.setdefault(
+             candidate_digest,
+             {"data": candidate_data, "artifact": candidate_artifact, "catalog": catalog,
+-             "rehydrated": rehydrated},
++             "rehydrated": rehydrated,
++             "dex_object_ids": set()},
+         )
++        object_id = record.get("dex_object_id")
++        if object_id is not None:
++            dex_candidates[candidate_digest]["dex_object_ids"].add(object_id)
+ 
+     input_entries: dict[str, dict[str, Any]] = {}
+     code_discovered: list[tuple[Path, dict[str, Any], bytes, str]] = []
+@@ -733,7 +737,17 @@ def r0dump_repair_run(run_dir: Path, output_dir: Path, dexdump: str | None = Non
+         if item.get("reason") == "code_item_conflict":
+             continue
+         matches = []
+-        for candidate_digest, candidate in dex_candidates.items():
++        object_id = record.get("dex_object_id")
++        scoped_candidates = dex_candidates.items()
++        if object_id is not None:
++            identity_matches = [
++                (digest, candidate)
++                for digest, candidate in dex_candidates.items()
++                if object_id in candidate["dex_object_ids"]
++            ]
++            if identity_matches:
++                scoped_candidates = identity_matches
++        for candidate_digest, candidate in scoped_candidates:
+             target_offset = r0dump_match_code_item(record, candidate["catalog"])
+             if target_offset is not None:
+                 matches.append((candidate_digest, target_offset))
+diff --git a/tools/r0dump/test_r0dump_host_repair.py b/tools/r0dump/test_r0dump_host_repair.py
+index 66162ed..db1b898 100644
+--- a/tools/r0dump/test_r0dump_host_repair.py
++++ b/tools/r0dump/test_r0dump_host_repair.py
+@@ -237,6 +237,42 @@ class r0dump_HostRepairTest(unittest.TestCase):
+             self.assertEqual(item["reason"], "target_dex_ambiguous")
+             self.assertFalse(report["reconstructions"])
+ 
++    def r0dump_test_code_item_scopes_candidates_by_dex_identity(self):
++        with tempfile.TemporaryDirectory() as temp:
++            root = Path(temp)
++            run = root / "run"
++            (run / "records").mkdir(parents=True)
++            (run / "artifacts").mkdir()
++            first, code_off = r0dump_backfill_dex(padding=1)
++            second, _ = r0dump_backfill_dex(padding=2)
++            replacement = first[code_off:code_off + 18]
++            for sequence, value, object_id in ((1, first, 11), (2, second, 22)):
++                name = f"base-{sequence}.dex.raw"
++                (run / "artifacts" / name).write_bytes(value)
++                (run / "records" / f"00000{sequence}.json").write_text(json.dumps({
++                    "capture_kind": "dex",
++                    "artifact_relative_path": f"artifacts/{name}",
++                    "dex_object_id": object_id,
++                }), encoding="utf-8")
++            (run / "artifacts/method.codeitem.raw").write_bytes(replacement)
++            (run / "records/000003.json").write_text(json.dumps({
++                "capture_kind": "codeitem",
++                "artifact_relative_path": "artifacts/method.codeitem.raw",
++                "dex_object_id": 22,
++                "method_index": 0,
++                "class_def_index": 0,
++                "class_name": "LExample;",
++                "method_name": "target",
++                "method_descriptor": "()V",
++                "code_item_size": len(replacement),
++            }), encoding="utf-8")
++
++            report = r0dump_repair_run(run, root / "output")
++
++            item = next(item for item in report["records"] if item["record"] == "000003.json")
++            self.assertEqual(item["trust"], "repaired")
++            self.assertEqual(len(report["reconstructions"]), 1)
++
+     def r0dump_test_truncated_code_item_is_rejected_without_touching_base_dex(self):
+         with tempfile.TemporaryDirectory() as temp:
+             root = Path(temp)
+-- 
+2.43.0
+

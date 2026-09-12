@@ -1,0 +1,1166 @@
+From abef544f8e853b64b5174270001e7bfc2e6fba21 Mon Sep 17 00:00:00 2001
+From: Ivory <contact@ivory.cafe>
+Date: Thu, 10 Sep 2026 21:46:41 +0800
+Subject: [PATCH 21/32] manager: documentation and string resources
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ AndroidManifest.xml           |   1 -
+ DESIGN.md                     | 172 +++++++------
+ IMPLEMENTATION.md             | 449 ++++++----------------------------
+ PRODUCT.md                    |  49 ++--
+ STATUS.md                     |  34 +--
+ res/values-zh-rCN/strings.xml |  16 +-
+ res/values/strings.xml        |  16 +-
+ 7 files changed, 217 insertions(+), 520 deletions(-)
+
+diff --git a/AndroidManifest.xml b/AndroidManifest.xml
+index 39419b5..25e37ba 100644
+--- a/AndroidManifest.xml
++++ b/AndroidManifest.xml
+@@ -4,7 +4,6 @@
+ 
+     <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+     <uses-permission android:name="android.permission.FORCE_STOP_PACKAGES" />
+-    <uses-permission android:name="android.permission.USE_BIOMETRIC" />
+     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+     <uses-permission android:name="android.permission.MANAGE_R0DUMP_EXPORT" />
+diff --git a/DESIGN.md b/DESIGN.md
+index cbe798f..92a01ca 100644
+--- a/DESIGN.md
++++ b/DESIGN.md
+@@ -1,81 +1,91 @@
+-# R0dump Manager Design System
+-
+-## Visual Direction
+-
+-Android 16 system configuration tool using Jetpack Compose, Material 3 Expressive, dynamic color, edge-to-edge layout, and standard system typography. Design serves repeated operational work: compact, familiar, and state-driven.
+-
+-## Color
+-
+-- Prefer Android dynamic color in light and dark themes.
+-- Fallback primary: `#465D91` light, `#AFC6FF` dark.
+-- Fallback surface: `#FAF8FF` light, `#121318` dark.
+-- Success is reserved for verified completion; enabled sessions use primary state styling.
+-- Warning and error colors communicate dirty, interrupted, invalid, or costly states, never decoration.
+-
+-## Typography
+-
+-- Use the platform Material 3 typography and Roboto family.
+-- App title: bold `titleLarge`; page title: bold `titleLarge`; section and group titles: bold `titleMedium`.
+-- Body labels: `bodyLarge` or `bodyMedium`.
+-- Masks, descriptors, and byte values use monospace where scanning benefits. Internal run IDs and generations are not exposed in the primary UI.
+-- Do not use display typography inside compact tool surfaces.
+-
+-## Shape And Elevation
+-
+-- Content groups and cards use at most 8 dp corner radius.
+-- Use standard Material component shapes for fields and buttons.
+-- Do not nest cards.
+-- Elevation is limited to persistent action surfaces, sheets, and dialogs.
+-
+-## Spacing And Sizing
+-
+-- Spacing scale: 4, 8, 12, 16, 24, and 32 dp.
+-- Compact horizontal padding: 16 dp; medium: 24 dp; expanded: 32 dp.
+-- List rows are at least 56 dp and touch targets at least 48 dp.
+-- Toolbars, buttons, counters, and loading states keep stable dimensions.
+-
+-## Layout
+-
+-- Compact: top app bar with language, refresh, and capture-state switch actions, a single scrolling column, contextual secondary actions, and four-item bottom navigation.
+-- Medium: navigation rail, single content column, and contextual docked actions.
+-- Expanded: navigation rail and a centered editing column up to 720 dp.
+-- Insets are consumed once by the root scaffold; action surfaces must not cover the final form row.
+-
+-## Components
+-
+-- Capture state: the top-right switch is the only persistent enabled/disabled signal. Run IDs, generations, and duplicate device-state text remain internal unless an error requires recovery.
+-- The switch keeps a 48 dp semantic touch target while its visual control is scaled down for the compact TopAppBar.
+-- Capture state: the top-right switch is the primary enable/disable action; authentication success continues the pending transition without a second tap.
+-- Contextual actions: refresh lives in the TopAppBar. A valid draft transition shows one short native Toast and exposes publish-only as a compact TopAppBar icon after authentication. The bottom action surface is reserved for validation errors and recovery state; it never persists a generic "draft changed" banner.
+-- Validation feedback: the contextual error surface names each affected field and gives its localized correction, shows up to three issues without taking over the screen, and directs users to inline highlighted fields when more remain.
+-- Manager-owned fields such as run ID are repaired or generated automatically and never presented as user-fixable validation errors.
+-- Booleans use switches, capture points use checkboxes inside expandable category headers, enums use segmented controls or chips, and numeric values use text fields with units.
+-- Capture point category headers show selected and total counts. All groups start collapsed on first use, then restore the user's latest expanded/collapsed choices.
+-- Capture point rows lead with the actual ART or libcore source function. The stable runtime point ID remains visible as secondary text so operators can correlate the selection with logs and artifacts.
+-- Budgets use two expandable groups, capacity limits and records/flushing, with the same header, summary, chevron, and motion vocabulary as advanced settings. Reset is an icon action beside the page title rather than a full-width trailing button.
+-- Notification permission is explained only when the user starts a capture without notifications enabled; it does not occupy persistent page space.
+-- Advanced settings use three expandable headers for Manifest, Walk, and Force/ANR; headers summarize enabled state and validation errors reveal hidden fields. ANR protection is the first control inside Force/ANR so its independent session policy is visible before force-invoke selectors.
+-- The selected destination and expanded/collapsed state of capture, budget, and advanced groups persist across activity and process recreation. Transient menus and search activation do not persist.
+-- Walk start and mode use full-width Material 3 dropdown fields; the closed field shows the current value and the open menu marks the current item.
+-- The Apps destination starts with the primary "Application selection" title followed immediately by application search; it does not repeat a description or insert an empty spacer.
+-- Icon-only buttons require content descriptions and tooltips where the icon is not universally familiar.
+-
+-## Motion
+-
+-Use Material 3 expressive motion only for state feedback, typically 150 to 250 ms. Capture groups, advanced groups, and additional budgets animate height and opacity when expanded or collapsed; dropdown menus use the Material transition. No decorative page entrances, bouncing, pulsing, or transaction logic that depends on animation completion. Reduced motion falls back to crossfade or instant state changes.
+-
+-## Localization
+-
+-English and Simplified Chinese are equal layout targets. Technical identifiers remain unchanged. Every screenshot pass covers both languages, all four destinations, important enabled/disabled/error states, and portrait/landscape layouts.
+-
+-## Visual Verification
+-
+-- Use screenshots from the physical OnePlus 9 as the primary visual evidence; emulator or preview captures are supplemental only.
+-- Capture each iteration in both English and Simplified Chinese for the session, capture points, budgets, and advanced destinations.
+-- Cover unauthenticated disabled, authenticated disabled, enabled, validation-error, and in-flight states where applicable.
+-- Verify portrait and landscape at the physical display size, then exercise at least one medium or expanded window configuration.
+-- Inspect every capture for text truncation, overlap, hidden final rows, unstable control dimensions, insufficient contrast, and touch targets smaller than 48 dp.
+-- Store captures with descriptive names containing the destination, state, locale, and orientation so before/after comparisons remain reproducible.
+-- End each verification pass with the device in a disabled session state and confirm that the target process and active-session notification are absent.
+-
+-The normative UI/UX requirements remain sections 8 and 10 of [IMPLEMENTATION.md](IMPLEMENTATION.md).
++# R0dump Manager 设计系统
++
++## 视觉方向
++
++采用 Jetpack Compose、Material 3 Expressive、动态取色、edge-to-edge 布局和系统标准字体，
++形成 Android 16 系统配置工具。设计服务于重复操作，应紧凑、熟悉并以状态为中心。
++
++## 颜色
++
++- 浅色和深色主题优先使用 Android 动态取色。
++- 浅色后备主色：`#465D91`；深色后备主色：`#AFC6FF`。
++- 浅色后备 surface：`#FAF8FF`；深色后备 surface：`#121318`。
++- success 色只表示已验证完成；启用中的会话使用主色状态样式。
++- warning 和 error 色只表达草稿、异常中断、无效或高成本状态，不作装饰。
++
++## 字体
++
++- 使用平台 Material 3 typography 和 Roboto 字体族。
++- 应用标题和页面标题使用加粗 `titleLarge`；分区和分组标题使用加粗 `titleMedium`。
++- 正文标签使用 `bodyLarge` 或 `bodyMedium`。
++- mask、descriptor 和字节值在有利于扫描时使用等宽字体。主界面不展示内部 run ID 和 generation，
++  除非错误恢复确实需要。
++- 紧凑工具界面不使用 display 级大字号。
++
++## 形状与层级
++
++- 内容分组和卡片的圆角不超过 8 dp。
++- 输入框和按钮使用标准 Material 组件形状。
++- 不嵌套卡片。
++- elevation 只用于常驻操作面、sheet 和 dialog。
++
++## 间距与尺寸
++
++- 间距刻度：4、8、12、16、24、32 dp。
++- compact 水平边距为 16 dp，medium 为 24 dp，expanded 为 32 dp。
++- 列表行至少 56 dp，触控目标至少 48 dp。
++- toolbar、按钮、计数器和加载状态保持稳定尺寸。
++
++## 布局
++
++- Compact：顶部应用栏包含语言、刷新和捕获状态开关；主体为单列滚动内容，带上下文次要操作和四项底部导航。
++- Medium：使用 navigation rail、单列内容和停靠式上下文操作区。
++- Expanded：使用 navigation rail，编辑列居中且最大宽度为 720 dp。
++- 根 Scaffold 只消费一次 inset；操作区不得遮住表单最后一行。
++
++## 组件
++
++- 右上角开关是唯一常驻的捕获启用/禁用信号。run ID、generation 和重复设备状态默认保持内部化，
++  只有错误恢复需要时才显示。
++- 开关保留 48 dp 语义触控目标，compact TopAppBar 中仅缩小视觉控件。
++- 开关是主要启停操作，点击后直接继续待处理状态转换。
++- 刷新位于 TopAppBar。有效草稿转换只显示一次短 Toast；可在 TopAppBar 提供紧凑的“仅发布”图标。
++  底部操作面只用于校验错误和恢复状态，不常驻“草稿已修改”横幅。
++- 校验错误区必须指出受影响字段和本地化修正方式，最多直接展示三项；更多错误引导到行内高亮字段。
++- Manager 管理的 run ID 等字段自动修复或生成，不显示为需要用户处理的错误。
++- 布尔值使用 switch，捕获点使用可展开分类内的 checkbox，枚举使用 segmented control 或 chip，
++  数值使用带单位的输入框。
++- 捕获点分类标题显示已选数和总数。首次使用时默认折叠，后续恢复用户最近的展开状态。
++- 捕获点行首先显示真实 ART/libcore 源函数；稳定 runtime point ID 作为次要文本保留，便于关联日志和产物。
++- 预算分为“容量限制”和“数量/刷新”两个可展开组，与高级设置共用标题、摘要、箭头和动效语言。
++  重置使用页面标题旁的图标操作，不使用底部通栏按钮。
++- 只有用户在通知未启用时启动捕获，才解释通知权限；不占用常驻页面空间。
++- 高级设置分为 Manifest、Walk、Force/ANR 三个可展开组。标题汇总启用状态，校验错误自动展开隐藏字段。
++  ANR protection 位于 Force/ANR 组首项，以便先展示其独立会话策略。
++- 当前页面、捕获/预算/高级分组的展开状态在 Activity 和进程重建后保留；临时菜单和搜索激活状态不保留。
++- Walk 启动方式和模式使用全宽 Material 3 下拉框；闭合时显示当前值，展开菜单标记当前项。
++- Apps 页面首先显示“应用选择”，随后直接显示搜索，不重复说明或插入空白占位。
++- 纯图标按钮必须有内容描述；图标含义不通用时还需 tooltip。
++
++## 动效
++
++Material 3 Expressive 动效只用于状态反馈，通常为 150 到 250 ms。捕获组、高级组和附加预算组展开/折叠时
++只改变高度和透明度；下拉菜单使用 Material 标准过渡。禁止装饰性页面入场、弹跳、脉冲，以及依赖动画完成的
++事务逻辑。减少动态效果时退化为 crossfade 或即时变化。
++
++## 本地化
++
++英文和简体中文是同等布局目标，技术标识保持原样。每轮截图覆盖两种语言、四个页面、重要的启用/禁用/错误状态，
++以及横竖屏布局。
++
++## 视觉验收
++
++- 以 OnePlus 9 真机截图作为主要视觉证据；模拟器或 Preview 只作补充。
++- 每轮覆盖英文和简体中文的会话、捕获点、预算和高级设置页面。
++- 按适用情况覆盖 owner-only、已启用、校验错误和执行中状态。
++- 先检查真机分辨率下的横竖屏，再检查至少一种 medium 或 expanded 窗口。
++- 检查文字截断、控件重叠、末行遮挡、尺寸跳动、对比度不足和小于 48 dp 的触控目标。
++- 截图文件名包含页面、状态、语言和方向，确保前后对比可复现。
++- 每轮结束时设备必须处于禁用会话状态，并确认目标进程和活动会话通知均不存在。
++
++UI/UX 的规范正文仍以 [IMPLEMENTATION.md](IMPLEMENTATION.md) 第 8、10 章为准。
+diff --git a/IMPLEMENTATION.md b/IMPLEMENTATION.md
+index 16857c4..f09849a 100644
+--- a/IMPLEMENTATION.md
++++ b/IMPLEMENTATION.md
+@@ -6,13 +6,13 @@
+ |---|---|
+ | 目标分支 | `r0dump-fusion` |
+ | 发布平台 | LineageOS 23.2 / Android 16 / `user`、`userdebug` |
+-| 构建与验收 | 源码展开 `-j2`，实际编译 `-j8`；定向 userdebug 构建和真机矩阵即为最终验收 |
++| 开发规范 | [`docs/r0dump-development-guide.md`](../../../docs/r0dump-development-guide.md) |
+ | 应用模块 | `packages/apps/R0dumpManager` |
+ | 包名 | `com.android.r0dumpmanager` |
+ | 配置前缀 | `persist.sys.r0dump.fusion.*` |
+ | 发布形态 | 平台系统应用 + init root 文件准备/导出 helper；开发验收仍以 userdebug 真机为准 |
+ | UI 技术 | Jetpack Compose + Material 3 Expressive |
+-| 文档状态 | Manager 已完成；方案一已完成源码、构建、SELinux 与 userdebug 真机 M9 闭环（2026-08-31） |
++| 文档状态 | Manager 基线已完成；当前保持既有控制面 |
+ | 主要用户 | ROM、ART、逆向与脱壳实验人员 |
+ 
+ 本文中的属性前缀是 `persist.sys.r0dump.fusion.*`。`system.persist` 不是 Android property 的合法命名顺序。
+@@ -20,7 +20,16 @@
+ Manager 完成证据和范围边界见 [STATUS.md](STATUS.md)。该状态只标记 Manager、其 Framework 管理入口与专用 SELinux
+ 合同完成，不代替 ART 数据面或后续脱壳实验主线的独立进度。
+ 
+-### 0.1 方案一当前完成度
++### 0.1 当前精简范围
++
++Manager 保持现有控制面，不跟随当前 ART 恢复实验扩张。early `standard_snapshot` 和默认关闭的
++`nearby_candidate` 继续复用现有 capture point、通用预算和导出入口；不新增 recovery/evidence/diagnostic profile、
++runtime bundle reader、artifact trust-state、分层预算或额外配置字段。构造期 Header/RuntimeView 和 table overlay
++属于准备从 ART 工作树删除的临时代码，不进入 Manager 产品合同。
++
++本文后续章节描述当前 Manager 合同，不应被解释为继续扩展恢复架构的任务清单。
++
++### 0.2 方案一当前完成度
+ 
+ “方案一”在本文中专指**同步 root helper 预创建目录 + 目录 FD 逐层交接**，不是后台 watcher 或事后修权限：
+ 
+@@ -29,12 +38,12 @@ Manager 完成证据和范围边界见 [STATUS.md](STATUS.md)。该状态只标
+ | 协议与 root helper | 已实现 | 固定二进制协议、身份复核、安全目录遍历、`SCM_RIGHTS` 返回 FD 和 native tests 已落地 |
+ | system_server | 已实现 | Binder UID/PID、`ProcessRecord`、PackageManager 和稳定配置快照四重校验已落地 |
+ | Framework / ART | 已实现 | `ParcelFileDescriptor` 到 native owned FD 的交接、固定子目录验证和 `0660` 原子发布已落地 |
+-| 产品与 SELinux | 已实现并通过策略构建 | helper 进入 lemonade/lemonadep 产品配置，独立 enforcing domain 和 neverallow/兼容性检查通过 |
++| 产品与 SELinux | 已实现 | helper 进入 OnePlus 9 产品配置，使用独立 enforcing domain |
+ | 真机实时读写 | 已验收 | 同一 revision 增量替换并重启后，普通非 root `adb shell` 已对 canonical 文件完成 stat/read/create/append/delete |
+-| 修复与导出 | 已验收 | Manager 经 AMS 请求 helper 修复最新 run、执行 CodeItem 回填，并把 APK、Manifest、报告和 SHA256 ZIP 导出到 Downloads；真机证据见 12.0.2 |
++| 修复与导出 | 已验收 | Manager 经 AMS 请求 helper 修复最新 run、执行 CodeItem 回填，并把 APK、Manifest、报告和 SHA256 ZIP 导出到 Downloads |
+ 
+ 这里的“实时”以 canonical 文件的发布边界为准：隐藏临时文件写入期间不承诺可读；原子 rename 成功后不允许再有
+-异步 `chown`/`chmod` 窗口。M9 已使用 `com.coolapk.market` 完成真机闭环，具体证据见 12.0.1。
++异步 `chown`/`chmod` 窗口。
+ 
+ ## 1. 现状与实施结论
+ 
+@@ -53,16 +62,12 @@ Manager 完成证据和范围边界见 [STATUS.md](STATUS.md)。该状态只标
+ 
+ `frameworks/base/core/java/android/app/r0dump_FusionConfig.java` 是字段解析、绝对上限、字段关系和字符串语法的唯一权威。
+ 
+-### 1.2 现有 Manager 代码的处理方式
++### 1.2 当前 Manager 实现边界
+ 
+-`R0dumpManager` 当前分支是历史实验快照，依赖本分支不存在的 `IR0dumpControlService`、旧的 28-bit 点位表和私有存储
+-Broker。该实现由 tag `r0dump-too-complex-wip` 保留，不作为新实现基线。
++当前实现遵循以下边界：
+ 
+-新实现采用重写策略：
+-
+-- 删除 Broker/AIDL、private-store reader、export、delete、index recovery 和旧 logcat UI；
+ - 保留 Compose、平台签名、priv-app 模块和可复用的包选择基础；
+-- 点位表切换为当前 42-bit registry；
++- 点位表切换为当前 43-bit registry；
+ - 只解决配置编辑、校验、事务发布、会话启动和会话结束；
+ - 不恢复常驻的产物 Broker、数据库或任意路径 reader；导出使用一次性、固定协议的显式 helper 操作；
+ - 为 `user`/`userdebug` 共用的实时权限准备新增一个极窄 init root helper。helper 只预建目录、设置 owner/group/mode
+@@ -112,7 +117,7 @@ SELinux domain 决定是否允许写入。
+ ### 2.1 目标
+ 
+ 1. 从已安装应用中选择精确 target package 和 target process；
+-2. 以当前 42 个物理 capture point 生成 64-bit mask；
++2. 以当前 43 个物理 capture point 生成 64-bit mask；
+ 3. 编辑 manifest、walk、force-invoke、ANR protection 和 18 个预算字段；
+ 4. 在发布前展示所有校验错误与字段依赖；
+ 5. 通过奇偶 generation 一次发布完整配置；
+@@ -121,11 +126,11 @@ SELinux domain 决定是否允许写入。
+ 8. 明确展示配置持久化、进程快照和重启语义；
+ 9. 默认启用 manifest、walk、force-invoke 和 ANR protection；manifest 组件类的包名前缀自动形成有界强制调用范围，完整精确 selector 可选且优先；
+ 10. 在 user 和 userdebug 产品配置中作为正式系统应用预装；
+-11. 对修改操作增加主用户、设备凭据和活动会话提醒三层保护；
++11. 对修改操作增加主用户、前台状态和活动会话提醒三层保护，不要求设备设置或输入 PIN；
+ 12. 完整支持 Android 16 edge-to-edge、预测返回、大屏自适应和 Material 3 Expressive。
+ 13. 所有用户可见文案支持简体中文和英文，并提供应用内语言切换。
+ 14. 新运行产物在原子发布后立即可由普通 `adb shell` 读写，且同一机制在 `user` 与 `userdebug` 构建中生效。
+-15. 经认证后可导出目标包最新有效 run；helper 保守修复 DEX、回填 CodeItem，并把 base/split APK、提取的 Manifest、
++15. 可导出目标包最新有效 run；helper 保守修复 DEX、回填 CodeItem，并把 base/split APK、提取的 Manifest、
+     修复报告和 SHA256 一并写入 `/sdcard/Downloads/r0dump-exports/<package>/`，供 JADX 使用。
+ 
+ ### 2.2 非目标
+@@ -141,7 +146,7 @@ SELinux domain 决定是否允许写入。
+ - 不允许用户输入输出目录；
+ - 不热更新已运行目标进程中的 immutable config；
+ - 不为制造点位命中而重签目标 APK、注入 agent 或改变 dexopt 模式；
+-- 不因构建类型变化而开放给 secondary user、managed profile 或无设备凭据环境修改全局配置。
++- 不因构建类型变化而开放给 secondary user 或 managed profile 修改全局配置；主用户即使未设置设备凭据也可使用。
+ 
+ ## 3. 模块边界
+ 
+@@ -219,7 +224,6 @@ packages/apps/R0dumpManager/
+     domain/ProfileRegistry.kt
+     notification/ActiveSessionNotifier.kt
+     receiver/BootCompletedReceiver.kt
+-    security/MutationAuthenticator.kt
+     ui/R0dumpManagerScreen.kt
+     ui/components/{CaptureStateToggle,AppSearch,ConfigField,FusionActionToolbar}.kt
+     ui/screens/{Session,CapturePoints,Limits,Advanced}Screen.kt
+@@ -363,7 +367,8 @@ PrepareResponseV1 (12 bytes, little-endian) {
+ 
+ - socket peer 必须是 `uid=1000` 的 system_server，且 SELinux 只允许 system_server connect；
+ - helper 自行再次执行 generation sandwich，要求 stable even、enabled=1，并逐项匹配 request；
+-- 首版只接受 `user_id=0`，target UID 必须是 system-user application UID；
++- 首版只接受 `user_id=0`；target UID 由 AMS 的 Binder UID/PID、`ProcessRecord` 和 PackageManager 精确绑定，
++  不再按 UID 数值是否小于 10000 区分系统 UID 与应用 UID；
+ - package、process、run ID 必须通过与 Framework/ART 相同的长度和 component 校验；
+ - helper 以 `MSG_TRUNC` 接收请求并要求包长精确等于 285 bytes；未知 magic/version/size、短包和长包全部拒绝；
+ - system_server 使用 2 秒 socket read timeout，要求响应头精确为 12 bytes，且成功响应必须恰有一个 FD；非成功响应或
+@@ -400,6 +405,8 @@ ExportResponseV1 (682 bytes, little-endian) {
+   descriptor 与 `code_off` 保守回填可证明唯一的 CodeItem；冲突或越界记录保持 partial，不猜测覆盖；
+ - ZIP 内含原始 run、`repaired/`、`partial/`、`inputs.json`、`report.json`、`export-report.json`、base/split APK、
+   从每个 APK 提取的二进制 `AndroidManifest.xml` 以及 `jadx-input.json`；
++- `report.json` 额外包含 `method_execution_paths`，按 DEX 对象、方法索引和可用的主动观察 attempt 关联
++  `before_dispatch`、传统解释器、直接 Nterp 与 no-execute 捕获记录，并报告 CodeItem hash 是否变化；
+ - 最终原子发布到 `/sdcard/Downloads/r0dump-exports/<package>/<run>.zip`，并写同名 `.sha256`；目录使用 `02770`，
+   文件使用 `0660`。Manager 只接收计数、最终路径和哈希，不接收任何 payload 字节。
+ 
+@@ -514,7 +521,7 @@ PRODUCT_PACKAGES += \
+ 
+ 建议放在 `device/oneplus/lemonade/lineage_lemonade.mk`。确认需要推广到更多设备后再上移到 Lineage common 配置。
+ 同一产品配置必须被 `user`、`userdebug`、`eng` 继承。发布包、权限检查、SELinux enforcing、hidden API enforcement 和日常
+-真机验收仍以 `lineage_lemonadep-bp4a-userdebug` 为准；本项目不把额外 user 变体或整包镜像作为当前收口前置条件，但
++真机验收固定使用开发规范中的 `lineage_lemonade bp4a userdebug`；本项目不把额外 user 变体或整包镜像作为当前收口前置条件，但
+ helper 的实现不得依赖任何 userdebug-only 能力，并需要以构建规则/source contract 证明 user 变体可包含同一模块。
+ 
+ 应用保持：
+@@ -545,7 +552,6 @@ Manifest 只声明：
+ 
+ - `android.permission.QUERY_ALL_PACKAGES`：目标应用选择器；
+ - `android.permission.FORCE_STOP_PACKAGES`：结束旧进程和结束会话；
+-- `android.permission.USE_BIOMETRIC`：通过平台 `BiometricPrompt` 执行 mutation 前认证；
+ - `android.permission.RECEIVE_BOOT_COMPLETED`：开机后恢复活动配置通知；
+ - `android.permission.POST_NOTIFICATIONS`：显示正式验收要求的 ongoing session notification，按系统运行时授权处理。
+ - `android.permission.MANAGE_R0DUMP_EXPORT`：signature/privileged 隐藏权限，仅允许 Manager 请求 AMS 发起修复导出。
+@@ -558,19 +564,14 @@ privapp allowlist 只保留实际需要 allowlist 的 `FORCE_STOP_PACKAGES` 与
+ 
+ ### 5.1 系统预装版本访问门禁
+ 
+-读取配置可以直接进行，任何写配置、force-stop 或 launch 操作必须同时满足：
++读取和写入配置均不要求输入 PIN、指纹或其它设备凭据。写配置、force-stop、launch 和导出操作仍必须同时满足：
+ 
+ 1. 当前 Android user 是 system user；
+-2. 设备已经配置安全锁屏；
+-3. 当前 Activity 处于前台；
+-4. 最近 5 分钟内通过一次 platform `BiometricPrompt`，允许 `BIOMETRIC_STRONG | DEVICE_CREDENTIAL`；
+-5. 本次高风险动作的精确确认已经完成。
+-
+-认证 token 只保存在进程内单调时钟状态，不写 SharedPreferences，不跨 Manager 进程重启。应用进入后台超过 30 秒、
+-切换用户或收到 `ACTION_SCREEN_OFF` 后立即清除认证状态。
++2. 当前 Activity 处于前台；
++3. 设备快照、generation、目标 package/process 和调用者身份校验通过；
++4. 本次操作未与其它 mutation 并发。
+ 
+-force-invoke、ANR protection 和 all-process 每次从 false 切到 true 都需要动作级确认，即使 5 分钟认证仍有效。设备没有
+-安全锁屏时 Manager 保持只读，并引导用户进入系统安全设置，不提供绕过按钮。
++应用不保存或触发设备认证 token；主用户在未设置锁屏凭据的设备上仍可正常使用。
+ 
+ secondary user 和 managed profile 只显示“配置仅可由设备主用户管理”，不读取应用列表，不展示发布按钮。
+ 
+@@ -596,7 +597,7 @@ secondary user 和 managed profile 只显示“配置仅可由设备主用户管
+ 3. 没有接受外部 JSON/property key 的 exported Intent；
+ 4. Manager 只能写 `r0dump_fusion_prop`；
+ 5. 配置值必须先通过 Framework parser；
+-6. force-invoke 和 ANR protection 默认开启，但不得绕过 Manifest/精确 selector 范围、点位依赖、认证或发布校验；
++6. force-invoke 和 ANR protection 默认开启，但不得绕过 Manifest/精确 selector 范围、点位依赖或发布校验；
+ 7. 发布失败后不得把 UI 标记为成功；
+ 8. 奇数 generation 不允许普通发布或启动目标。
+ 9. 非 system user 在 Framework 层也不能激活 capture；
+@@ -729,8 +730,10 @@ Manager 的点位表必须与 `art/runtime/r0dump/r0dump_hook_point.h` 一一对
+ | 39 | `Walk.cookie.dex` | active DEX snapshot |
+ | 40 | `Walk.executable.method` | active method evidence |
+ | 41 | `ForceInvoke.no_execute` | active CodeItem |
++| 42 | `Nterp.method.entry` | direct Nterp method evidence |
+ 
+-mask 序列化固定为 `0x` 加 16 个小写 hex digits。bits 42..63 必须为 0。
++mask 序列化固定为 `0x` 加 16 个小写 hex digits。bits 43..63 必须为 0。bit 42 默认关闭，
++与只覆盖传统 `interpreter::Execute()` 的 bit 23 保持独立。
+ 
+ ### 6.4 字段依赖
+ 
+@@ -851,7 +854,7 @@ Manifest 不设置 `android:enableOnBackInvokedCallback="false"`。Compose 使
+ 4. 存在 dirty 草稿且即将离开 Activity 时，完成手势后显示“保留草稿 / 丢弃并退出 / 取消”。
+ 
+ handler 必须无条件进入 composition，仅通过 `enabled` 切换，避免 callback 顺序随 recomposition 改变。取消手势时恢复
+-原状态，不能误提交、误丢弃草稿或触发认证。
++原状态，不能误提交或误丢弃草稿。
+ 
+ #### 大屏、横屏与自由窗口
+ 
+@@ -870,7 +873,7 @@ compact 时保留当前 tab、scroll position、search query 和草稿，不重
+ 
+ - `WindowInsets.ime` 与 `BringIntoViewRequester` 保证错误输入可见；
+ - Enter 在搜索框执行搜索，在单行数字框移动到下一字段，不直接发布；
+-- Ctrl+Enter 只在通过认证且草稿有效时触发“只发布”；
++- Ctrl+Enter 只在前台且草稿有效时触发“只发布”；
+ - Esc 关闭 search/sheet/dialog；
+ - Tab 顺序遵循视觉顺序；
+ - hover 只增加状态层，不改变布局尺寸；
+@@ -881,7 +884,7 @@ compact 时保留当前 tab、scroll position、search query 和草稿，不重
+ - Manifest 通过 `android:localeConfig="@xml/locales_config"` 声明 `en` 与 `zh-CN`；
+ - 顶栏语言菜单提供“跟随系统 / 简体中文 / English”，使用 Android 16 平台 `LocaleManager.applicationLocales`，
+   不引入 AppCompat 或自建 locale 持久化；
+-- UI、校验提示、认证提示、Snackbar、活动通知和 boot recovery 通知不得硬编码用户文案，英文与简体中文资源键必须完全一致；
++- UI、校验提示、Snackbar、活动通知和 boot recovery 通知不得硬编码用户文案，英文与简体中文资源键必须完全一致；
+ - 包名、property key、run ID、generation、mask、capture point 稳定名称和 JVM descriptor 等技术标识保持原文；
+ - 语言切换允许 Activity 按系统配置变更流程重建，ViewModel 草稿、profile、generation 基线和当前 tab 必须保留；
+ - 设备为简体中文或用户选择简体中文时，应用全部操作文案和通知使用中文。
+@@ -984,7 +987,7 @@ medium 使用 NavigationRail 和单列内容。所有布局中启用/关闭 swit
+ - 点击应用选择器打开 Material 3 SearchBar，全屏 compact 搜索或 expanded anchored 搜索；
+ - process 模式：主进程、所有进程、自定义 `package:suffix`；
+ - profile 选择；
+-- “修复并导出最新产物”区：位于“配置方案”下方；完成认证后请求 helper，进行中禁用其它 mutation，成功后显示 run、修复统计、ZIP 路径和 SHA256；
++- “修复并导出最新产物”区：位于“配置方案”下方；前台点击后请求 helper，进行中禁用其它 mutation，成功后显示 run、修复统计、ZIP 路径和 SHA256；
+ - 导出结果明确说明 ZIP 已包含 base/split APK 与提取的 Manifest，可直接作为 JADX 输入；
+ - TopAppBar 最右侧 switch 是启用/关闭主操作，启用时发布配置并启动目标；
+ - `只发布` 次操作；
+@@ -1055,10 +1058,10 @@ ANR protection 和“所有进程”需要确认 sheet。确认文字必须说
+ 
+ - dirty 状态；
+ - validation error 数量；
+-- 已认证且非中断状态显示 `只发布`。
++- 前台且非中断状态显示 `只发布`。
+ 
+ compact 使用 `HorizontalFloatingToolbar`；medium/expanded 使用底部 docked surface。无修改且校验通过时不显示空操作栏或“草稿有效”。启用、关闭和恢复统一由
+-TopAppBar 最右侧 switch 发起；未认证时点击 switch 打开系统凭据，认证成功后自动继续待执行动作。发布中 switch 位置用
++TopAppBar 最右侧 switch 发起；点击后直接继续待执行动作。发布中 switch 位置用
+ 同尺寸 `LoadingIndicator` 替换。事务期间禁用重复操作，navigation 仍可查看，不能编辑草稿。
+ 
+ 刷新草稿前若存在未发布修改，先显示三项选择：丢弃并刷新、保留草稿、取消。
+@@ -1089,8 +1092,7 @@ TopAppBar 最右侧 switch 发起；未认证时点击 switch 打开系统凭据
+ | system user + stable enabled | 是 | 结束会话 | 修改后发布必须先终止旧进程 |
+ | odd generation | 否 | 恢复为禁用状态 | 恢复后必须从 defaults/profile 重建 |
+ | generation conflict | 否 | 刷新设备状态 | 不自动覆盖并发 writer |
+-| 未配置安全锁屏 | 否 | 无 | 打开系统安全设置 |
+-| 认证缺失或过期 | 是 | 验证后继续 | 不丢失当前草稿 |
++| 未配置安全锁屏 | 是 | 正常操作 | 不要求设置安全锁屏 |
+ | secondary user / managed profile | 否 | 无 | 仅显示 owner-only 说明，不枚举应用 |
+ | 发布中 | 否 | 显示稳定宽度 loading | 允许查看其它目的地，禁止重复 mutation |
+ 
+@@ -1220,7 +1222,7 @@ read back even generation and enabled=0
+ - Manager 草稿先保存在 `SavedStateHandle`，用于旋转、分屏、语言切换和进程重建；
+ - 用户选择“保留草稿”并退出时，同一份完整 JSON、profile 和 generation 基线写入应用私有 `SharedPreferences`；只保留一份
+   当前草稿，不建立 force selector 历史，设备 generation 变化、用户丢弃草稿或 JSON 校验失败时立即清除；
+-- 认证 token 仍只存在进程内，绝不随草稿持久化；
++- 不保存设备认证 token；草稿仍只保存配置内容和 generation/profile 关联；
+ - 不将 property 快照复制到数据库作为第二真相源。
+ 
+ 系统预装版本必须增加活动通知：当 boot 完成或 Manager 发布 enabled 配置时显示目标包、run ID 和“打开 Manager”。
+@@ -1236,7 +1238,7 @@ read back even generation and enabled=0
+ - Manager 35 个字段名与 Framework `FIELDS`；
+ - 默认值；
+ - 18 个绝对上限和字段关系；
+-- 42 个 bit/name；
++- 43 个 bit/name；
+ - force bit 固定为 41；
+ - mask 序列化格式；
+ - Manager production source 不出现任意 property key 输入、adb、su、产物 Broker 或私有存储 reader；
+@@ -1249,79 +1251,6 @@ Framework 校验失败返回稳定字段 code，Manager 将其映射到对应页
+ 
+ ## 12. 测试规格
+ 
+-### 12.0 当前验证基线（2026-09-01）
+-
+-以下结果用于区分“源码已落地”和“真机已验收”，后续改动必须重新执行受影响项：
+-
+-| 验证项 | 当前结果 | 证据/说明 |
+-|---|---|---|
+-| helper 定向构建 | 通过 | `m -j8 r0dump_file_helper r0dump_file_helper_tests` |
+-| helper host native tests | 7/7 通过 | 目录 owner/group/mode、`O_PATH` 交接 FD、重复 process 目录、symlink、非法 run ID、完整修复导出和无有效 run 拒绝 |
+-| ART 文件层定向测试 | 25/25 通过 | `r0dump_FileTest.*`，含 `O_PATH` 同 inode 重开、目录 fsync、GID 继承、固定目录和原子发布 |
+-| ART runtime tests 构建 | 通过 | `m -j8 art_runtime_tests` |
+-| Framework 生产目标 | 通过 | `framework-minus-apex`、`services`、`services.core` 与 API 检查已完成；设备端 `services.jar` 已确认包含导出事务 |
+-| SELinux policy | 通过 | `m -j8 selinux_policy`，含 neverallow、Treble compatibility、freeze/context tests |
+-| Manager instrumentation | 50/50 通过 | response parser、认证/前台/owner gate、ViewModel 导出状态与既有 Manager 回归 |
+-| Framework 测试全集 | 基线阻塞 | 现有 `LockPatternUtils.byteArrayToPattern` / `LockPatternView.Cell.of` 测试签名漂移；本特性测试源未出现编译错误 |
+-| userdebug 真机 M9 | 通过 | OnePlus 9 `f5e3adbc`；成套替换并重启后以酷安完成产物发布和非 root shell 实时读写 |
+-| userdebug 真机 M10 | 通过 | OnePlus 9 `f5e3adbc`；Manager 导出 `com.VCB` 最新 run，SHA256 与 ZIP 完整性通过，APK/Manifest/报告齐全 |
+-
+-Framework 测试全集的基线阻塞不得被写成“本特性测试已通过”；在其修复前，以生产目标编译、helper/ART 定向测试、
+-SELinux 全策略构建和真机 M9 共同形成当前验证链。Framework 测试全集的既有基线阻塞不影响已独立
+-通过的生产目标编译、本特性定向测试、完整 SELinux policy 和真机证据，但不应被误写为“Framework 全集已通过”。
+-
+-#### 12.0.1 M9 真机证据
+-
+-验收设备为 OnePlus 9，serial `f5e3adbc`，构建基线为 `lineage_lemonadep-bp4a-userdebug`。终端解锁后使用同一
+-revision 的 Framework、ART CAPEX、helper/rc 和 SELinux policy，以 `com.coolapk.market` / UID `10198` 执行冷启动。
+-
+-首次完整交接运行 `20260831T035916Z-market-trace` 通过 strace 暴露了一个确定的持久化问题：文件已成功
+-rename，但 `fsync(O_PATH directory fd)` 返回 `EBADF`，从而误报 `run_degraded/write_failed`。修复为在目标进程内重新
+-打开并验证同一 inode 后，最终运行 `20260831T041320Z-market-final` 得到：
+-
+-- run 目录为 `root:ext_data_rw 02770`，`process-4928` 及 `metadata/artifacts/records/methods` 为
+-  `u0_a198:ext_data_rw 02770`；
+-- `session.json`、`metadata/manifest.json`、`methods/methods.jsonl`、50 个 record 与 11 个 artifact 均为
+-  `u0_a198:ext_data_rw 0660`；
+-- 日志包含两次 `event=capture_flushed status=ok site=file.flush`，不包含 `run_degraded`、Binder invalid FD、
+-  system_server/zygote crash 或特性相关 AVC；
+-- `adb unroot` 后确认 shell 为 `uid=2000` 且包含 `ext_data_rw(1078)`，能在目标进程仍运行时直接
+-  stat/read session、manifest、methods、record 和 artifact；
+-- 普通 shell 在 `artifacts` 中成功 create、append、read 和 delete `adb-shell-rw-final.txt`，新文件为
+-  `shell:ext_data_rw 0660`；
+-- 验收结束后恢复 `enabled=0`、`anr_protection_enabled=0`、`generation=318`（稳定偶数），并停止酷安进程。
+-
+-#### 12.0.2 M10 真机证据
+-
+-验收设备仍为 OnePlus 9，serial `f5e3adbc`，构建基线为 `lineage_lemonade-bp4a-userdebug`。Manager 经设备凭据认证后，
+-通过 AMS 的固定事务请求 helper 导出 `com.VCB` 最新有效 run `20260819T023726Z-VCB-custom`：
+-
+-- 最终产物为 `/sdcard/Downloads/r0dump-exports/com.VCB/20260819T023726Z-VCB-custom.zip`，大小
+-  `633962934` bytes；同目录 `.zip.sha256` 验证为 `OK`；
+-- `unzip -t` 对 738 个 ZIP entry 完整检查通过，无压缩数据错误；发布后不存在隐藏 partial staging 目录；
+-- ZIP 包含 `apk/base.apk`、`apk/split-1.apk`、base/split `AndroidManifest.xml`、`jadx-input.json`、
+-  `export-report.json`、7 个进程的原始记录及设备端修复输出/报告；
+-- 汇总为 283 条 record、229 条 repaired、54 条 partial、114 个 usable output；CodeItem 回填流程已执行，
+-  此 run 没有符合保守匹配条件的条目，因此 `codeitems_backfilled=0`；
+-- 导出目录为 `02770`、ZIP 和校验文件为 `0660`；SELinux 保持 Enforcing，导出阶段无 helper AVC、无
+-  system_server/helper crash；Manager 显示同一 run 的修复统计和最终 Downloads 路径。
+-
+-#### 12.0.3 受保护 DEX 的 UI 定向回归
+-
+-在 ART CAPEX 完成 top-byte/tag 地址归一化和分段逻辑 DEX 读取后，使用 Manager 正常认证、发布并启动
+-`com.VCB`，目标前缀为 `com.VCB.ui.`。本次配置只选择 bit 39 `Walk.cookie.dex` 与 bit 40
+-`Walk.executable.method`（mask `0x0000018000000000`），刻意关闭 bit 3/5 的全量建立快照，避免它们先消耗
+-artifact 配额。设备为 OnePlus 9（`f5e3adbc`），实际 run 为 `20260819T022922Z-VCB-custom`；日志证明配置由
+-Manager publish 生效，应用保持存活，并完成 `walk_completed`（514 个类候选、512 个方法候选、512 个
+-CodeItem 捕获）。
+-
+-随后通过普通导出脚本拉取 run 并在主机端修复，结果为 9 个 verified、500 个 repaired、13 个 partial、
+-10 个去重可用 DEX，且完成 500 条 CodeItem 回填。partial 原因明确记录为 12 条 `active_entry_limit` 和
+-1 条 `data_range_out_of_bounds`，没有猜测性重建。生成的 ZIP 包含 `metadata/manifest.json`、原始 artifacts、
+-修复报告和回填结果；`unzip -t` 对 1549 个 entry 通过，`.zip.sha256` 校验为 `OK`。该证据同时确认：
+-受保护 DEX 的逻辑视图与 CodeItem 回填链路已经可用，但 512 条 artifact 上限仍是完整覆盖所有 UI 方法的
+-明确边界，不能将本次 500 条回填误写为“无上限全量导出”。
+-
+ ### T1: Schema 单元测试
+ 
+ - 34 字段完整 JSON round-trip；
+@@ -1336,8 +1265,8 @@ CodeItem 捕获）。
+ 
+ ### T3: Capture point 测试
+ 
+-- 42 个 bit 唯一且连续；
+-- bits 42..63 拒绝；
++- 43 个 bit 唯一且连续；
++- bits 43..63 拒绝；
+ - mask 为固定 16 位 hex；
+ - force 开启时 bit 41 必须存在；
+ - 不存在全选 profile。
+@@ -1366,18 +1295,18 @@ CodeItem 捕获）。
+ - publish 成功按顺序 force-stop/launch；
+ - stop 失败不标记 disabled；
+ - rotation/process recreation 保留草稿。
+-- 未选择包、非 owner、非前台、未认证、并发 mutation 时禁止导出；成功后保存摘要，失败显示稳定且可操作的错误信息。
++- 未选择包、非 owner、非前台或并发 mutation 时禁止导出；成功后保存摘要，失败显示稳定且可操作的错误信息。
+ 
+ ### T7: Compose UI 测试
+ 
+ - 应用搜索；
+-- 42 点位分组与 TalkBack label；
++- 43 点位分组与 TalkBack label；
+ - dependency controls；
+ - 200% 字体无截断；
+ - compact、landscape、840dp 两栏；
+ - odd generation recovery-only UI；
+ - warning confirmation。
+-- “跟随系统 / 简体中文 / English”切换后页面、认证提示和通知使用对应资源，且草稿不丢失；
++- “跟随系统 / 简体中文 / English”切换后页面和通知使用对应资源，且草稿不丢失；
+ - `values` 与 `values-zh-rCN` 的 string key 和格式参数完全一致；
+ 
+ 另加 golden/screenshot 覆盖：
+@@ -1400,7 +1329,7 @@ CodeItem 捕获）。
+ - Manifest、privapp allowlist 和生产源码中不存在旧 `MANAGE_R0DUMP` 合同；
+ - secondary user 启动 Manager 时保持只读；
+ - secondary user 中同名 target package 不激活 Framework capture 或 ANR protection；
+-- 未认证、认证超时和 screen-off 后 mutation 全部拒绝。
++- 未处于前台、非 owner、状态冲突或并发 mutation 时操作拒绝；不以认证状态或 screen-off 作为拒绝条件。
+ - `r0dump_file_helper` 运行于独立 enforcing domain，只有 system_server 可连接其 socket；
+ - helper 可以对固定 r0dump 目录执行最小 mkdir/chown/chmod，但不能访问网络、shell、其它应用目录或任意路径；
+ - 导出时 helper 只能读取请求包的固定 r0dump run、使用 AMS 传入的 APK FD，并只能写固定 Downloads 导出根；
+@@ -1411,241 +1340,26 @@ CodeItem 捕获）。
+ 
+ ### T9: 构建
+ 
+-开发与最终验收固定使用 `userdebug`，只构建本次改动影响的目标，不构建 `systemimage`。源码展开/提取任务使用
+-`-j2`，实际编译使用 `-j8`：
++构建产品、并发参数和目标命令统一遵循
++[`r0dump 开发规范`](../../../docs/r0dump-development-guide.md)，本文件不保存重复构建命令。
+ 
+-```bash
+-source build/envsetup.sh
+-lunch lineage_lemonadep-bp4a-userdebug
+-m R0dumpManager R0dumpManagerTests r0dump_file_helper r0dump_file_helper_tests \
+-  framework-minus-apex art_runtime_tests com.android.art \
+-  plat_sepolicy.cil plat_seapp_contexts plat_property_contexts \
+-  plat_sepolicy_and_mapping.sha256 sepolicy_tests -j8
+-```
+-
+-若本轮仅修改 Manager，构建命令收窄为 `m R0dumpManager -j8`。只有 Framework、ART、helper 或 SELinux 源码实际变化时，
+-才追加对应目标。不得把 `m systemimage`、`m droid` 或全量 `adb sync system` 作为日常部署步骤。
+-
+-最终收口不要求另行构建 `lineage_lemonade-bp4a-user` 或 `system.img`；同一 revision 的 Manager、Framework 与 SELinux
+-定向产物在 `lineage_lemonadep-bp4a-userdebug` 真机上通过事务矩阵即构成最终验收证据。
+-
+-并运行：
+-
+-- Kotlin/Java formatter；
+-- `git diff --check`；
+-- Manager source contract；
+-- `r0dump_FusionConfigTest`；
+-- helper protocol/path/ownership native tests；
+-- helper 修复/CodeItem 回填、Manifest 提取、ZIP 条目和 SHA256 native tests；
+-- `r0dump_FileTest` prepared-FD、GID 继承、atomic rename tests；
+-- `treble_sepolicy_tests`；
+-- APK privapp permission allowlist 检查。
+-- userdebug hidden API/privapp enforcement；
+-- Android 16 lint 与 edge-to-edge/inset screenshot gate。
++Manager 改动仍按影响范围执行 formatter、source contract、配置校验、helper native tests、SELinux policy、
++instrumentation 和 UI 检查；不得用历史构建记录代替当前工作树结果。
+ 
+ ### T10: 真机事务
+ 
+-#### 同包名原位替换旧 Manager
+-
+-应用身份固定为 `com.android.r0dumpmanager`，不得用新包名并行安装第二个 Manager。设备曾安装过同包名的 `/data/app`
+-更新包时，该更新包会覆盖 `/system/priv-app/R0dumpManager`，因此部署必须按以下顺序执行：
+-
+-1. 构建同一源码 revision 的 `R0dumpManager`、Framework、ART、`r0dump_file_helper`、init rc、privapp allowlist 和
+-   SELinux policy；
+-2. `am force-stop com.android.r0dumpmanager` 后执行 `adb uninstall com.android.r0dumpmanager`，清除旧 `/data/app` 更新包及旧数据；
+-3. 将 Framework、ART APEX、helper、init rc、系统 APK、allowlist 和 SELinux policy 成套刷入或同步，禁止只执行
+-   `adb install`；
+-4. 重启设备，使 boot classpath 和 SELinux policy 从同一 revision 加载；
+-5. `pm path com.android.r0dumpmanager` 必须只返回
+-   `/system/priv-app/R0dumpManager/R0dumpManager.apk`；任何 `/data/app` 路径均判定替换失败；
+-6. 进程必须运行于 `u:r:r0dump_manager_app:s0`，且已安装 Manifest 不再声明 `MANAGE_R0DUMP`；
+-7. 执行 `tools/validate_post_flash.sh --require-system-match`，开发期 `userdebug` 设备额外显式传
+-   `--allow-userdebug`；该 userdebug 路径即为最终验收口径，不要求额外 user build。
+-
+-#### userdebug 增量替换（默认开发流程）
++Windows ADB/Fastboot 连接、进程重置、`adb root`、remount 和增量替换统一遵循
++[`r0dump 开发规范`](../../../docs/r0dump-development-guide.md)。
+ 
+-日常真机开发使用物理连接和 Windows 侧 ADB，通过 overlayfs 精确替换，不要求重建或刷写 `systemimage`：
++Manager 部署额外遵守以下事务边界：
+ 
+-```bash
+-export ADB='/mnt/c/Program Files/platformtools/adb.exe'
+-export ADB_SERIAL=f5e3adbc
+-
+-# 仅 Manager 源码或资源变化，脚本默认只替换系统 APK 和 privapp allowlist。
+-packages/apps/R0dumpManager/tools/deploy_userdebug.sh
+-
+-# 同时修改了 Framework manager API。
+-packages/apps/R0dumpManager/tools/deploy_userdebug.sh --with-framework
+-
+-# 同时修改了 SELinux 类型、规则或 contexts。
+-packages/apps/R0dumpManager/tools/deploy_userdebug.sh --with-sepolicy
+-
+-# 实时输出权限链路需要 Framework、ART、helper 与 policy 使用同一 revision。
+-packages/apps/R0dumpManager/tools/deploy_userdebug.sh \
+-  --with-framework --with-art --with-file-helper --with-sepolicy
+-```
+-
+-脚本执行 `adb root`、`adb remount`、逐文件 `adb push`、权限/标签修复、`sync` 和 reboot。ART 使用设备匹配的
+-`com.android.art.capex` 整体替换，禁止直接写只读 `/apex/com.android.art` 挂载点。脚本只允许在
+-`ro.build.type=userdebug|eng` 且 `ro.debuggable=1` 的设备运行，避免把开发替换流程误用于发布设备。
+-
+-#### 构建 release 选择的排障经验
+-
+-本项目同一产品存在多个 `TARGET_RELEASE` 配置。OnePlus 9 当前设备和历史成功构建使用的是：
+-
+-```bash
+-source build/envsetup.sh
+-lunch lineage_lemonade-bp4a-userdebug
+-```
+-
+-这里的 `bp4a` 不是可有可无的标签。误用 `lineage_lemonade-trunk_staging-userdebug`，或在不同产品之间
+-复用同一个 `out/`，会让 Soong 重新解析另一套 vendor/source-root 依赖图，表现为 `libjxl`、protobuf、
+-Oplus Rust 等“缺少变体/重复模块”错误。它们与 r0dump-fusion 的新增代码或依赖无关；历史日志
+-`out/r0dump-fusion-art-rebuild-3.log`、`out/r0dump-fusion-d102-capex-build.log` 已证明 `bp4a` 图可正常完成
+-ART APEX 构建。
+-
+-每次编译前必须检查输出中的 `PLATFORM_VERSION`、`TARGET_PRODUCT`、`TARGET_RELEASE` 和
+-`PRODUCT_SOURCE_ROOT_DIRS`，确认与设备/历史产物一致；切换产品或 release 后不得直接复用旧的 Soong 图。
+-推荐先执行 `m nothing -j2` 展开依赖，再用 `j8` 编译目标。若错误只出现在 bootstrap 的 vendor 变体解析阶段，
+-先回到正确的 `lunch` 组合并检查生成目录，不要为绕过错误给无关库追加 `vendor_available`，也不要把临时
+-构建规避改入功能提交。
+-
+-另一个容易误判的失败发生在 ART 的 LTO 链接阶段：`class_linker.cc` 可能报告
+-`stack frame size ... exceeds limit`。这不是缺少库或新增依赖，而是当前 clang/LTO 对已有大型运行时函数的
+-栈帧诊断变成了 fatal warning；本轮 Fusion 在 `VerifyClass`/`InitializeClass` 增加完成记录后触发了该边界。
+-处理原则是只在对应函数周围使用已有 ART 惯例的 `-Wno-frame-larger-than=` 作用域，并保留全局
+-`ART_FRAME_SIZE_LIMIT`，禁止通过提高全局上限或关闭所有 frame 检查来“修复”。修改后重新执行 `m nothing -j2`
+-确认图稳定，再执行 `m com.android.art -j8`；必须以 `#### build completed successfully` 和新生成的
+-`system/apex/com.android.art.capex` 为成功证据。
+-
+-设备重启后的另一个陷阱是用户可能仍处于 `RUNNING_LOCKED`。此时 PackageManager 会暂时不向 shell
+-解析普通应用的 Activity，`am start`/`monkey` 可能返回 `Activity class ... does not exist`，这不代表 APK
+-或 ART 损坏；先解锁用户（测试机 PIN 为 `2468`），再启动目标应用并检查 `sys.user.0.ce_available`。
+-捕获完成后应关闭 `persist.sys.r0dump.fusion.enabled`，避免下一次实验继续消耗 512 个 artifact 配额。
+-
+-本轮 `com.VCB` 实验还记录了一个必须保留的安全教训：保护器会把 `DexFile::DataSize()` 改成逻辑长度，
+-但该长度未必对应一段连续、可读的虚拟地址。直接按 `DataBegin()+DataSize()` 做 `memcpy` 曾在
+-`r0dump_ObserveDexSource` 触发 SIGSEGV；这不是目标应用崩溃，也不是应当放宽边界检查的理由。Fusion
+-在回退读取前必须重新检查地址溢出、大小上限和 `/proc/self/maps` 的连续 `r--/rw-` 覆盖，无法证明整段
+-可读时只写 `invalid_range` 证据并交由后续逻辑视图/分段恢复处理，禁止猜测性读取。该检查应保持在运行时
+-采集路径中，即使未来增加匿名映射扫描，也必须使用 `process_vm_readv` 的短读失败语义作为第二道 TOCTOU 闸门。
+-
+-#### 一键导出并修复最新产物
+-
+-`tools/export_latest.py` 通过普通 `adb shell` 权限读取指定包的 external-files 目录，从包含至少一个 artifact
+-且存在 `session.json` 的 run 中，按 artifact 最新修改时间选择最新 run，完整拉取后再在主机端处理：
+-
+-```bash
+-python3 packages/apps/R0dumpManager/tools/export_latest.py com.coolapk.market
+-
+-# 多设备时显式指定序列号和输出根目录
+-python3 packages/apps/R0dumpManager/tools/export_latest.py \
+-  -s f5e3adbc \
+-  -o /path/to/exports \
+-  --dexdump out/host/linux-x86/bin/dexdump \
+-  com.coolapk.market
+-```
+-
+-默认展开结果位于 `r0dump-exports/<package>/<run_id>/`。设备端原始 run 和本地 raw artifact 永不修改；脚本按
+-process 调用既有 `art/tools/r0dump/r0dump_host_repair.py`，在 `process-*/host-repair/` 下生成去重的 `blobs/`、
+-保守修复的 `repaired/*.dexfixed.dex`、不能安全修复的 `partial/*.json`、`inputs.json` 和 `report.json`。
+-修复器只在 DEX header、section range 和 map list 完整自洽时重算 SHA-1 signature 与 Adler-32 checksum；即使原始 DEX 因 verify
+-拒绝或 header checksum 不匹配，也会在输出前重新写回 checksum，并在报告中记录修复前后有效性；
+-对 `*.codeitem.raw`，Python 修复器通过已有的 `method_index`、class、method 和 descriptor，在所有完整 DEX
+-中解析 method/class_data 并要求目标唯一；只有原始与捕获 code item 的完整 span 长度相同、偏移和边界均一致且
+-同一方法不存在字节冲突时才原位回填，随后重新计算 signature/checksum，输出 `*.codeitem.dex`。CompactDex、
+-截断 blob、目标缺失/不唯一、长度变化、冲突 code item 或缺少重建输入的 dexdata 明确标记为 partial，不做猜测性重建。
+-
+-#### 旧版完整类恢复方案在 Fusion 中的落地边界
+-
+-旧版 r0dump 能导出 `com.VCB.ui.*`，关键并不是单独增加一个“按类名 dump”的点位，而是保存了
+-ART 仍在内存中的**逻辑 DEX 视图**：`DexFile` 的 identity/location、`data_begin/data_size`、六张 ID
+-表的地址与数量、class-def/class-data 以及每个方法的原始 `code_off`。随后主机端把这些带 provenance 的
+-运行时字节按标准 DEX 035 重新排布，再计算 SHA-1/Adler-32。普通 `DexFile::Begin()/Size()` 快照在
+-verify、重定位或保护器处理后可能已经不是可解析的标准 DEX，因此不能替代逻辑视图。
+-
+-Fusion 采用相同的证据分层，但不恢复旧版的全局 watcher；当前实现由 ART 在 `DexFile` 上提供只读
+-`R0dumpRuntimeView` 快照，直接暴露实际的 `data_begin/data_size`、六张 ID 表指针和可安全读取的
+-header counts，避免依赖保护器私有布局猜测：
+-
+-* `runtime_view` 只描述 ART 实际观察到的地址、长度、section pointer/count、`dex_identity`、location
+-  和每个 region 的来源；地址没有对应 raw span 时，报告必须降级，禁止填零或猜测 vendor 偏移。
+-  Arm64 地址在进入 `/proc/self/maps` 校验前必须去除可能存在的 top-byte/MTE tag，否则同一可读区域
+-  会被误判为不可读，进而丢失 header counts。
+-* `logical-data.raw` 是无 header 的 `DataBegin()/DataSize()` 逻辑镜像。对分裂匿名映射，运行时逐段通过
+-  `/proc/self/maps` + `process_vm_readv` 复制，空洞保留为零并记录 partial 状态；禁止恢复为连续可读前
+-  直接 `memcpy`。与同 run 的
+-  `logical-layout.json`（或 record 中内嵌的 `runtime_view`）配对后，才允许进入重建器。
+-* 只有六张 ID 表、所有可达 class-data、annotation/debug 及 CodeItem 均能在边界内解析，且引用关系
+-  自洽时，输出 `reconstructed_standard_verified/*.dex`；缺少任一表或存在冲突时输出
+-  `logical_layout`/evidence，仍可提供 descriptor catalog，但绝不伪造方法体。
+-* CodeItem 回填必须按 `dex_object_id + method_index + 类名/方法名/描述符` 绑定目标 DEX；仅按方法索引
+-  在多份运行时 DEX 间匹配会产生歧义。即使逻辑 DEX 已成功重建，若 CodeItem 受 artifact 预算丢弃，报告
+-  仍应保留 `artifact_limit`，不能声称完成回填。
+-* 标准 DEX 修复、CodeItem 回填、逻辑视图重建是三个独立阶段。每阶段都保留原始 blob 和 report，重建
+-  后再次校验 map list、header ranges、SHA-1 和 Adler-32；JADX 只消费 verified standard DEX。
+-
+-因此，“有类名、类、CodeItem 就一定能还原 DEX”并不成立：没有运行时 ID 表和 class-data 的 provenance，
+-最多只能生成 descriptor catalog。该降级是设计契约，不是失败隐藏；Manager 只显示可操作的缺失输入，
+-helper/host repair 负责最终判定与 checksum 修复。
+-
+-要在设备 run 中产生 codeitem，至少启用实际会捕获方法体的点位，例如主动 walk 使用 bit 40
+-`Walk.executable.method`；仅启用 bit 39 `Walk.cookie.dex` 只会得到 DEX。bit 41
+-`ForceInvoke.no_execute` 还要求 `force_invoke_enabled=true` 才会产生强制调用 codeitem。
+-
+-run 根目录中的 `export-report.json` 记录设备、包名、远端 run、产物数量及各 process 的 verified/repaired/partial
+-统计和 codeitem 回填数量。最后生成 `r0dump-exports/<package>/<run_id>.zip` 及对应 `.zip.sha256`，ZIP 内
+-固定以 `<package>/<run_id>/` 为根并同时包含原始 run、修复结果和报告。脚本支持 `ADB`、`ADB_SERIAL`
+-环境变量，以及 `--run-id`、`--no-repair`、`--dexdump`、`--jadx` 和 `--verbose` 参数；目标目录或 ZIP
+-已存在时拒绝覆盖，拉取失败时清理 `.partial-*` 临时目录。整个流程不需要 `adb root`。
+-
+-设备实验不能只靠 `setprop` 拼出一组配置：`capture_point_mask` 必须使用 Manager 约定的 16 位十六进制
+-格式，并且必须经 `r0dump_FusionConfig` 的 publish 接口创建 run 与 helper 侧的进程配置；否则 ART 进程
+-即使能看到 property，也不会得到有效的 session/run 目录。针对 UI 的实验应从 Manager 提交配置，避免把
+-“property 已写入”误认为“采集已启用”。
+-
+-SELinux 增量替换是不可拆分事务，必须同时包含：
+-
+-- `/system/etc/selinux/plat_sepolicy_and_mapping.sha256`；
+-- `/system/etc/selinux/plat_sepolicy.cil`；
+-- `/system/etc/selinux/plat_seapp_contexts`；
+-- `/system/etc/selinux/plat_property_contexts`。
+-
+-hash 必须先替换，使 init 放弃 vendor/odm 中与旧平台 policy 匹配的 `precompiled_sepolicy`，转而按当前 split CIL 编译；
+-随后再替换 CIL 和 contexts。禁止只推送 contexts，否则其中的新类型可能不存在于已加载的旧 precompiled policy，导致设备
+-无法进入 Android。部署后统一重启并运行：
+-
+-```bash
+-ADB="$ADB" ADB_SERIAL="$ADB_SERIAL" OUT_DIR=out/target/product/lemonadep \
+-  packages/apps/R0dumpManager/tools/validate_post_flash.sh \
+-  --allow-userdebug --require-system-match
+-```
+-
+-卸载旧更新包会清除旧 Manager 私有数据，这是原位替换的预期行为。fusion 配置位于持久系统属性中，不把旧应用数据迁移为
+-新的授权或配置来源；部署前后都必须检查稳定偶数 generation，并在结束时保证 `enabled=0`。
+-
+-1. 首次启动显示 Unconfigured；
+-2. 发布 disabled defaults；
+-3. 发布 bit 39 profile；
+-4. `getprop` 验证 34 字段和 even generation；
+-5. force-stop/launch 后目标生成新 run；
+-6. Manager 自身退出不影响配置；
+-7. 结束会话后目标退出且 enabled=0；
+-8. 手工制造 odd generation 后 UI 只允许恢复；
+-9. 重启后 disabled/enabled 状态正确恢复；
+-10. logcat 无 property denial、system_server crash、zygote crash 或 Manager ANR。
+-11. 设备凭据认证成功、取消、失败、超时和 screen-off 路径符合门禁；
+-12. predictive back 在 search、sheet、dirty draft 和 Activity exit 中无误提交；
+-13. 三键、手势导航、横屏、分屏和桌面自由窗口无遮挡。
+-14. helper 运行于 root UID 和独立 enforcing domain，socket peer 只有 system_server；
+-15. 新 run 全部目录完整 mode 为 `02770`、group 为 `ext_data_rw`；共享/run 祖先 owner 为 root，process/PID 和固定子目录
+-    owner 为目标 UID；
+-16. `session.json`、manifest、artifact、record、methods 和 summary 文件均为目标 UID、`ext_data_rw`、`0660`；
+-17. `adb unroot` 后普通 `adb shell` 能在 canonical rename 后立即 stat/read/create/delete 测试文件；
+-18. 在 helper ACK 前暂停 native publish，故障注入时不产生应用 GID 或 world-writable fallback；
+-19. stale generation、错误 UID/PID、symlink、伪造 run owner、既有 process/PID、socket timeout、helper crash 和 FD 缺失
+-    均不影响目标正常启动；
+-20. userdebug 真机验收后检查模块和 rc 没有依赖 `ro.debuggable`；user 构建可用性由同源构建规则和 policy 测试覆盖，当前收口
+-    不额外要求完整 user 镜像编译。
++- 同一包名只保留系统预装版本，不能让 `/data/app` 更新包覆盖系统 APK；
++- Manager、Framework、ART、helper 和 SELinux 只替换本次实际修改的部分，但所有选中产物必须来自同一工作树和构建配置；
++- ART 使用完整 `com.android.art.capex`，不直接修改活动 APEX 挂载点；
++- Framework、helper 或 SELinux 发生合同变化时，必须连同其依赖成套替换并重启；
++- 导出继续使用 `tools/export_latest.py`，它通过规范中指定的 Windows ADB 读取应用 external-files 目录，
++  不要求 `adb root`；
++- 部署结束必须确认 Manager 来自 `/system/priv-app/R0dumpManager`，配置 generation 为稳定偶数。
+ 
+ ### T11: 酷安回归
+ 
+@@ -1659,39 +1373,26 @@ ADB="$ADB" ADB_SERIAL="$ADB_SERIAL" OUT_DIR=out/target/product/lemonadep \
+ - 全部新目录保持 `ext_data_rw`/`02770`，全部新文件保持 `ext_data_rw`/`0660`；
+ - 最终状态必须为 enabled=0、ANR protection=0、generation 为偶数。
+ 
+-## 13. 实施阶段
++## 13. 当前状态
+ 
+-| 阶段 | 内容 | 退出条件 |
+-|---|---|---|
+-| M0 | 本文档和 schema source contract | 字段、点位、权限和 UX 评审通过 |
+-| M1 | Framework manager 入口和 generation/recovery 测试 | Core tests 全通过，现有读取语义无回归 |
+-| M2 | property type、专用 app domain、产品打包 | sepolicy tests 通过，Manager 独占写权限 |
+-| M3 | 删除旧 Broker 实现，完成 model/repository/ViewModel | 单元测试和 source contract 通过 |
+-| M4 | Android 16 + Material 3 Expressive 四区 UI | UI 状态、预测返回、insets 和大屏 tests 通过 |
+-| M5 | 系统预装认证、通知与 owner-only gate | 凭据、multi-user 和 active reminder 验证通过 |
+-| M6 | 联合构建、部署和 transaction smoke | APK、Framework、policy 同 revision 生效 |
+-| M7 | CoolApk bit 39、ANR 和性能回归 | T11 完成，最终 disabled |
+-| M8 | root helper、Framework preparation bridge、prepared FD ART 写入 | helper/Framework/ART 单测和 policy 全通过 |
+-| M9 | 实时非 root shell 真机矩阵 | canonical 文件首次可见即读写成功，最终 disabled |
+-| M10 | Manager→AMS→helper 修复导出 | 最新 run 经 CodeItem 回填后在 Downloads 生成含 APK/Manifest/报告的可校验 ZIP |
+-
+-原 Manager 路径依赖顺序为 M1 -> M2 -> M3 -> M4 -> M5 -> M6 -> M7；实时权限扩展在该基线上按 M8 -> M9
+-实施。M8 未完成时不得用 inotify、world-writable mode、目标进程 supplementary group 或忽略 `fchown` 失败临时代替。
+-修复导出按 M10 独立验收，不改变 M8/M9 的实时写入合同。
++Manager 基线已经完成，当前只维护既有配置、会话、目录准备、修复导出和 UI 合同。
++Manager 已暴露默认关闭的 bit 42 `Nterp.method.entry`；helper 在现有 `report.json` 中导出
++`method_execution_paths`。ART 的 standard snapshot、nearby 和 Nterp 实验继续复用现有点位、预算和导出入口，
++不增加 Manager 配置字段、profile、数据库或常驻服务。
+ 
+ ## 14. 验收定义
+ 
+ R0dump Manager 合格必须同时满足：
+ 
+-- 当前 42-bit 和 34-field schema 完整可编辑；
++- 当前 43-bit 和 34-field schema 完整可编辑；
+ - Framework 是最终校验和事务发布权威；
+ - Manager 拥有专用 SELinux domain，其他 platform app 无写权限；
+-- user/userdebug 产品配置默认预装 Manager 与 root helper，且 mutation 受 owner user、设备凭据和前台状态约束；
++- user/userdebug 产品配置默认预装 Manager 与 root helper，且 mutation 受 owner user、前台状态和设备快照约束，不要求设备凭据；
+ - generation 冲突、中断和恢复有明确状态；
+ - 发布成功必须经过 read-back verification；
+ - 新配置只在目标重启后宣称生效；
+ - 结束会话同时终止目标并发布 disabled；
+-- force-invoke 和 ANR protection 默认开启；Manifest/完整精确 selector 范围、bit 41、认证及发布校验仍保持强制，all-process 默认关闭；
++- `Defaults` profile 中 force-invoke 和 ANR protection 开启，`CoolApk cookie walk` profile 中关闭；启用 force 时，Manifest/完整精确 selector 范围、bit 41 和发布校验仍保持强制，all-process 默认关闭；
+ - Android 16 edge-to-edge、predictive back、IME、large screen 和 freeform window 验收通过；
+ - Material 3 Expressive API 集中封装，动态色、深色、高对比度和 reduced motion 完整；
+ - 无常驻 payload Broker、数据库、Manager 私有产物 reader 或任意路径 root 服务；
+@@ -1700,7 +1401,7 @@ R0dump Manager 合格必须同时满足：
+   UID、`ext_data_rw`、`0660`；
+ - canonical 文件首次可见时普通非 root `adb shell` 已可读写；
+ - helper/Framework/ART 任一环节失败都 fail closed，目标应用继续启动且不产生权限降级输出；
+-- 经认证的导出只选择目标包最新有效 run，源数据不原地修改；ZIP 包含修复输出、CodeItem 回填报告、base/split APK、
++- 导出只选择目标包最新有效 run，源数据不原地修改；ZIP 包含修复输出、CodeItem 回填报告、base/split APK、
+   提取的 Manifest、JADX 索引和 SHA256，并发布到 `/sdcard/Downloads/r0dump-exports/<package>/`；
+ - Host、Framework、SELinux、UI 和真机矩阵全部通过；
+ - 最终设备状态为稳定偶数 generation 且 enabled=0。
+@@ -1743,7 +1444,7 @@ Manager 需要 UI metadata，因此无法完全消除字段表副本。source co
+ 
+ 当前源码树的 Material 3 Expressive API 仍带 experimental 标记。所有 opt-in 集中在 theme/components 边界，并为
+ `LoadingIndicator`、expressive shape、motion scheme 和 floating toolbar 保留标准 Material 3 等价实现。平台库升级导致
+-API 删除或行为回归时，只替换封装层，不能阻断配置、认证、发布和结束会话等核心流程，也不能临时引入外部 Maven 依赖。
++API 删除或行为回归时，只替换封装层，不能阻断配置、发布和结束会话等核心流程，也不能临时引入外部 Maven 依赖。
+ 
+ ### 大 DEX 与启动性能
+ 
+diff --git a/PRODUCT.md b/PRODUCT.md
+index a0f3268..997b52f 100644
+--- a/PRODUCT.md
++++ b/PRODUCT.md
+@@ -1,38 +1,41 @@
+-# R0dump Manager Product
++# R0dump Manager 产品说明
+ 
+-## Register
++## 文档类型
+ 
+-product
++产品定义。
+ 
+-## Users
++## 目标用户
+ 
+-ROM developers and trusted device operators configuring r0dump capture sessions on an Android 16 owner-user device. Their recurring workflow is to select a target, choose capture points, validate limits, publish, launch, inspect, and end the session.
++在 Android 16 主用户设备上配置 r0dump 捕获会话的 ROM 开发者和受信任设备操作人员。
++主要流程是选择目标、选择捕获点、校验限制、发布配置、启动目标、检查结果并结束会话。
+ 
+-## Product Purpose
++## 产品目的
+ 
+-Provide a guarded system UI for the allowlisted `persist.sys.r0dump.fusion.*` contract. Success means the device state is always legible, drafts cannot be mistaken for published values, dangerous operations require device authentication, and every mutation is verified by read-back.
++为白名单内的 `persist.sys.r0dump.fusion.*` 合同提供受控系统界面。成功标准是：设备状态始终清晰，
++草稿不会被误认为已发布值，每次修改都经过 read-back 确认；产品不要求输入 PIN 或其它设备凭据。
+ 
+-## Brand Personality
++## 产品气质
+ 
+-Precise, restrained, trustworthy. The interface should feel like an Android system tool, not a debugging demo or a marketing surface.
++准确、克制、可信。界面应当像 Android 系统工具，而不是临时调试页面或营销页面。
+ 
+-## Anti-references
++## 反例
+ 
+-- Arbitrary property editors that expose unrestricted `setprop` access.
+-- Card-heavy dashboards, oversized status heroes, decorative motion, gradients, or glass effects.
+-- Dense engineering consoles that require users to memorize bit numbers, byte limits, or generation rules.
+-- Custom controls that replace familiar Android and Material 3 affordances.
++- 暴露任意 `setprop` 的通用属性编辑器。
++- 大量卡片、超大状态标题、装饰性动效、渐变或玻璃效果。
++- 要求用户记忆 bit 编号、字节上限或 generation 规则的密集工程控制台。
++- 用自定义控件替代熟悉的 Android 与 Material 3 交互。
+ 
+-## Design Principles
++## 设计原则
+ 
+-1. Put authoritative device state before editable content.
+-2. Keep draft state visibly separate from the published snapshot.
+-3. Make the common capture workflow fast and progressively disclose dangerous controls.
+-4. Treat authentication, validation, and read-back as part of every mutation.
+-5. Prefer familiar Android controls and compact, scannable information hierarchy.
++1. 权威设备状态优先于可编辑内容。
++2. 草稿状态与已发布快照必须明确分离。
++3. 常用捕获流程应快速完成，危险能力逐层展示。
++4. 校验和 read-back 是每次修改的一部分；主用户不受设备锁屏凭据限制。
++5. 优先使用熟悉的 Android 控件和紧凑、易扫描的信息层级。
+ 
+-## Accessibility & Inclusion
++## 无障碍与包容性
+ 
+-Meet at least 4.5:1 contrast for body text, preserve 48 dp touch targets, expose meaningful descriptions for icon-only controls, support English and Simplified Chinese without truncation, follow system high-contrast and dark themes, and respect reduced-motion settings.
++正文对比度至少为 4.5:1，触控目标至少为 48 dp，纯图标控件提供有意义的内容描述。
++英文和简体中文均不得截断，并应遵循系统高对比度、深色主题和减少动态效果设置。
+ 
+-The normative product and security contract remains [IMPLEMENTATION.md](IMPLEMENTATION.md).
++产品和安全规范以 [IMPLEMENTATION.md](IMPLEMENTATION.md) 为准。
+diff --git a/STATUS.md b/STATUS.md
+index 3faf00e..410437d 100644
+--- a/STATUS.md
++++ b/STATUS.md
+@@ -1,24 +1,24 @@
+-# R0dump Manager Status
++# R0dump Manager 状态
+ 
+-## Current state
++## 当前状态
+ 
+-**Completed and accepted on 2026-08-30.**
++**Manager 基线已完成，当前不扩展控制面。**
+ 
+-This completion marker covers the Manager application, its narrow Framework publication entry, dedicated SELinux contract, product packaging, and the userdebug deployment and transaction workflow. ART capture quality, unpacking experiments, and later runtime data-plane work remain separate project tracks.
++该完成标记只覆盖 Manager 应用、极窄的 Framework 发布入口、专用 SELinux 合同、产品打包，以及
++userdebug 部署和配置事务流程。ART 捕获质量、脱壳实验和后续 runtime 数据面仍是独立工作线。
+ 
+-## Acceptance evidence
++截至 2026-09-08，当前 ART 工作树包含尚未部署的恢复实验：构造期 Header/RuntimeView provenance、
++early `standard_snapshot`、同步 `nearby_candidate` 和 logical-data table overlay。当前 Manager 基线没有
++对应的独立开关、recovery profile、预算、bundle reader 或 artifact trust-state。安装 Manager APK
++不代表这些 runtime 能力已经完成。
+ 
+-- Target: `lineage_lemonadep-bp4a-userdebug` on Android 16.
+-- Build policy: source expansion with `-j2`; actual compilation with `-j8`.
+-- Targeted Manager, Framework, and SELinux production artifacts built successfully.
+-- Manager instrumentation: **44/44 tests passed** after the final UI, validation, Toast, and managed run-ID changes.
+-- Manager source contracts passed for 34 Framework fields, 42 capture points, direct Framework transactions, product/SELinux packaging, Android 16 lifecycle behavior, and English/Simplified Chinese parity.
+-- Physical-device checks passed for the budget reset icon, removed notification banner, ANR-protection ordering, one-shot draft Toast, actionable validation details, and automatic run-ID handling.
+-- Live publication/recovery transaction matrix passed with read-back verification.
+-- Final device state: generation `262`, enabled `0`, SELinux `Enforcing`, no active target process.
++项目范围已经收敛：只保留 early standard snapshot 和 bit 40 下默认关闭的 nearby 实验；constructor
++Header/RuntimeView、table overlay、runtime bundle 和新的 Manager recovery/trust-state 方案不再保留。
+ 
+-## Completion boundary
++## 完成边界
+ 
+-- No additional `user` build is required for Manager acceptance.
+-- Framework core production code built successfully. The broader `FrameworksCoreTests` target still has unrelated pre-existing lock-screen test compile errors; this is not a Manager acceptance blocker.
+-- Further work should not reopen Manager architecture or UX unless a new regression, requirement, or runtime contract change is identified.
++- 构建、连接和替换统一遵循 [`r0dump 开发规范`](../../../docs/r0dump-development-guide.md)。
++- Manager 基线验收不要求额外构建 `user` 版本或完整系统镜像。
++- 没有新回归、需求或 runtime 合同变化时，不重新设计 Manager 架构或 UI。
++- Manager 不为本轮精简恢复方案增加 profile、配置字段或结果模型；继续使用现有点位、通用预算和导出入口。
++- 当前 OnePlus 9 工作线固定使用 `lineage_lemonade bp4a userdebug`。
+diff --git a/res/values-zh-rCN/strings.xml b/res/values-zh-rCN/strings.xml
+index 1450806..58bbac5 100644
+--- a/res/values-zh-rCN/strings.xml
++++ b/res/values-zh-rCN/strings.xml
+@@ -1,8 +1,6 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+     <string name="app_name">R0dump 管理器</string>
+-    <string name="authentication_title">确认配置更改</string>
+-    <string name="authentication_subtitle">使用屏幕锁验证身份，以管理持久化 r0dump 配置</string>
+ 
+     <string name="change_language">切换语言</string>
+     <string name="language_system">跟随系统</string>
+@@ -41,9 +39,6 @@
+     <string name="session_subtitle">选择主用户中精确的目标进程和配置方案。</string>
+     <string name="owner_user_only">仅限设备主用户</string>
+     <string name="owner_user_only_detail">次要用户和工作资料只能查看，不能修改。</string>
+-    <string name="device_credential_required">需要设备凭据</string>
+-    <string name="device_credential_required_detail">修改全局配置前，请先设置安全锁屏。</string>
+-    <string name="authenticate_to_change">验证身份后更改配置</string>
+     <string name="device_state">设备状态</string>
+     <string name="run_id">运行 ID</string>
+     <string name="select_application">应用选择</string>
+@@ -55,8 +50,9 @@
+     <string name="artifact_export_detail">由 root helper 修复最新捕获记录，并在 /sdcard/Downloads/r0dump-exports 中生成 ZIP 和 SHA-256 校验文件。</string>
+     <string name="artifact_export_action">修复并导出最新产物</string>
+     <string name="artifact_exporting">正在修复并导出…</string>
+-    <string name="artifact_export_summary">%1$d 条已验证，%2$d 条已修复，%3$d 条部分可用，已回填 %4$d 条 CodeItem</string>
+-    <string name="artifact_export_includes">包含 base/split APK 和提取的 AndroidManifest.xml，便于 JADX 分析。</string>
++    <string name="artifact_export_summary">%1$d 条已验证，%2$d 条已修复，%3$d 条部分可用，已回填 %4$d 条 CodeItem，%5$d 个 JADX 可用 DEX</string>
++    <string name="artifact_export_jadx_ready">ZIP 可由 JADX 直接打开，并包含 base/split APK、提取的 Manifest 和修复证据。</string>
++    <string name="artifact_export_jadx_unavailable">未生成经过验证的 DEX；ZIP 只包含诊断证据，不能视为成功的 JADX 导出。</string>
+     <string name="export_select_package">请先选择要导出的应用。</string>
+     <string name="export_completed">导出完成：%1$s</string>
+     <string name="export_failed">导出失败：%1$s</string>
+@@ -80,7 +76,7 @@
+     <string name="user_app">用户</string>
+ 
+     <string name="capture_points">捕获点位</string>
+-    <string name="capture_selected_count">已选择 42 个点位中的 %1$d 个</string>
++    <string name="capture_selected_count">已选择 43 个点位中的 %1$d 个</string>
+     <string name="capture_mask_clip_label">r0dump 捕获掩码</string>
+     <string name="group_dex_establishment">DEX 建立</string>
+     <string name="group_class_linker">ClassLinker</string>
+@@ -191,9 +187,7 @@
+     <string name="validation_issue_format">%1$s：%2$s</string>
+     <string name="validation_more_issues">另有 %1$d 项，请检查页面中标红字段</string>
+     <string name="publish_and_launch">发布并启动</string>
+-    <string name="authenticate">验证身份</string>
+     <string name="end_session">结束会话</string>
+-    <string name="capture_toggle_authenticate">验证身份以更改捕获状态</string>
+     <string name="capture_toggle_enable">启用捕获并启动</string>
+     <string name="capture_toggle_disable">关闭捕获</string>
+     <string name="publish">只发布</string>
+@@ -224,8 +218,6 @@
+     <string name="operation_completed">操作已完成</string>
+     <string name="error_owner_only">只有设备主用户可以更改 r0dump 配置</string>
+     <string name="error_foreground_required">R0dump 管理器必须位于前台</string>
+-    <string name="error_device_credential_required">必须先设置安全锁屏</string>
+-    <string name="error_authentication_required">需要完成设备凭据验证</string>
+     <string name="error_validation">请先修正配置错误再发布</string>
+     <string name="error_stop_target">无法停止目标进程</string>
+     <string name="error_launch_target">配置已发布，但目标应用启动失败</string>
+diff --git a/res/values/strings.xml b/res/values/strings.xml
+index cb8d3c3..f9a0f24 100644
+--- a/res/values/strings.xml
++++ b/res/values/strings.xml
+@@ -1,8 +1,6 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+     <string name="app_name">R0dump Manager</string>
+-    <string name="authentication_title">Confirm configuration change</string>
+-    <string name="authentication_subtitle">Use your screen lock to manage persistent r0dump configuration</string>
+ 
+     <string name="change_language">Change language</string>
+     <string name="language_system">Follow system</string>
+@@ -41,9 +39,6 @@
+     <string name="session_subtitle">Select the exact owner-user target process and profile.</string>
+     <string name="owner_user_only">Owner user only</string>
+     <string name="owner_user_only_detail">Secondary users and managed profiles are read-only.</string>
+-    <string name="device_credential_required">Device credential required</string>
+-    <string name="device_credential_required_detail">Set a lock screen credential before changing global configuration.</string>
+-    <string name="authenticate_to_change">Authenticate to change configuration</string>
+     <string name="device_state">Device state</string>
+     <string name="run_id">Run ID</string>
+     <string name="select_application">Application selection</string>
+@@ -55,8 +50,9 @@
+     <string name="artifact_export_detail">Repair the newest captured run through the root helper, then create a ZIP and SHA-256 file in /sdcard/Downloads/r0dump-exports.</string>
+     <string name="artifact_export_action">Repair and export latest run</string>
+     <string name="artifact_exporting">Repairing and exporting…</string>
+-    <string name="artifact_export_summary">%1$d verified, %2$d repaired, %3$d partial, %4$d CodeItems backfilled</string>
+-    <string name="artifact_export_includes">Includes base/split APKs and extracted AndroidManifest.xml files for JADX.</string>
++    <string name="artifact_export_summary">%1$d verified, %2$d repaired, %3$d partial, %4$d CodeItems backfilled, %5$d JADX-ready DEX files</string>
++    <string name="artifact_export_jadx_ready">The ZIP can be opened directly in JADX and also includes base/split APKs, extracted manifests, and repair evidence.</string>
++    <string name="artifact_export_jadx_unavailable">No validated DEX was produced. The ZIP contains diagnostic evidence but is not a successful JADX export.</string>
+     <string name="export_select_package">Select an application before exporting.</string>
+     <string name="export_completed">Export complete: %1$s</string>
+     <string name="export_failed">Export failed: %1$s</string>
+@@ -80,7 +76,7 @@
+     <string name="user_app">User</string>
+ 
+     <string name="capture_points">Capture points</string>
+-    <string name="capture_selected_count">%1$d of 42 selected</string>
++    <string name="capture_selected_count">%1$d of 43 selected</string>
+     <string name="capture_mask_clip_label">r0dump capture mask</string>
+     <string name="group_dex_establishment">DEX establishment</string>
+     <string name="group_class_linker">ClassLinker</string>
+@@ -191,9 +187,7 @@
+     <string name="validation_issue_format">%1$s: %2$s</string>
+     <string name="validation_more_issues">%1$d more issues are highlighted in their fields</string>
+     <string name="publish_and_launch">Publish and launch</string>
+-    <string name="authenticate">Authenticate</string>
+     <string name="end_session">End session</string>
+-    <string name="capture_toggle_authenticate">Authenticate to change capture state</string>
+     <string name="capture_toggle_enable">Enable capture and launch</string>
+     <string name="capture_toggle_disable">Disable capture</string>
+     <string name="publish">Publish</string>
+@@ -224,8 +218,6 @@
+     <string name="operation_completed">Operation completed</string>
+     <string name="error_owner_only">Only the owner user can change r0dump configuration</string>
+     <string name="error_foreground_required">R0dump Manager must be in the foreground</string>
+-    <string name="error_device_credential_required">A secure lock screen is required</string>
+-    <string name="error_authentication_required">Device credential authentication is required</string>
+     <string name="error_validation">Correct configuration errors before publishing</string>
+     <string name="error_stop_target">Unable to stop target process</string>
+     <string name="error_launch_target">Configuration published, but target launch failed</string>
+-- 
+2.43.0
+

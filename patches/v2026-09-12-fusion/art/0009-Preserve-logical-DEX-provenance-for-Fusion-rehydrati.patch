@@ -1,0 +1,1192 @@
+From 7b45fc6288b34e9c215a0d907cd0ef342e316462 Mon Sep 17 00:00:00 2001
+From: Ivory <contact@ivory.cafe>
+Date: Tue, 1 Sep 2026 22:00:30 +0800
+Subject: [PATCH 09/21] Preserve logical DEX provenance for Fusion rehydration
+
+Capture live DexFile identity and logical data fallback so protected classes can be reconstructed only when complete runtime evidence is available. Reuse the strict host rehydrator and keep checksum-safe partial fallbacks for legacy runs.\n\nConstraint: Manager acceptance does not require a full user image build; host repair must remain conservative on incomplete evidence.\nRejected: Fabricating DEX tables from class names or CodeItems | It cannot produce JADX-safe bytecode or trustworthy references.\nConfidence: high\nScope-risk: moderate\nDirective: Keep runtime_view provenance and reconstructed_standard_verified trust gates intact when extending capture points.\nTested: Python host/rehydrator regression suite 18/18; py_compile; diff --check.\nNot-tested: Android C++ build blocked by unrelated external/libjxl vendor variant errors during Soong bootstrap.
+
+Change-Id: I06bcb5e4e3a3d05b5ebba1d19f43f4883edc0966
+---
+ runtime/r0dump/r0dump_buffer.h            |  10 +
+ runtime/r0dump/r0dump_capture.cc          |  74 ++-
+ runtime/r0dump/r0dump_file.cc             |  12 +-
+ tools/r0dump/r0dump_dex_rehydrate.py      | 771 ++++++++++++++++++++++
+ tools/r0dump/r0dump_host_repair.py        |  83 ++-
+ tools/r0dump/test_r0dump_dex_rehydrate.py | 103 +++
+ 6 files changed, 1046 insertions(+), 7 deletions(-)
+ create mode 100755 tools/r0dump/r0dump_dex_rehydrate.py
+ create mode 100644 tools/r0dump/test_r0dump_dex_rehydrate.py
+
+diff --git a/runtime/r0dump/r0dump_buffer.h b/runtime/r0dump/r0dump_buffer.h
+index 3b1dda5..b433c10 100644
+--- a/runtime/r0dump/r0dump_buffer.h
++++ b/runtime/r0dump/r0dump_buffer.h
+@@ -191,6 +191,16 @@ struct r0dump_RecordMetadata final {
+   std::string materialize_status;
+   std::string dispatch_status;
+   std::string exception_class;
++  // Runtime addresses are provenance only. They let host rehydration relate a
++  // logical-data capture to the live DexFile without treating pointers as DEX
++  // file offsets. They are intentionally optional and never dereferenced by
++  // the writer.
++  std::optional<uint64_t> begin;
++  std::optional<uint64_t> data_begin;
++  // Serialized only when ART can prove all section spans are within the
++  // captured logical image. The host rehydrator treats this as an opaque
++  // provenance object, never as permission to read live addresses.
++  std::string runtime_view_json;
+ };
+ 
+ struct r0dump_PendingRecord final {
+diff --git a/runtime/r0dump/r0dump_capture.cc b/runtime/r0dump/r0dump_capture.cc
+index 28217b8..dfc60fc 100644
+--- a/runtime/r0dump/r0dump_capture.cc
++++ b/runtime/r0dump/r0dump_capture.cc
+@@ -19,6 +19,7 @@
+ #include <array>
+ #include <atomic>
+ #include <cstring>
++#include <cstdio>
+ #include <memory>
+ #include <mutex>
+ #include <optional>
+@@ -369,6 +370,59 @@ r0dump_RecordMetadata r0dump_DexMetadata(const DexFile& dex) {
+                             ? std::optional<uint64_t>()
+                             : std::optional<uint64_t>(container->End() - container->Begin()),
+   };
++  metadata.dex_object_id = r0dump_DexIdentity(dex);
++  if (dex.Begin() != nullptr) {
++    metadata.begin = reinterpret_cast<uintptr_t>(dex.Begin());
++  }
++  if (dex.DataBegin() != nullptr) {
++    metadata.data_begin = reinterpret_cast<uintptr_t>(dex.DataBegin());
++  }
++  // Preserve the old r0dump logical-view contract when the header's ID tables
++  // are all addressable from DataBegin. This is deliberately metadata-only;
++  // the bytes are captured through kDexData and validated by the host.
++  const DexFile::Header& header = dex.GetHeader();
++  const uint8_t* data_begin = dex.DataBegin();
++  const uint8_t* dex_begin = dex.Begin();
++  const size_t data_size = dex.DataSize();
++  const bool has_logical_base = data_begin != nullptr && data_size != 0u;
++  const auto in_logical_image = [&](uint32_t offset, uint32_t count, size_t item_size) {
++    if (!has_logical_base || dex_begin == nullptr || offset < header.data_off_) {
++      return false;
++    }
++    const uint64_t relative = static_cast<uint64_t>(offset) - header.data_off_;
++    return relative <= data_size &&
++           static_cast<uint64_t>(count) * item_size <= data_size - relative;
++  };
++  if (in_logical_image(header.string_ids_off_, header.string_ids_size_, 4u) &&
++      in_logical_image(header.type_ids_off_, header.type_ids_size_, 4u) &&
++      in_logical_image(header.proto_ids_off_, header.proto_ids_size_, 12u) &&
++      in_logical_image(header.field_ids_off_, header.field_ids_size_, 8u) &&
++      in_logical_image(header.method_ids_off_, header.method_ids_size_, 8u) &&
++      in_logical_image(header.class_defs_off_, header.class_defs_size_, 32u)) {
++    char base[32];
++    std::snprintf(base, sizeof(base), "0x%llx",
++                  static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(data_begin)));
++    const auto pointer = [&](uint32_t offset) {
++      char value[32];
++      std::snprintf(value, sizeof(value), "0x%llx",
++                    static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(dex_begin) + offset));
++      return std::string(value);
++    };
++    metadata.runtime_view_json = "{\"data_begin\":\"" + std::string(base) +
++        "\",\"string_ids\":\"" + pointer(header.string_ids_off_) +
++        "\",\"type_ids\":\"" + pointer(header.type_ids_off_) +
++        "\",\"proto_ids\":\"" + pointer(header.proto_ids_off_) +
++        "\",\"field_ids\":\"" + pointer(header.field_ids_off_) +
++        "\",\"method_ids\":\"" + pointer(header.method_ids_off_) +
++        "\",\"class_defs\":\"" + pointer(header.class_defs_off_) +
++        "\",\"section_counts_current\":{\"string_ids\":" +
++        std::to_string(header.string_ids_size_) + ",\"type_ids\":" +
++        std::to_string(header.type_ids_size_) + ",\"proto_ids\":" +
++        std::to_string(header.proto_ids_size_) + ",\"field_ids\":" +
++        std::to_string(header.field_ids_size_) + ",\"method_ids\":" +
++        std::to_string(header.method_ids_size_) + ",\"class_defs\":" +
++        std::to_string(header.class_defs_size_) + "}}";
++  }
+   r0dump_SetLocationMetadata(dex.GetLocation(), &metadata);
+   return metadata;
+ }
+@@ -617,20 +671,29 @@ r0dump_CaptureResult r0dump_ObserveDex(r0dump_Point point,
+       g_r0dump_capture_process_state.load(std::memory_order_acquire);
+   DCHECK(state != nullptr);
+   r0dump_CountPointObservation(state, point);
+-  const size_t size = kind == r0dump_CaptureKind::kDexData ? dex.DataSize() : dex.Size();
++  // A protected or relocated DexFile may no longer expose a valid standard
++  // header, while its logical DataBegin/DataSize range is still live. Capture
++  // that range as dexdata so host rehydration can use a runtime view later.
++  r0dump_CaptureKind capture_kind = kind;
++  if (kind == r0dump_CaptureKind::kDexView &&
++      !r0dump_ValidateDexImage(dex.Begin(), dex.Size()).has_value() &&
++      dex.DataBegin() != nullptr && dex.DataSize() != 0u) {
++    capture_kind = r0dump_CaptureKind::kDexData;
++  }
++  const size_t size = capture_kind == r0dump_CaptureKind::kDexData ? dex.DataSize() : dex.Size();
+   const r0dump_HookContext context = r0dump_MakeHookContext(point, site);
+   if (size > state->max_dex_bytes) {
+     return {
+         .status = r0dump_CaptureStatus::kInvalidRange,
+         .submit = state->staging->r0dump_RecordDrop(context,
+-                                                    kind,
++                                                    capture_kind,
+                                                     r0dump_DexFormat::kNotApplicable,
+                                                     "dex_bytes_limit",
+                                                     r0dump_DexMetadata(dex)),
+     };
+   }
+   return r0dump_CaptureDex(
+-      *state->pool, *state->staging, {dex, method, class_def_index}, kind, context);
++      *state->pool, *state->staging, {dex, method, class_def_index}, capture_kind, context);
+ }
+ 
+ r0dump_CaptureResult r0dump_ObserveDexSource(r0dump_Point point,
+@@ -1277,6 +1340,11 @@ r0dump_CaptureResult r0dump_SubmitPreparedCodeItem(r0dump_Staging& staging,
+       .source_kind = std::move(prepared.source_kind),
+       .class_def_index = prepared.class_def_index,
+   };
++  record_metadata.dex_object_id = prepared.dex_identity;
++  record_metadata.declared_size = prepared.dex_size;
++  record_metadata.method_index = prepared.method_index;
++  record_metadata.code_item_offset = prepared.code_offset;
++  record_metadata.code_item_size = capture->r0dump_Size();
+   return {
+       .status = r0dump_CaptureStatus::kSubmitted,
+       .submit = staging.r0dump_SubmitCodeItem(std::move(key),
+diff --git a/runtime/r0dump/r0dump_file.cc b/runtime/r0dump/r0dump_file.cc
+index 1c90e90..5de0f7b 100644
+--- a/runtime/r0dump/r0dump_file.cc
++++ b/runtime/r0dump/r0dump_file.cc
+@@ -589,9 +589,17 @@ std::string r0dump_SerializeRecord(const r0dump_PendingRecord& record,
+                              : std::string(),
+                          &first);
+   r0dump_AppendJsonNumber(&json, "checksum", record.metadata.checksum, &first);
+-  r0dump_AppendJsonNumber<uint64_t>(&json, "begin", std::nullopt, &first);
++  r0dump_AppendJsonNumber(&json, "begin", record.metadata.begin, &first);
+   r0dump_AppendJsonNumber(&json, "declared_size", record.metadata.declared_size, &first);
+-  r0dump_AppendJsonNumber<uint64_t>(&json, "data_begin", std::nullopt, &first);
++  r0dump_AppendJsonNumber(&json, "data_begin", record.metadata.data_begin, &first);
++  if (!record.metadata.runtime_view_json.empty()) {
++    if (!first) {
++      json.push_back(',');
++    }
++    first = false;
++    json += "\"runtime_view\":";
++    json += record.metadata.runtime_view_json;
++  }
+   r0dump_AppendJsonNumber(&json, "data_size", record.metadata.data_size, &first);
+   r0dump_AppendJsonNumber(&json, "container_size", record.metadata.container_size, &first);
+   r0dump_AppendJsonField(&json, "source_kind", record.metadata.source_kind, &first);
+diff --git a/tools/r0dump/r0dump_dex_rehydrate.py b/tools/r0dump/r0dump_dex_rehydrate.py
+new file mode 100755
+index 0000000..2be79d0
+--- /dev/null
++++ b/tools/r0dump/r0dump_dex_rehydrate.py
+@@ -0,0 +1,771 @@
++#!/usr/bin/env python3
++"""Validate a repaired r0dump epoch and rebuild its complete logical DEX image.
++
++Unlike r0dump_dex_repair.py's descriptor catalog fallback, this tool only writes
++an output when every ID table and every reachable class_data/code_item is present.
++It accepts r0dump's headerless ``logical-data.raw`` plus the RuntimeView recorded
++beside it and canonicalises displaced ID tables into a normal DEX 035 layout.
++"""
++
++from __future__ import annotations
++
++import argparse
++import dataclasses
++import hashlib
++import json
++import struct
++import sys
++import zlib
++from pathlib import Path
++
++
++HEADER_SIZE = 0x70
++ENDIAN_CONSTANT = 0x12345678
++NO_INDEX = 0xFFFFFFFF
++ITEM_SIZES = {
++    "string_ids": 4,
++    "type_ids": 4,
++    "proto_ids": 12,
++    "field_ids": 8,
++    "method_ids": 8,
++    "class_defs": 32,
++}
++HEADER_POSITIONS = {
++    "string_ids": 56,
++    "type_ids": 64,
++    "proto_ids": 72,
++    "field_ids": 80,
++    "method_ids": 88,
++    "class_defs": 96,
++}
++
++
++class LayoutError(ValueError):
++    pass
++
++
++def align4(value: int) -> int:
++    return (value + 3) & ~3
++
++
++def read_u32(data: bytes | bytearray, offset: int) -> int:
++    if offset < 0 or offset + 4 > len(data):
++        raise LayoutError(f"u32 outside image at 0x{offset:x}")
++    return struct.unpack_from("<I", data, offset)[0]
++
++
++def write_u32(data: bytearray, offset: int, value: int) -> None:
++    if not 0 <= value <= 0xFFFFFFFF:
++        raise LayoutError(f"u32 overflow: {value}")
++    struct.pack_into("<I", data, offset, value)
++
++
++def read_uleb(data: bytes | bytearray, offset: int) -> tuple[int, int]:
++    value = 0
++    shift = 0
++    for _ in range(5):
++        if offset >= len(data):
++            raise LayoutError("truncated uleb128")
++        byte = data[offset]
++        offset += 1
++        value |= (byte & 0x7F) << shift
++        if byte < 0x80:
++            return value, offset
++        shift += 7
++    raise LayoutError("invalid uleb128")
++
++
++def read_sleb(data: bytes | bytearray, offset: int) -> tuple[int, int]:
++    value = 0
++    shift = 0
++    for _ in range(5):
++        if offset >= len(data):
++            raise LayoutError("truncated sleb128")
++        byte = data[offset]
++        offset += 1
++        value |= (byte & 0x7F) << shift
++        shift += 7
++        if byte < 0x80:
++            if byte & 0x40:
++                value -= 1 << shift
++            return value, offset
++    raise LayoutError("invalid sleb128")
++
++
++def write_uleb(value: int) -> bytes:
++    if not 0 <= value <= 0xFFFFFFFF:
++        raise LayoutError(f"uleb overflow: {value}")
++    result = bytearray()
++    while True:
++        byte = value & 0x7F
++        value >>= 7
++        result.append(byte | (0x80 if value else 0))
++        if not value:
++            return bytes(result)
++
++
++@dataclasses.dataclass(frozen=True)
++class RuntimeLayout:
++    raw_size: int
++    offsets: dict[str, int]
++    counts: dict[str, int]
++    count_source: str
++
++
++@dataclasses.dataclass
++class ClassData:
++    static_fields: list[tuple[int, int]]
++    instance_fields: list[tuple[int, int]]
++    direct_methods: list[tuple[int, int, int]]
++    virtual_methods: list[tuple[int, int, int]]
++
++
++def parse_runtime_layout(raw: bytes, metadata: dict[str, object]) -> RuntimeLayout:
++    runtime_view = metadata.get("runtime_view")
++    if not isinstance(runtime_view, dict):
++        raise LayoutError("metadata has no runtime_view")
++    base_value = runtime_view.get("data_begin")
++    if not isinstance(base_value, str):
++        raise LayoutError("runtime_view.data_begin missing")
++    base = int(base_value, 16) & ((1 << 56) - 1)
++    offsets: dict[str, int] = {}
++    for name in ITEM_SIZES:
++        value = runtime_view.get(name)
++        if not isinstance(value, str):
++            raise LayoutError(f"runtime_view.{name} missing")
++        pointer = int(value, 16) & ((1 << 56) - 1)
++        offset = pointer - base
++        if offset < 0 or offset >= len(raw):
++            raise LayoutError(f"{name} pointer outside logical image: 0x{pointer:x}")
++        offsets[name] = offset
++
++    current = metadata.get("section_counts_current")
++    if not isinstance(current, dict):
++        current = runtime_view.get("section_counts_current")
++    if isinstance(current, dict) and all(isinstance(current.get(name), int) for name in ITEM_SIZES):
++        counts = {name: int(current[name]) for name in ITEM_SIZES}
++        return RuntimeLayout(len(raw), offsets, counts, "epoch_current")
++
++    # Compatibility with older snapshots: infer a table's first sustained all-zero allocation
++    # tail. The logical image can contain unrelated data after the table allocation, so scanning
++    # backwards from DataSize() is incorrect for a displaced table.
++    counts: dict[str, int] = {}
++    for name, element_size in ITEM_SIZES.items():
++        start = offsets[name]
++        end = min((other for other in offsets.values() if other > start), default=len(raw))
++        maximum = (end - start) // element_size
++        count = maximum
++        zero_run = 0
++        for index in range(maximum):
++            item = raw[start + index * element_size : start + (index + 1) * element_size]
++            if any(item):
++                zero_run = 0
++            else:
++                zero_run += 1
++            if zero_run == 16:
++                count = index + 1 - zero_run
++                break
++        counts[name] = count
++    return RuntimeLayout(len(raw), offsets, counts, "inferred_zero_tail")
++
++
++def table_bytes(raw: bytes, layout: RuntimeLayout, name: str) -> bytes:
++    start = layout.offsets[name]
++    size = layout.counts[name] * ITEM_SIZES[name]
++    if start + size > len(raw):
++        raise LayoutError(f"{name} extends outside logical image")
++    return raw[start : start + size]
++
++
++def parse_class_data(raw: bytes, offset: int) -> tuple[ClassData, int]:
++    if offset <= 0 or offset >= len(raw):
++        raise LayoutError(f"class_data offset invalid: 0x{offset:x}")
++    cursor = offset
++    static_count, cursor = read_uleb(raw, cursor)
++    instance_count, cursor = read_uleb(raw, cursor)
++    direct_count, cursor = read_uleb(raw, cursor)
++    virtual_count, cursor = read_uleb(raw, cursor)
++
++    def fields(count: int) -> list[tuple[int, int]]:
++        nonlocal cursor
++        result = []
++        index = 0
++        for _ in range(count):
++            delta, cursor = read_uleb(raw, cursor)
++            access, cursor = read_uleb(raw, cursor)
++            index += delta
++            result.append((index, access))
++        return result
++
++    def methods(count: int) -> list[tuple[int, int, int]]:
++        nonlocal cursor
++        result = []
++        index = 0
++        for _ in range(count):
++            delta, cursor = read_uleb(raw, cursor)
++            access, cursor = read_uleb(raw, cursor)
++            code_off, cursor = read_uleb(raw, cursor)
++            index += delta
++            result.append((index, access, code_off))
++        return result
++
++    parsed = ClassData(fields(static_count), fields(instance_count), methods(direct_count), methods(virtual_count))
++    return parsed, cursor
++
++
++def encode_class_data(parsed: ClassData, code_offset) -> bytes:
++    output = bytearray()
++    output.extend(write_uleb(len(parsed.static_fields)))
++    output.extend(write_uleb(len(parsed.instance_fields)))
++    output.extend(write_uleb(len(parsed.direct_methods)))
++    output.extend(write_uleb(len(parsed.virtual_methods)))
++
++    def fields(values: list[tuple[int, int]]) -> None:
++        previous = 0
++        for index, access in values:
++            output.extend(write_uleb(index - previous))
++            output.extend(write_uleb(access))
++            previous = index
++
++    def methods(values: list[tuple[int, int, int]]) -> None:
++        previous = 0
++        for index, access, old_code_off in values:
++            output.extend(write_uleb(index - previous))
++            output.extend(write_uleb(access))
++            output.extend(write_uleb(code_offset(old_code_off) if old_code_off else 0))
++            previous = index
++
++    fields(parsed.static_fields)
++    fields(parsed.instance_fields)
++    methods(parsed.direct_methods)
++    methods(parsed.virtual_methods)
++    return bytes(output)
++
++
++def validate_layout(raw: bytes, layout: RuntimeLayout) -> dict[str, object]:
++    for name in ITEM_SIZES:
++        table_bytes(raw, layout, name)
++    counts = layout.counts
++    string_offsets = [read_u32(raw, layout.offsets["string_ids"] + index * 4) for index in range(counts["string_ids"])]
++    if any(offset >= len(raw) for offset in string_offsets):
++        raise LayoutError("string_id points outside logical image")
++    for index in range(counts["type_ids"]):
++        if read_u32(raw, layout.offsets["type_ids"] + index * 4) >= counts["string_ids"]:
++            raise LayoutError(f"type_id {index} has invalid descriptor index")
++    for index in range(counts["proto_ids"]):
++        offset = layout.offsets["proto_ids"] + index * 12
++        shorty, result, parameters = struct.unpack_from("<III", raw, offset)
++        if shorty >= counts["string_ids"] or result >= counts["type_ids"] or parameters >= len(raw):
++            raise LayoutError(f"proto_id {index} is invalid")
++    for name in ("field_ids", "method_ids"):
++        limit = counts[name]
++        for index in range(limit):
++            offset = layout.offsets[name] + index * 8
++            first, second, third = struct.unpack_from("<HHI", raw, offset)
++            if first >= counts["type_ids"] or third >= counts["string_ids"]:
++                raise LayoutError(f"{name} {index} is invalid")
++            if name == "field_ids" and second >= counts["type_ids"]:
++                raise LayoutError(f"field_id {index} has invalid type")
++            if name == "method_ids" and second >= counts["proto_ids"]:
++                raise LayoutError(f"method_id {index} has invalid proto")
++
++    code_offsets: set[int] = set()
++    class_data_offsets: set[int] = set()
++    declared_methods = 0
++    methods_with_code = 0
++    class_defs_without_class_data = 0
++    for index in range(counts["class_defs"]):
++        offset = layout.offsets["class_defs"] + index * 32
++        class_idx, _, super_idx, interfaces, source, annotations, class_data, static_values = struct.unpack_from("<8I", raw, offset)
++        if class_idx >= counts["type_ids"] or (super_idx != NO_INDEX and super_idx >= counts["type_ids"]):
++            raise LayoutError(f"class_def {index} has invalid type index")
++        for pointed in (interfaces, annotations, class_data, static_values):
++            if pointed and pointed >= len(raw):
++                raise LayoutError(f"class_def {index} points outside logical image")
++        if source != NO_INDEX and source >= counts["string_ids"]:
++            raise LayoutError(f"class_def {index} has invalid source string")
++        if class_data:
++            parsed, _ = parse_class_data(raw, class_data)
++            class_data_offsets.add(class_data)
++            for method, _, code_off in parsed.direct_methods + parsed.virtual_methods:
++                declared_methods += 1
++                if method >= counts["method_ids"] or (code_off and code_off >= len(raw)):
++                    raise LayoutError(f"class_def {index} has invalid method/code offset")
++                if code_off:
++                    if code_off + 16 > len(raw):
++                        raise LayoutError(f"code_item at 0x{code_off:x} truncated")
++                    code_offsets.add(code_off)
++                    methods_with_code += 1
++        else:
++            class_defs_without_class_data += 1
++    return {
++        "counts": counts,
++        "class_data_items": len(class_data_offsets),
++        "code_items": len(code_offsets),
++        "declared_methods": declared_methods,
++        "methods_with_code": methods_with_code,
++        "class_defs_without_class_data": class_defs_without_class_data,
++        "readiness": {
++            "id_tables": "all_references_valid",
++            "class_data": "all_reachable_items_parse",
++            "code_items": "all_reachable_items_parse",
++            "eligible_for_complete_reconstruction": True,
++        },
++        "dump_ready": True,
++    }
++
++
++def patch_annotation_tree(output: bytearray, at: int, raw_base: int, seen: set[tuple[str, int]]) -> None:
++    """Rebase the offset-bearing annotation items reachable from a class definition."""
++    def shifted(old: int) -> int:
++        if old >= len(output) - raw_base:
++            raise LayoutError(f"annotation offset outside logical image: 0x{old:x}")
++        return raw_base + old if old else 0
++
++    def annotation_set(offset: int) -> None:
++        if not offset or ("set", offset) in seen:
++            return
++        seen.add(("set", offset))
++        physical = raw_base + offset
++        count = read_u32(output, physical)
++        for index in range(count):
++            position = physical + 4 + index * 4
++            write_u32(output, position, shifted(read_u32(output, position)))
++
++    def annotation_set_ref_list(offset: int) -> None:
++        if not offset or ("ref", offset) in seen:
++            return
++        seen.add(("ref", offset))
++        physical = raw_base + offset
++        count = read_u32(output, physical)
++        for index in range(count):
++            position = physical + 4 + index * 4
++            old = read_u32(output, position)
++            annotation_set(old)
++            write_u32(output, position, shifted(old))
++
++    if not at or ("directory", at) in seen:
++        return
++    seen.add(("directory", at))
++    physical = raw_base + at
++    class_annotations, fields_size, methods_size, parameters_size = struct.unpack_from("<4I", output, physical)
++    annotation_set(class_annotations)
++    write_u32(output, physical, shifted(class_annotations))
++    cursor = physical + 16
++    for _ in range(fields_size + methods_size):
++        value_position = cursor + 4
++        old = read_u32(output, value_position)
++        annotation_set(old)
++        write_u32(output, value_position, shifted(old))
++        cursor += 8
++
++
++def encoded_value_end(raw: bytes, offset: int) -> int:
++    """Return the byte after one encoded_value, rejecting malformed recursion."""
++    if offset >= len(raw):
++        raise LayoutError(f"encoded_value outside logical image: 0x{offset:x}")
++    header = raw[offset]
++    value_type = header & 0x1F
++    value_arg = header >> 5
++    cursor = offset + 1
++    scalar_widths = {
++        0x00: 1,  # byte
++        0x02: 2,  # short
++        0x03: 2,  # char
++        0x04: 4,  # int
++        0x06: 8,  # long
++        0x10: 4,  # float
++        0x11: 8,  # double
++        0x15: 4,  # method_type
++        0x16: 4,  # method_handle
++        0x17: 4,  # string
++        0x18: 4,  # type
++        0x19: 4,  # field
++        0x1A: 4,  # method
++        0x1B: 4,  # enum
++    }
++    if value_type == 0x1C:  # VALUE_ARRAY
++        if value_arg:
++            raise LayoutError(f"invalid VALUE_ARRAY argument at 0x{offset:x}")
++        size, cursor = read_uleb(raw, cursor)
++        for _ in range(size):
++            cursor = encoded_value_end(raw, cursor)
++    elif value_type == 0x1D:  # VALUE_ANNOTATION
++        if value_arg:
++            raise LayoutError(f"invalid VALUE_ANNOTATION argument at 0x{offset:x}")
++        _, cursor = read_uleb(raw, cursor)  # type_idx
++        size, cursor = read_uleb(raw, cursor)
++        for _ in range(size):
++            _, cursor = read_uleb(raw, cursor)  # name_idx
++            cursor = encoded_value_end(raw, cursor)
++    elif value_type in scalar_widths:
++        if value_arg >= scalar_widths[value_type]:
++            raise LayoutError(f"encoded_value width overflow at 0x{offset:x}")
++        cursor += value_arg + 1
++    elif value_type == 0x1E:  # VALUE_NULL
++        if value_arg:
++            raise LayoutError(f"invalid VALUE_NULL argument at 0x{offset:x}")
++    elif value_type == 0x1F:  # VALUE_BOOLEAN
++        if value_arg > 1:
++            raise LayoutError(f"invalid VALUE_BOOLEAN argument at 0x{offset:x}")
++    else:
++        raise LayoutError(f"bogus encoded_value value_type {value_type} at 0x{offset:x}")
++    if cursor > len(raw):
++        raise LayoutError(f"encoded_value extends outside logical image at 0x{offset:x}")
++    return cursor
++
++
++def encoded_array_end(raw: bytes, offset: int) -> int:
++    size, cursor = read_uleb(raw, offset)
++    for _ in range(size):
++        cursor = encoded_value_end(raw, cursor)
++    return cursor
++
++
++def encoded_annotation_end(raw: bytes, offset: int) -> int:
++    _, cursor = read_uleb(raw, offset)  # type_idx
++    size, cursor = read_uleb(raw, cursor)
++    for _ in range(size):
++        _, cursor = read_uleb(raw, cursor)  # name_idx
++        cursor = encoded_value_end(raw, cursor)
++    return cursor
++
++
++def annotation_item_end(raw: bytes, offset: int) -> int:
++    if offset >= len(raw):
++        raise LayoutError(f"annotation_item outside logical image: 0x{offset:x}")
++    visibility = raw[offset]
++    if visibility > 2:
++        raise LayoutError(f"invalid annotation visibility at 0x{offset:x}")
++    return encoded_annotation_end(raw, offset + 1)
++
++
++def type_list_end(raw: bytes, offset: int) -> int:
++    size = read_u32(raw, offset)
++    end = offset + 4 + size * 2
++    if end > len(raw):
++        raise LayoutError(f"type_list extends outside logical image at 0x{offset:x}")
++    return end
++
++
++def code_item_end(raw: bytes, offset: int) -> int:
++    if offset + 16 > len(raw):
++        raise LayoutError(f"code_item truncated at 0x{offset:x}")
++    tries_size = struct.unpack_from("<H", raw, offset + 6)[0]
++    insns_size = read_u32(raw, offset + 12)
++    cursor = offset + 16 + insns_size * 2
++    if cursor > len(raw):
++        raise LayoutError(f"code_item instructions extend outside logical image at 0x{offset:x}")
++    if not tries_size:
++        return cursor
++    cursor = align4(cursor) + tries_size * 8
++    handlers_size, cursor = read_uleb(raw, cursor)
++    for _ in range(handlers_size):
++        handler_count, cursor = read_sleb(raw, cursor)
++        for _ in range(abs(handler_count)):
++            _, cursor = read_uleb(raw, cursor)  # type_idx
++            _, cursor = read_uleb(raw, cursor)  # address
++        if handler_count <= 0:
++            _, cursor = read_uleb(raw, cursor)  # catch_all_addr
++    if cursor > len(raw):
++        raise LayoutError(f"code_item handlers extend outside logical image at 0x{offset:x}")
++    return cursor
++
++
++def debug_info_end(raw: bytes, offset: int) -> int:
++    cursor = offset
++    _, cursor = read_uleb(raw, cursor)  # line_start
++    parameters_size, cursor = read_uleb(raw, cursor)
++    for _ in range(parameters_size):
++        _, cursor = read_uleb(raw, cursor)  # uleb128p1 name index
++    while True:
++        if cursor >= len(raw):
++            raise LayoutError(f"debug_info extends outside logical image at 0x{offset:x}")
++        opcode = raw[cursor]
++        cursor += 1
++        if opcode == 0:
++            return cursor
++        if opcode == 1:
++            _, cursor = read_uleb(raw, cursor)
++        elif opcode == 2:
++            _, cursor = read_sleb(raw, cursor)
++        elif opcode == 3:
++            for _ in range(3):
++                _, cursor = read_uleb(raw, cursor)
++        elif opcode == 4:
++            for _ in range(4):
++                _, cursor = read_uleb(raw, cursor)
++        elif opcode in (5, 6):
++            _, cursor = read_uleb(raw, cursor)
++        elif opcode in (7, 8, 9) or opcode >= 10:
++            pass
++        else:
++            raise LayoutError(f"unknown debug opcode {opcode} at 0x{cursor - 1:x}")
++
++
++def string_data_end(raw: bytes, offset: int) -> int:
++    _, cursor = read_uleb(raw, offset)
++    terminator = raw.find(b"\0", cursor)
++    if terminator < 0:
++        raise LayoutError(f"unterminated string_data at 0x{offset:x}")
++    return terminator + 1
++
++
++def collect_reachable_data(raw: bytes, layout: RuntimeLayout) -> dict[int, dict[int, int]]:
++    """Collect every data item reached by the reconstructed ID/class tables.
++
++    The returned mapping is ``map_item type -> {old offset: exclusive end}``.  It
++    deliberately excludes the old class_data pool because it is rewritten below
++    to repair its code_off values.
++    """
++    counts = layout.counts
++    groups: dict[int, dict[int, int]] = {}
++
++    def add(item_type: int, offset: int, end) -> None:
++        if not offset:
++            return
++        if offset >= len(raw):
++            raise LayoutError(f"data item type 0x{item_type:x} outside logical image: 0x{offset:x}")
++        item_end = end(raw, offset)
++        groups.setdefault(item_type, {})[offset] = item_end
++
++    for index in range(counts["string_ids"]):
++        add(0x2002, read_u32(raw, layout.offsets["string_ids"] + index * 4), string_data_end)
++    for index in range(counts["proto_ids"]):
++        add(0x1001, read_u32(raw, layout.offsets["proto_ids"] + index * 12 + 8), type_list_end)
++
++    annotation_sets: set[int] = set()
++    annotation_ref_lists: set[int] = set()
++
++    def add_annotation_set(offset: int) -> None:
++        if not offset or offset in annotation_sets:
++            return
++        if offset + 4 > len(raw):
++            raise LayoutError(f"annotation_set outside logical image: 0x{offset:x}")
++        annotation_sets.add(offset)
++        count = read_u32(raw, offset)
++        end = offset + 4 + count * 4
++        if end > len(raw):
++            raise LayoutError(f"annotation_set extends outside logical image at 0x{offset:x}")
++        groups.setdefault(0x1003, {})[offset] = end
++        for index in range(count):
++            add(0x2004, read_u32(raw, offset + 4 + index * 4), annotation_item_end)
++
++    def add_annotation_ref_list(offset: int) -> None:
++        if not offset or offset in annotation_ref_lists:
++            return
++        if offset + 4 > len(raw):
++            raise LayoutError(f"annotation_set_ref_list outside logical image: 0x{offset:x}")
++        annotation_ref_lists.add(offset)
++        count = read_u32(raw, offset)
++        end = offset + 4 + count * 4
++        if end > len(raw):
++            raise LayoutError(f"annotation_set_ref_list extends outside logical image at 0x{offset:x}")
++        groups.setdefault(0x1002, {})[offset] = end
++        for index in range(count):
++            add_annotation_set(read_u32(raw, offset + 4 + index * 4))
++
++    for index in range(counts["class_defs"]):
++        offset = layout.offsets["class_defs"] + index * 32
++        _, _, _, interfaces, _, annotations, class_data, static_values = struct.unpack_from("<8I", raw, offset)
++        add(0x1001, interfaces, type_list_end)
++        add(0x2005, static_values, encoded_array_end)
++        if annotations:
++            if annotations + 16 > len(raw):
++                raise LayoutError(f"annotations_directory outside logical image: 0x{annotations:x}")
++            fields_size = read_u32(raw, annotations + 4)
++            methods_size = read_u32(raw, annotations + 8)
++            parameters_size = read_u32(raw, annotations + 12)
++            directory_end = annotations + 16 + (fields_size + methods_size + parameters_size) * 8
++            if directory_end > len(raw):
++                raise LayoutError(f"annotations_directory extends outside logical image at 0x{annotations:x}")
++            groups.setdefault(0x2006, {})[annotations] = directory_end
++            add_annotation_set(read_u32(raw, annotations))
++            cursor = annotations + 16
++            for _ in range(fields_size + methods_size):
++                add_annotation_set(read_u32(raw, cursor + 4))
++                cursor += 8
++            for _ in range(parameters_size):
++                add_annotation_ref_list(read_u32(raw, cursor + 4))
++                cursor += 8
++        if class_data:
++            parsed, _ = parse_class_data(raw, class_data)
++            for _, _, code_offset in parsed.direct_methods + parsed.virtual_methods:
++                if code_offset:
++                    add(0x2001, code_offset, code_item_end)
++                    add(0x2003, read_u32(raw, code_offset + 8), debug_info_end)
++    return groups
++    for _ in range(parameters_size):
++        value_position = cursor + 4
++        old = read_u32(output, value_position)
++        annotation_set_ref_list(old)
++        write_u32(output, value_position, shifted(old))
++        cursor += 8
++
++
++def build_rehydrated_dex(
++    raw: bytes, layout: RuntimeLayout, *, preserve_annotations: bool = True
++) -> tuple[bytes, dict[str, object]]:
++    readiness = validate_layout(raw, layout)
++    counts = layout.counts
++    source_groups = collect_reachable_data(raw, layout)
++    table_offsets: dict[str, int] = {}
++    cursor = HEADER_SIZE
++    for name in ITEM_SIZES:
++        cursor = align4(cursor)
++        table_offsets[name] = cursor
++        cursor += counts[name] * ITEM_SIZES[name]
++    raw_base = align4(cursor)
++    # Only copy reachable data items.  The protected logical image also contains
++    # displaced tables, stale allocations, and intentionally poisoned bytes;
++    # leaving those in a normal DEX data section makes strict map verification
++    # correctly reject the result as non-zero padding.
++    output = bytearray(raw_base + len(raw))
++    for items in source_groups.values():
++        for old_offset, old_end in items.items():
++            output[raw_base + old_offset : raw_base + old_end] = raw[old_offset:old_end]
++
++    # Canonical ID tables are contiguous before the data section. Their offset-bearing fields
++    # continue to reference the copied logical raw image at raw_base + old_offset.
++    for name in ITEM_SIZES:
++        output[table_offsets[name] : table_offsets[name] + counts[name] * ITEM_SIZES[name]] = table_bytes(raw, layout, name)
++    for index in range(counts["string_ids"]):
++        position = table_offsets["string_ids"] + index * 4
++        old = read_u32(output, position)
++        write_u32(output, position, raw_base + old)
++    for index in range(counts["proto_ids"]):
++        position = table_offsets["proto_ids"] + index * 12 + 8
++        old = read_u32(output, position)
++        write_u32(output, position, raw_base + old if old else 0)
++
++    class_data_cache: dict[int, int] = {}
++    code_offsets = set(source_groups.get(0x2001, {}))
++    annotations: list[int] = []
++    annotations_stripped = 0
++    for index in range(counts["class_defs"]):
++        source = layout.offsets["class_defs"] + index * 32
++        destination = table_offsets["class_defs"] + index * 32
++        values = list(struct.unpack_from("<8I", raw, source))
++        interfaces, annotation_off, class_data_off, static_values = values[3], values[5], values[6], values[7]
++        values[3] = raw_base + interfaces if interfaces else 0
++        values[5] = raw_base + annotation_off if annotation_off and preserve_annotations else 0
++        values[7] = raw_base + static_values if static_values else 0
++        if annotation_off and preserve_annotations:
++            annotations.append(annotation_off)
++        elif annotation_off:
++            annotations_stripped += 1
++        if class_data_off:
++            parsed, _ = parse_class_data(raw, class_data_off)
++            class_data_cache.setdefault(class_data_off, 0)
++        struct.pack_into("<8I", output, destination, *values)
++
++    # Code items retain their physical bytes in raw, but debug_info_off is a DEX offset.
++    for code_off in code_offsets:
++        debug_position = raw_base + code_off + 8
++        debug_off = read_u32(output, debug_position)
++        write_u32(output, debug_position, raw_base + debug_off if debug_off else 0)
++    annotation_seen: set[tuple[str, int]] = set()
++    for annotation in annotations:
++        patch_annotation_tree(output, annotation, raw_base, annotation_seen)
++
++    class_data_base = align4(len(output))
++    if class_data_base > len(output):
++        output.extend(b"\0" * (class_data_base - len(output)))
++    for old in class_data_cache:
++        class_data_cache[old] = len(output)
++        parsed, _ = parse_class_data(raw, old)
++        output.extend(encode_class_data(parsed, lambda code: raw_base + code))
++
++    for index in range(counts["class_defs"]):
++        source = layout.offsets["class_defs"] + index * 32
++        old_class_data = read_u32(raw, source + 24)
++        if old_class_data:
++            write_u32(output, table_offsets["class_defs"] + index * 32 + 24, class_data_cache[old_class_data])
++
++    map_off = align4(len(output))
++    if map_off > len(output):
++        output.extend(b"\0" * (map_off - len(output)))
++    map_items = [
++        (0x0000, 1, 0),
++        (0x0001, counts["string_ids"], table_offsets["string_ids"]),
++        (0x0002, counts["type_ids"], table_offsets["type_ids"]),
++        (0x0003, counts["proto_ids"], table_offsets["proto_ids"]),
++        (0x0004, counts["field_ids"], table_offsets["field_ids"]),
++        (0x0005, counts["method_ids"], table_offsets["method_ids"]),
++        (0x0006, counts["class_defs"], table_offsets["class_defs"]),
++        *(
++            (item_type, len(items), raw_base + min(items))
++            for item_type, items in source_groups.items()
++            if items
++        ),
++        (0x2000, len(class_data_cache), class_data_base) if class_data_cache else None,
++        (0x1000, 1, map_off),
++    ]
++    map_items = [item for item in map_items if item is not None]
++    map_items.sort(key=lambda item: item[2])
++    output.extend(struct.pack("<I", len(map_items)))
++    for item_type, size, offset in map_items:
++        output.extend(struct.pack("<HHII", item_type, 0, size, offset))
++
++    file_size = len(output)
++    output[0:8] = b"dex\n035\0"
++    struct.pack_into("<III", output, 32, file_size, HEADER_SIZE, ENDIAN_CONSTANT)
++    struct.pack_into("<I", output, 52, map_off)
++    for name, position in HEADER_POSITIONS.items():
++        struct.pack_into("<II", output, position, counts[name], table_offsets[name])
++    first_data_offset = min(min(items) for items in source_groups.values() if items)
++    data_off = raw_base + first_data_offset
++    struct.pack_into("<II", output, 104, file_size - data_off, data_off)
++    output[12:32] = hashlib.sha1(output[32:]).digest()
++    struct.pack_into("<I", output, 8, zlib.adler32(output[12:]) & 0xFFFFFFFF)
++    report = dict(readiness)
++    report.update({
++        "raw_base": raw_base,
++        "file_size": file_size,
++        "class_data_rewritten": len(class_data_cache),
++        "annotations_stripped": annotations_stripped,
++        "source_map_items": {f"0x{item_type:04x}": len(items) for item_type, items in source_groups.items()},
++    })
++    return bytes(output), report
++
++
++def main(argv: list[str] | None = None) -> int:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--raw", type=Path, required=True)
++    parser.add_argument("--metadata", type=Path, required=True)
++    parser.add_argument("--output", type=Path)
++    parser.add_argument("--inspect-only", action="store_true")
++    parser.add_argument("--strip-annotations", action="store_true")
++    args = parser.parse_args(argv)
++    try:
++        raw = args.raw.read_bytes()
++        metadata = json.loads(args.metadata.read_text(encoding="utf-8"))
++        layout = parse_runtime_layout(raw, metadata)
++        if args.inspect_only:
++            print(json.dumps(validate_layout(raw, layout), indent=2, sort_keys=True))
++            return 0
++        if args.output is None:
++            raise LayoutError("--output is required unless --inspect-only is used")
++        dex, report = build_rehydrated_dex(
++            raw, layout, preserve_annotations=not args.strip_annotations
++        )
++        args.output.parent.mkdir(parents=True, exist_ok=True)
++        args.output.write_bytes(dex)
++        report.update({
++            "format": "r0dump-rehydrated-dex-v1",
++            "input_sha256": hashlib.sha256(raw).hexdigest(),
++            "output_sha256": hashlib.sha256(dex).hexdigest(),
++            "count_source": layout.count_source,
++        })
++        args.output.with_suffix(args.output.suffix + ".json").write_text(
++            json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
++        )
++        print(json.dumps(report, sort_keys=True), file=sys.stderr)
++        return 0
++    except (OSError, ValueError, struct.error, json.JSONDecodeError) as error:
++        print(f"r0dump_dex_rehydrate: {error}", file=sys.stderr)
++        return 1
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tools/r0dump/r0dump_host_repair.py b/tools/r0dump/r0dump_host_repair.py
+index 77945cd..da3dd8b 100755
+--- a/tools/r0dump/r0dump_host_repair.py
++++ b/tools/r0dump/r0dump_host_repair.py
+@@ -5,6 +5,7 @@ from __future__ import annotations
+ 
+ import argparse
+ import hashlib
++import importlib.util
+ import json
+ import struct
+ import subprocess
+@@ -15,6 +16,21 @@ from pathlib import Path
+ from typing import Any, Iterable
+ 
+ 
++def _load_rehydrator():
++    """Load the strict logical-view rehydrator without making it a package dependency."""
++    module_path = Path(__file__).with_name("r0dump_dex_rehydrate.py")
++    spec = importlib.util.spec_from_file_location("r0dump_dex_rehydrate", module_path)
++    if spec is None or spec.loader is None:
++        return None
++    module = importlib.util.module_from_spec(spec)
++    sys.modules[spec.name] = module
++    spec.loader.exec_module(module)
++    return module
++
++
++_R0DUMP_REHYDRATOR = _load_rehydrator()
++
++
+ R0DUMP_ALGORITHM_VERSION = "r0dump-host-repair-v2"
+ DEX_HEADER_SIZE = 0x70
+ DEX_MAGIC_PREFIX = b"dex\n"
+@@ -505,6 +521,63 @@ def r0dump_find_artifact(run_dir: Path, record: dict[str, Any]) -> Path | None:
+     return path if path.is_file() else None
+ 
+ 
++def r0dump_find_runtime_metadata(run_dir: Path, artifact: Path,
++                                 record: dict[str, Any]) -> Path | None:
++    """Find the sidecar describing a logical-data capture.
++
++    Runtime metadata may be embedded in the record or emitted next to the raw
++    artifact.  Keeping this lookup permissive lets old runs be inspected while
++    giving new Fusion writers a stable `logical-layout.json` convention.
++    """
++    if isinstance(record.get("runtime_view"), dict):
++        return None
++    candidates = [
++        artifact.with_suffix(artifact.suffix + ".json"),
++        artifact.with_suffix(".json"),
++        artifact.parent / "logical-layout.json",
++        artifact.parent / "runtime-view.json",
++        run_dir / "metadata" / "logical-layout.json",
++        run_dir / "metadata" / "runtime-view.json",
++    ]
++    for candidate in candidates:
++        if candidate.is_file():
++            try:
++                value = r0dump_load_json(candidate)
++            except (OSError, ValueError, json.JSONDecodeError):
++                continue
++            if isinstance(value, dict) and isinstance(value.get("runtime_view"), dict):
++                return candidate
++    return None
++
++
++def r0dump_try_rehydrate_logical(run_dir: Path, record: dict[str, Any], artifact: Path,
++                                 data: bytes) -> tuple[bytes | None, dict[str, Any]]:
++    """Rebuild a standard DEX only when a complete runtime view is available."""
++    if _R0DUMP_REHYDRATOR is None or record.get("capture_kind") != "dexdata":
++        return None, {}
++    metadata: dict[str, Any] | None = None
++    if isinstance(record.get("runtime_view"), dict):
++        metadata = record
++    else:
++        sidecar = r0dump_find_runtime_metadata(run_dir, artifact, record)
++        if sidecar is not None:
++            metadata = r0dump_load_json(sidecar)
++    if metadata is None:
++        # Keep the established dexrecon_missing_runtime_tables report for old
++        # runs; a logical-layout report is emitted only once a view is present.
++        return None, {}
++    try:
++        layout = _R0DUMP_REHYDRATOR.parse_runtime_layout(data, metadata)
++        rebuilt, report = _R0DUMP_REHYDRATOR.build_rehydrated_dex(data, layout)
++    except (OSError, ValueError, struct.error, json.JSONDecodeError) as error:
++        return None, {"trust": "partial", "kind": "dexdata", "output_kind": "logical_layout",
++                      "reason": "dexrecon_layout_invalid", "error": str(error)}
++    report = dict(report)
++    report.update({"trust": "reconstructed_standard_verified", "kind": "dexdata",
++                   "output_kind": "reconstructed_standard"})
++    return rebuilt, report
++
++
+ def r0dump_method_identity(record: dict[str, Any]) -> tuple[Any, ...] | None:
+     if record.get("capture_kind") != "codeitem":
+         return None
+@@ -604,7 +677,12 @@ def r0dump_repair_run(run_dir: Path, output_dir: Path, dexdump: str | None = Non
+                      "artifact": str(artifact.relative_to(run_dir)), "records": []}
+         )
+         input_entry["records"].append(record_path.name)
+-        repaired, details = r0dump_repair_artifact(record, data)
++        repaired = None
++        details: dict[str, Any] = {}
++        if record.get("capture_kind") == "dexdata":
++            repaired, details = r0dump_try_rehydrate_logical(run_dir, record, artifact, data)
++        if not details:
++            repaired, details = r0dump_repair_artifact(record, data)
+         identity = r0dump_method_identity(record)
+         conflicts = []
+         if identity is not None and len(method_hashes[identity]) > 1:
+@@ -629,7 +707,8 @@ def r0dump_repair_run(run_dir: Path, output_dir: Path, dexdump: str | None = Non
+             partial_path.write_text(json.dumps(item, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+             item["output"] = str(partial_path.relative_to(output_dir))
+         else:
+-            fixed_path = repaired_dir / f"{digest}.dexfixed.dex"
++            suffix = ".rehydrated.dex" if details.get("output_kind") == "reconstructed_standard" else ".dexfixed.dex"
++            fixed_path = repaired_dir / f"{digest}{suffix}"
+             fixed_path.write_bytes(repaired)
+             item["output"] = str(fixed_path.relative_to(output_dir))
+             if dexdump:
+diff --git a/tools/r0dump/test_r0dump_dex_rehydrate.py b/tools/r0dump/test_r0dump_dex_rehydrate.py
+new file mode 100644
+index 0000000..87c6a6f
+--- /dev/null
++++ b/tools/r0dump/test_r0dump_dex_rehydrate.py
+@@ -0,0 +1,103 @@
++#!/usr/bin/env python3
++"""Regression tests for r0dump_dex_rehydrate.py."""
++
++import hashlib
++import importlib.util
++import struct
++import sys
++import unittest
++from pathlib import Path
++
++
++MODULE_PATH = Path(__file__).with_name("r0dump_dex_rehydrate.py")
++SPEC = importlib.util.spec_from_file_location("r0dump_dex_rehydrate", MODULE_PATH)
++assert SPEC is not None and SPEC.loader is not None
++rehydrate = importlib.util.module_from_spec(SPEC)
++sys.modules[SPEC.name] = rehydrate
++SPEC.loader.exec_module(rehydrate)
++
++
++class R0dumpDexRehydrateTest(unittest.TestCase):
++    def test_runtime_view_accepts_embedded_section_counts(self) -> None:
++        raw = bytes(0x200)
++        metadata = {
++            "runtime_view": {
++                "data_begin": "0x1000",
++                "string_ids": "0x1000",
++                "type_ids": "0x1004",
++                "proto_ids": "0x1008",
++                "field_ids": "0x1014",
++                "method_ids": "0x101c",
++                "class_defs": "0x1024",
++                "section_counts_current": {
++                    "string_ids": 1, "type_ids": 1, "proto_ids": 1,
++                    "field_ids": 1, "method_ids": 1, "class_defs": 1,
++                },
++            }
++        }
++        layout = rehydrate.parse_runtime_layout(raw, metadata)
++        self.assertEqual(layout.count_source, "epoch_current")
++        self.assertEqual(layout.counts["class_defs"], 1)
++
++    def test_annotation_item_is_not_an_encoded_value(self) -> None:
++        # visibility=BUILD, encoded_annotation(type=1, one name/value pair),
++        # VALUE_BYTE(7).  Treating byte 1 as an encoded_value type is the
++        # regression that used to make otherwise complete snapshots fail.
++        raw = bytes((2, 1, 1, 3, 0, 7))
++        self.assertEqual(rehydrate.annotation_item_end(raw, 0), len(raw))
++        with self.assertRaisesRegex(rehydrate.LayoutError, "bogus encoded_value"):
++            rehydrate.encoded_value_end(bytes((1,)), 0)
++
++    def test_rebuild_rebases_code_and_emits_a_complete_map(self) -> None:
++        raw = bytearray(0x1000)
++        offsets = {
++            "string_ids": 0x100,
++            "type_ids": 0x200,
++            "proto_ids": 0x300,
++            "field_ids": 0x400,
++            "method_ids": 0x500,
++            "class_defs": 0x600,
++        }
++        counts = {
++            "string_ids": 3,
++            "type_ids": 2,
++            "proto_ids": 1,
++            "field_ids": 0,
++            "method_ids": 1,
++            "class_defs": 1,
++        }
++        strings = (0x700, 0x710, 0x720)
++        for index, offset in enumerate(strings):
++            struct.pack_into("<I", raw, offsets["string_ids"] + index * 4, offset)
++        raw[0x700:0x704] = b"\x01V\0\0"
++        raw[0x710:0x714] = b"\x07LV;\0"
++        raw[0x720:0x725] = b"\x01m\0\0\0"
++        struct.pack_into("<II", raw, offsets["type_ids"], 0, 1)
++        struct.pack_into("<III", raw, offsets["proto_ids"], 2, 0, 0)
++        struct.pack_into("<HHI", raw, offsets["method_ids"], 1, 0, 2)
++        struct.pack_into(
++            "<8I", raw, offsets["class_defs"], 1, 1, 0, 0, rehydrate.NO_INDEX, 0, 0x800, 0
++        )
++        # One direct method with code_item at 0x900.  The instruction stream is a NOP.
++        raw[0x800:0x808] = b"\x00\x00\x01\x00\x00\x01\x80\x12"
++        struct.pack_into("<HHHHII", raw, 0x900, 1, 0, 0, 0, 0, 1)
++        struct.pack_into("<H", raw, 0x910, 0)
++        layout = rehydrate.RuntimeLayout(len(raw), offsets, counts, "unit_test")
++
++        dex, report = rehydrate.build_rehydrated_dex(bytes(raw), layout)
++
++        self.assertTrue(report["dump_ready"])
++        self.assertEqual(report["code_items"], 1)
++        self.assertEqual(dex[12:32], hashlib.sha1(dex[32:]).digest())
++        class_defs_off = struct.unpack_from("<I", dex, 100)[0]
++        class_data_off = struct.unpack_from("<I", dex, class_defs_off + 24)[0]
++        parsed, _ = rehydrate.parse_class_data(dex, class_data_off)
++        self.assertEqual(parsed.direct_methods[0][2], report["raw_base"] + 0x900)
++        map_off = struct.unpack_from("<I", dex, 52)[0]
++        map_count = struct.unpack_from("<I", dex, map_off)[0]
++        map_types = {struct.unpack_from("<H", dex, map_off + 4 + index * 12)[0] for index in range(map_count)}
++        self.assertTrue({0x1000, 0x2000, 0x2001, 0x2002}.issubset(map_types))
++
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.43.0
+

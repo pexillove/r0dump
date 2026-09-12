@@ -1,0 +1,4271 @@
+From 6c938358516eddf9fd372c0f403d04ac91ad33fc Mon Sep 17 00:00:00 2001
+From: Ivory <contact@ivory.cafe>
+Date: Mon, 24 Aug 2026 08:01:19 +0800
+Subject: [PATCH 01/32] Preserve the platform manager experiment before
+ simplification
+
+Constraint: The current cross-project state must remain recoverable while development returns to the earlier dex-unpack implementation.
+
+Rejected: Leaving changes only in detached worktrees | switching revisions would obscure or discard the WIP.
+
+Confidence: high
+
+Scope-risk: narrow
+
+Directive: Treat r0dump-too-complex-wip as an archival checkpoint; reassess scope before reusing this platform architecture.
+
+Tested: Manager source tree, test module, and validation tools were staged and inspected.
+
+Not-tested: Complete end-to-end deployment and real-device acceptance of this exact cross-project checkpoint.
+---
+ Android.bp                                    |   64 +
+ AndroidManifest.xml                           |   27 +
+ ...-permissions-com.android.r0dumpmanager.xml |    7 +
+ res/drawable/ic_r0dump_manager.xml            |    9 +
+ res/values/strings.xml                        |    4 +
+ res/values/styles.xml                         |   10 +
+ src/com/android/r0dumpmanager/MainActivity.kt |   55 +
+ .../app/R0dumpManagerViewModel.kt             |  525 ++++++++
+ .../data/control/R0dumpControlRepository.kt   |  136 ++
+ .../data/log/ConfigAuditStore.kt              |  142 +++
+ .../data/logcat/R0dumpLogcatRepository.kt     |   21 +
+ .../data/packageinfo/PackageRepository.kt     |   57 +
+ .../data/reader/PrivateStoreModels.kt         |  138 ++
+ .../reader/R0dumpPrivateStoreRepository.kt    |  513 ++++++++
+ .../domain/config/ConfigModels.kt             |   58 +
+ .../domain/config/DumpPointRegistry.kt        |   56 +
+ .../domain/config/FusionConfig.kt             |   34 +
+ .../domain/config/R0dumpConfigRegistry.kt     |   16 +
+ .../r0dumpmanager/domain/log/ConfigLog.kt     |   20 +
+ .../domain/operation/SystemOperation.kt       |   15 +
+ .../android/r0dumpmanager/ui/MainScreen.kt    | 1123 +++++++++++++++++
+ .../android/r0dumpmanager/ui/theme/Theme.kt   |   71 ++
+ .../r0dumpmanager/ui/welcome/WelcomeScreen.kt |   71 ++
+ tests/AndroidManifest.xml                     |    7 +
+ .../reader/PrivateStoreReaderContractTest.kt  |  381 ++++++
+ tools/final_acceptance.sh                     |  128 ++
+ tools/validate_post_flash.sh                  |  110 ++
+ tools/validate_source_contracts.sh            |  224 ++++
+ 28 files changed, 4022 insertions(+)
+ create mode 100644 Android.bp
+ create mode 100644 AndroidManifest.xml
+ create mode 100644 privapp-permissions-com.android.r0dumpmanager.xml
+ create mode 100644 res/drawable/ic_r0dump_manager.xml
+ create mode 100644 res/values/strings.xml
+ create mode 100644 res/values/styles.xml
+ create mode 100644 src/com/android/r0dumpmanager/MainActivity.kt
+ create mode 100644 src/com/android/r0dumpmanager/app/R0dumpManagerViewModel.kt
+ create mode 100644 src/com/android/r0dumpmanager/data/control/R0dumpControlRepository.kt
+ create mode 100644 src/com/android/r0dumpmanager/data/log/ConfigAuditStore.kt
+ create mode 100644 src/com/android/r0dumpmanager/data/logcat/R0dumpLogcatRepository.kt
+ create mode 100644 src/com/android/r0dumpmanager/data/packageinfo/PackageRepository.kt
+ create mode 100644 src/com/android/r0dumpmanager/data/reader/PrivateStoreModels.kt
+ create mode 100644 src/com/android/r0dumpmanager/data/reader/R0dumpPrivateStoreRepository.kt
+ create mode 100644 src/com/android/r0dumpmanager/domain/config/ConfigModels.kt
+ create mode 100644 src/com/android/r0dumpmanager/domain/config/DumpPointRegistry.kt
+ create mode 100644 src/com/android/r0dumpmanager/domain/config/FusionConfig.kt
+ create mode 100644 src/com/android/r0dumpmanager/domain/config/R0dumpConfigRegistry.kt
+ create mode 100644 src/com/android/r0dumpmanager/domain/log/ConfigLog.kt
+ create mode 100644 src/com/android/r0dumpmanager/domain/operation/SystemOperation.kt
+ create mode 100644 src/com/android/r0dumpmanager/ui/MainScreen.kt
+ create mode 100644 src/com/android/r0dumpmanager/ui/theme/Theme.kt
+ create mode 100644 src/com/android/r0dumpmanager/ui/welcome/WelcomeScreen.kt
+ create mode 100644 tests/AndroidManifest.xml
+ create mode 100644 tests/src/com/android/r0dumpmanager/data/reader/PrivateStoreReaderContractTest.kt
+ create mode 100755 tools/final_acceptance.sh
+ create mode 100755 tools/validate_post_flash.sh
+ create mode 100755 tools/validate_source_contracts.sh
+
+diff --git a/Android.bp b/Android.bp
+new file mode 100644
+index 0000000..3163d6d
+--- /dev/null
++++ b/Android.bp
+@@ -0,0 +1,64 @@
++package {
++    default_applicable_licenses: ["Android-Apache-2.0"],
++}
++
++prebuilt_etc {
++    name: "privapp_permissions_com.android.r0dumpmanager",
++    sub_dir: "permissions",
++    src: "privapp-permissions-com.android.r0dumpmanager.xml",
++    filename_from_src: true,
++}
++
++android_library {
++    name: "R0dumpManagerLib",
++    srcs: ["src/**/*.kt"],
++    resource_dirs: ["res"],
++    platform_apis: true,
++    static_libs: [
++        "androidx.activity_activity-compose",
++        "androidx.compose.animation_animation",
++        "androidx.compose.foundation_foundation",
++        "androidx.compose.material3_material3",
++        "androidx.compose.runtime_runtime",
++        "androidx.compose.ui_ui",
++        "androidx.core_core-ktx",
++        "androidx.lifecycle_lifecycle-runtime-ktx",
++        "androidx.lifecycle_lifecycle-viewmodel-compose",
++        "androidx.navigation_navigation-compose",
++        "kotlin-stdlib",
++        "kotlinx-coroutines-android",
++        "kotlinx-coroutines-core",
++    ],
++    kotlincflags: ["-Xjvm-default=all"],
++}
++
++android_app {
++    name: "R0dumpManager",
++    defaults: ["platform_app_defaults"],
++    certificate: "platform",
++    platform_apis: true,
++    privileged: true,
++    required: ["privapp_permissions_com.android.r0dumpmanager"],
++    static_libs: ["R0dumpManagerLib"],
++    kotlincflags: ["-Xjvm-default=all"],
++    optimize: {
++        proguard_compatibility: false,
++    },
++}
++
++android_test {
++    name: "R0dumpManagerTests",
++    manifest: "tests/AndroidManifest.xml",
++    certificate: "platform",
++    srcs: ["tests/src/**/*.kt"],
++    platform_apis: true,
++    instrumentation_for: "R0dumpManager",
++    static_libs: [
++        "R0dumpManagerLib",
++        "androidx.test.ext.junit",
++        "androidx.test.runner",
++        "junit",
++    ],
++    kotlincflags: ["-Xjvm-default=all"],
++    test_suites: ["device-tests"],
++}
+diff --git a/AndroidManifest.xml b/AndroidManifest.xml
+new file mode 100644
+index 0000000..ccc78af
+--- /dev/null
++++ b/AndroidManifest.xml
+@@ -0,0 +1,27 @@
++<?xml version="1.0" encoding="utf-8"?>
++<manifest xmlns:android="http://schemas.android.com/apk/res/android"
++    package="com.android.r0dumpmanager">
++
++    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
++    <uses-permission android:name="android.permission.FORCE_STOP_PACKAGES" />
++    <uses-permission android:name="android.permission.MANAGE_R0DUMP" />
++
++    <application
++        android:allowBackup="false"
++        android:icon="@drawable/ic_r0dump_manager"
++        android:label="@string/app_name"
++        android:resizeableActivity="true"
++        android:roundIcon="@drawable/ic_r0dump_manager"
++        android:supportsRtl="true"
++        android:theme="@style/Theme.R0dumpManager">
++        <activity
++            android:name=".MainActivity"
++            android:exported="true"
++            android:label="@string/app_name">
++            <intent-filter>
++                <action android:name="android.intent.action.MAIN" />
++                <category android:name="android.intent.category.LAUNCHER" />
++            </intent-filter>
++        </activity>
++    </application>
++</manifest>
+diff --git a/privapp-permissions-com.android.r0dumpmanager.xml b/privapp-permissions-com.android.r0dumpmanager.xml
+new file mode 100644
+index 0000000..60712d9
+--- /dev/null
++++ b/privapp-permissions-com.android.r0dumpmanager.xml
+@@ -0,0 +1,7 @@
++<?xml version="1.0" encoding="utf-8"?>
++<permissions>
++    <privapp-permissions package="com.android.r0dumpmanager">
++        <permission name="android.permission.FORCE_STOP_PACKAGES" />
++        <permission name="android.permission.MANAGE_R0DUMP" />
++    </privapp-permissions>
++</permissions>
+diff --git a/res/drawable/ic_r0dump_manager.xml b/res/drawable/ic_r0dump_manager.xml
+new file mode 100644
+index 0000000..0756a73
+--- /dev/null
++++ b/res/drawable/ic_r0dump_manager.xml
+@@ -0,0 +1,9 @@
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="108dp"
++    android:height="108dp"
++    android:viewportWidth="108"
++    android:viewportHeight="108">
++    <path android:fillColor="#D9E2FF" android:pathData="M22,18h64a12,12 0,0 1,12 12v48a12,12 0,0 1,-12 12H22A12,12 0,0 1,10 78V30A12,12 0,0 1,22 18z" />
++    <path android:fillColor="#465D91" android:pathData="M30,34h48v8H30zM30,50h34v8H30zM30,66h48v8H30z" />
++    <path android:fillColor="#001A41" android:pathData="M74,48a10,10 0,1 0,0.1 0M74,54m-4,0a4,4 0,1 1,8 0a4,4 0,1 1,-8 0" />
++</vector>
+diff --git a/res/values/strings.xml b/res/values/strings.xml
+new file mode 100644
+index 0000000..dfa67c8
+--- /dev/null
++++ b/res/values/strings.xml
+@@ -0,0 +1,4 @@
++<?xml version="1.0" encoding="utf-8"?>
++<resources>
++    <string name="app_name">R0dump Manager</string>
++</resources>
+diff --git a/res/values/styles.xml b/res/values/styles.xml
+new file mode 100644
+index 0000000..ae30440
+--- /dev/null
++++ b/res/values/styles.xml
+@@ -0,0 +1,10 @@
++<?xml version="1.0" encoding="utf-8"?>
++<resources>
++    <style name="Theme.R0dumpManager" parent="android:style/Theme.Material.Light.NoActionBar">
++        <item name="android:windowNoTitle">true</item>
++        <item name="android:windowActionBar">false</item>
++        <item name="android:windowLightStatusBar">true</item>
++        <item name="android:windowLightNavigationBar">true</item>
++        <item name="android:colorAccent">#465D91</item>
++    </style>
++</resources>
+diff --git a/src/com/android/r0dumpmanager/MainActivity.kt b/src/com/android/r0dumpmanager/MainActivity.kt
+new file mode 100644
+index 0000000..c51776c
+--- /dev/null
++++ b/src/com/android/r0dumpmanager/MainActivity.kt
+@@ -0,0 +1,55 @@
++package com.android.r0dumpmanager
++
++import android.os.Bundle
++import androidx.activity.ComponentActivity
++import androidx.activity.compose.setContent
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.saveable.rememberSaveable
++import androidx.compose.runtime.setValue
++import androidx.lifecycle.viewmodel.compose.viewModel
++import com.android.r0dumpmanager.app.R0dumpManagerViewModel
++import com.android.r0dumpmanager.ui.MainScreen
++import com.android.r0dumpmanager.ui.theme.R0dumpManagerTheme
++import com.android.r0dumpmanager.ui.welcome.WelcomeScreen
++
++class MainActivity : ComponentActivity() {
++    override fun onCreate(savedInstanceState: Bundle?) {
++        super.onCreate(savedInstanceState)
++        window.setDecorFitsSystemWindows(false)
++        val preferences = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
++        setContent {
++            R0dumpManagerRoot(
++                initialShowWelcome = !preferences.getBoolean(KEY_WELCOME_DONE, false),
++                onWelcomeEntered = {
++                    preferences.edit().putBoolean(KEY_WELCOME_DONE, true).commit()
++                },
++            )
++        }
++    }
++}
++
++@Composable
++private fun R0dumpManagerRoot(
++    initialShowWelcome: Boolean,
++    onWelcomeEntered: () -> Unit,
++) {
++    R0dumpManagerTheme {
++        val viewModel: R0dumpManagerViewModel = viewModel()
++        var showWelcome by rememberSaveable { mutableStateOf(initialShowWelcome) }
++        if (showWelcome) {
++            WelcomeScreen(
++                onEnter = {
++                    onWelcomeEntered()
++                    showWelcome = false
++                },
++            )
++        } else {
++            MainScreen(viewModel)
++        }
++    }
++}
++
++private const val PREFS_NAME = "r0dump_manager_prefs"
++private const val KEY_WELCOME_DONE = "welcome_done"
+diff --git a/src/com/android/r0dumpmanager/app/R0dumpManagerViewModel.kt b/src/com/android/r0dumpmanager/app/R0dumpManagerViewModel.kt
+new file mode 100644
+index 0000000..fdd8206
+--- /dev/null
++++ b/src/com/android/r0dumpmanager/app/R0dumpManagerViewModel.kt
+@@ -0,0 +1,525 @@
++package com.android.r0dumpmanager.app
++
++import android.app.Application
++import android.content.Context
++import androidx.lifecycle.AndroidViewModel
++import androidx.lifecycle.viewModelScope
++import com.android.r0dumpmanager.data.control.BrokerStatus
++import com.android.r0dumpmanager.data.control.R0dumpControlRepository
++import com.android.r0dumpmanager.data.log.ConfigAuditStore
++import com.android.r0dumpmanager.data.logcat.R0dumpLogcatRepository
++import com.android.r0dumpmanager.data.packageinfo.PackageRepository
++import com.android.r0dumpmanager.data.reader.PrivateReaderGate
++import com.android.r0dumpmanager.data.reader.PrivateReaderUiState
++import com.android.r0dumpmanager.data.reader.PrivateReaderAvailability
++import com.android.r0dumpmanager.data.reader.R0dumpPrivateStoreRepository
++import com.android.r0dumpmanager.domain.config.ConfigApplication
++import com.android.r0dumpmanager.domain.config.ConfigState
++import com.android.r0dumpmanager.domain.config.DumpPointRegistry
++import com.android.r0dumpmanager.domain.config.FusionConfig
++import com.android.r0dumpmanager.domain.config.FusionConfigValidator
++import com.android.r0dumpmanager.domain.config.R0dumpConfigRegistry
++import com.android.r0dumpmanager.domain.log.ConfigLog
++import com.android.r0dumpmanager.domain.log.LogType
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++import kotlinx.coroutines.flow.update
++import kotlinx.coroutines.launch
++import java.util.concurrent.atomic.AtomicBoolean
++import java.util.concurrent.atomic.AtomicLong
++
++private const val STATE_FEEDBACK_MS = 2200L
++private const val PREFS_NAME = "r0dump_manager_prefs"
++private const val KEY_SELECTED_TARGET_PACKAGE = "selected_target_package"
++private const val PRIVATE_READER_PAGE_SIZE = 50
++
++data class R0dumpUiState(
++    val selectedApplication: ConfigApplication? = null,
++    val applications: List<ConfigApplication> = emptyList(),
++    val selectedBits: Set<Int> = emptySet(),
++    val enabled: Boolean = false,
++    val forceStopBeforeLaunch: Boolean = true,
++    val configState: ConfigState = ConfigState.Idle,
++    val actionInFlight: Boolean = false,
++    val brokerStatus: BrokerStatus? = null,
++    val capabilityMask: Long? = null,
++    val privateReader: PrivateReaderUiState = PrivateReaderUiState(),
++    val auditLogs: List<ConfigLog> = emptyList(),
++    val runtimeLogs: List<String> = emptyList(),
++    val message: String? = null,
++    val messageSerial: Long = 0L,
++) {
++    val mask: Int = DumpPointRegistry.maskFor(selectedBits)
++    val maskText: String = "0x" + (mask.toLong() and 0xffffffffL).toString(16).padStart(8, '0')
++    val generation: Long? = brokerStatus?.generation
++    val generationStable: Boolean = generation?.let { (it and 1L) == 0L } ?: true
++    val generationText: String = generation?.toString() ?: "<unset>"
++    val watchPackage: String? = brokerStatus?.packageName
++    // capabilityMask controls optional reader/Evidence features, not passive package+mask control.
++    val canPublish: Boolean = brokerStatus?.ready == true && brokerStatus.publishAllowed
++    val canStop: Boolean = brokerStatus?.ready == true && brokerStatus.active
++    val privateReaderStatus: String = privateReader.message ?: "Verified private store is ready"
++}
++
++private fun R0dumpUiState.withMessage(message: String?): R0dumpUiState =
++    if (message.isNullOrBlank()) {
++        copy(message = null)
++    } else {
++        copy(message = message, messageSerial = messageSerial + 1L)
++    }
++
++class R0dumpManagerViewModel(application: Application) : AndroidViewModel(application) {
++    private val controlRepository = R0dumpControlRepository()
++    private val preferences = application.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
++    private val auditStore = ConfigAuditStore(application)
++    private val logcatRepository = R0dumpLogcatRepository()
++    private val packageRepository = PackageRepository(application)
++    private val privateStoreRepository = R0dumpPrivateStoreRepository()
++    private val operationInFlight = AtomicBoolean(false)
++    private val configOperationInFlight = AtomicBoolean(false)
++    private val actionOperationInFlight = AtomicBoolean(false)
++    private val selectionVersion = AtomicLong(0L)
++
++    private val _uiState = MutableStateFlow(R0dumpUiState())
++    val uiState: StateFlow<R0dumpUiState> = _uiState.asStateFlow()
++
++    init {
++        refreshAll()
++    }
++
++    fun refreshAll() {
++        viewModelScope.launch(Dispatchers.IO) {
++            refreshAllNow()
++        }
++    }
++
++    private suspend fun refreshAllNow(
++        preferredPackageName: String? = null,
++        expectedSelectionVersion: Long? = null,
++    ) {
++        val applications = packageRepository.loadInstalledApplications(R0dumpConfigRegistry.groups, R0dumpConfigRegistry.operations)
++        val brokerStatus = controlRepository.status().getOrNull()
++        val capabilityMask = controlRepository.capabilityMask().getOrNull()
++        if (expectedSelectionVersion != null && selectionVersion.get() != expectedSelectionVersion) return
++        val watchPackage = brokerStatus?.packageName.orEmpty()
++        val persistedPackage = preferences.getString(KEY_SELECTED_TARGET_PACKAGE, "").orEmpty()
++        val selected = preferredPackageName?.let { requested ->
++            applications.firstOrNull { it.packageName == requested }
++        } ?: _uiState.value.selectedApplication?.let { old ->
++            applications.firstOrNull { it.packageName == old.packageName }
++        } ?: applications.firstOrNull { it.packageName == persistedPackage }
++            ?: applications.firstOrNull { it.packageName == watchPackage }
++            ?: applications.firstOrNull()
++        val logs = auditStore.readRecent(packageName = selected?.packageName)
++        val runtimeLogs = logcatRepository.readRecent().getOrElse { listOf("logcat unavailable: ${it.message}", "adb logcat -s r0dump") }
++        val indexGeneration = brokerStatus?.indexGeneration ?: -1L
++        val readerGate = PrivateReaderGate.state(
++            brokerStatus?.recoveryState,
++            capabilityMask,
++            indexGeneration,
++        )
++        val privateReader = if (readerGate.canRead && selected != null) {
++            privateStoreRepository.listRuns(
++                packageName = selected.packageName,
++                expectedIndexGeneration = indexGeneration,
++                cursor = null,
++                pageSize = PRIVATE_READER_PAGE_SIZE,
++            ).fold(
++                onSuccess = { page ->
++                    readerGate.copy(
++                        indexGeneration = page.indexGeneration,
++                        runs = page.items,
++                        nextCursor = page.nextCursor,
++                    )
++                },
++                onFailure = {
++                    PrivateReaderUiState(
++                        availability = PrivateReaderAvailability.UNAVAILABLE,
++                        message = "Verified private store is unavailable",
++                    )
++                },
++            )
++        } else {
++            readerGate
++        }
++        if (expectedSelectionVersion != null && selectionVersion.get() != expectedSelectionVersion) return
++        _uiState.update {
++            it.copy(
++                applications = applications,
++                selectedApplication = selected,
++                enabled = brokerStatus?.active ?: false,
++                brokerStatus = brokerStatus,
++                capabilityMask = capabilityMask,
++                privateReader = privateReader,
++                auditLogs = logs,
++                runtimeLogs = runtimeLogs,
++            )
++        }
++    }
++
++    fun selectApplication(application: ConfigApplication) {
++        if (isOperationBusy()) return
++        val version = selectionVersion.incrementAndGet()
++        preferences.edit().putString(KEY_SELECTED_TARGET_PACKAGE, application.packageName).apply()
++        _uiState.update { it.copy(selectedApplication = application) }
++        viewModelScope.launch(Dispatchers.IO) {
++            refreshAllNow(
++                preferredPackageName = application.packageName,
++                expectedSelectionVersion = version,
++            )
++        }
++    }
++
++    fun toggleDumpPoint(bit: Int) {
++        if (isOperationBusy() || !_uiState.value.canPublish) return
++        _uiState.update { state ->
++            val bits = if (bit in state.selectedBits) state.selectedBits - bit else state.selectedBits + bit
++            state.copy(
++                selectedBits = bits,
++            )
++        }
++    }
++
++    fun applyPreset(name: String) {
++        if (isOperationBusy() || !_uiState.value.canPublish) return
++        val bits = when (name) {
++            "key" -> DumpPointRegistry.points.filter { it.shortName in DumpPointRegistry.keyPoints }.map { it.bit }.toSet()
++            "active" -> setOf(1)
++            "all" -> DumpPointRegistry.points.map { it.bit }.toSet()
++            else -> emptySet()
++        }
++        _uiState.update { state ->
++            state.copy(
++                selectedBits = bits,
++            )
++        }
++    }
++
++    fun setForceStopBeforeLaunch(value: Boolean) {
++        if (isOperationBusy()) return
++        _uiState.update { it.copy(forceStopBeforeLaunch = value) }
++    }
++
++    fun consumeMessage(messageSerial: Long) {
++        _uiState.update { state ->
++            if (state.messageSerial == messageSerial) state.copy(message = null) else state
++        }
++    }
++
++    fun startDump() {
++        if (isOperationBusy()) return showBusyMessage()
++        val state = _uiState.value
++        val app = state.selectedApplication ?: return showMessage("Select a target application first")
++        if (!state.canPublish) return showError("Broker is not ready or does not allow publishing")
++        if (!app.launchable) {
++            return showStartPreflightError(app, "Selected application has no launcher activity")
++        }
++        val config = FusionConfig(
++            watchPackage = app.packageName,
++            dumpPointMask = state.mask,
++        )
++        val validation = FusionConfigValidator.validateForStart(config)
++        if (!validation.ok) return showStartPreflightError(app, validation.message)
++        if (!beginConfigOperation()) return
++        viewModelScope.launch(Dispatchers.IO) {
++            try {
++                _uiState.update { it.copy(configState = ConfigState.Updating, message = null) }
++                val beforeStatus = controlRepository.status().getOrThrow()
++                val result = controlRepository.publish(app.packageName, state.mask, beforeStatus.generation)
++                if (result.isSuccess) {
++                    val verifiedStatus = controlRepository.verifyStatus(result.getOrThrow()).getOrThrow()
++                    var workflowOk = true
++                    val messages = mutableListOf("Dump configuration published through broker")
++                    if (state.forceStopBeforeLaunch) {
++                        val forceStopResult = packageRepository.forceStop(app.packageName)
++                        if (forceStopResult.isFailure) {
++                            workflowOk = false
++                            messages += "force-stop failed: ${forceStopResult.exceptionOrNull()?.message ?: "unknown"}"
++                        }
++                    }
++                    val launchResult = packageRepository.launch(app.packageName)
++                    if (launchResult.isFailure) {
++                        workflowOk = false
++                        messages += "launch failed: ${launchResult.exceptionOrNull()?.message ?: "unknown"}"
++                    }
++                    val message = if (workflowOk) "Dump started" else messages.joinToString("; ")
++                    appendLog(app, if (workflowOk) LogType.OPERATION else LogType.ERROR, "broker.active", beforeStatus.active.toString(), "true", workflowOk, message)
++                    val nextState = if (workflowOk) ConfigState.Success else ConfigState.Error(message)
++                    _uiState.update {
++                        it.copy(
++                            enabled = verifiedStatus.active,
++                            brokerStatus = verifiedStatus,
++                            configState = nextState,
++                        ).withMessage(message)
++                    }
++                    settleConfigState(nextState)
++                } else {
++                    appendLog(app, LogType.ERROR, "broker.active", "false", "true", false, result.exceptionOrNull()?.message)
++                    val errorState = ConfigState.Error(result.exceptionOrNull()?.message ?: "Publish failed")
++                    _uiState.update { it.copy(configState = errorState).withMessage(errorState.message) }
++                    settleConfigState(errorState)
++                }
++                refreshAllNow()
++            } catch (error: Throwable) {
++                val message = error.message ?: "r0dump broker publish failed"
++                appendLog(app, LogType.ERROR, "broker.active", "false", "true", false, message)
++                setFeedbackState(ConfigState.Error(message), message)
++            } finally {
++                finishConfigOperation()
++            }
++        }
++    }
++
++    fun stopDump() {
++        publishDisabledSnapshot(successMessage = "Dump stopped", uiSuccessMessage = "Disabled snapshot published")
++    }
++
++    private fun publishDisabledSnapshot(successMessage: String, uiSuccessMessage: String) {
++        if (isOperationBusy()) return showBusyMessage()
++        val state = _uiState.value
++        val app = state.selectedApplication ?: return showMessage("Select a target application first")
++        if (!state.canStop) return showError("Broker is not ready with an active dump to stop")
++        val shouldForceStopTarget = state.forceStopBeforeLaunch
++        if (!beginConfigOperation()) return
++        viewModelScope.launch(Dispatchers.IO) {
++            try {
++                _uiState.update { it.copy(configState = ConfigState.Updating, message = null) }
++                val beforeStatus = controlRepository.status().getOrThrow()
++                val result = if (beforeStatus.active) {
++                    controlRepository.stop(beforeStatus.runId, beforeStatus.generation)
++                } else {
++                    Result.success(beforeStatus)
++                }
++                val verifiedStatus = if (result.isSuccess) {
++                    controlRepository.verifyStatus(result.getOrThrow()).getOrThrow()
++                } else {
++                    beforeStatus
++                }
++                var workflowOk = result.isSuccess
++                var operationMessage = result.exceptionOrNull()?.message ?: successMessage
++                var uiMessage = if (result.isSuccess) uiSuccessMessage else result.exceptionOrNull()?.message
++                if (result.isSuccess && shouldForceStopTarget) {
++                    val forceStopResult = packageRepository.forceStop(app.packageName)
++                    if (forceStopResult.isSuccess) {
++                        operationMessage = "$successMessage; target force-stopped"
++                        uiMessage = "$uiSuccessMessage; target force-stopped"
++                    } else {
++                        workflowOk = false
++                        val reason = forceStopResult.exceptionOrNull()?.message ?: "unknown"
++                        operationMessage = "$successMessage; force-stop failed: $reason"
++                        uiMessage = operationMessage
++                    }
++                }
++                appendLog(app, if (workflowOk) LogType.OPERATION else LogType.ERROR, "broker.active", beforeStatus.active.toString(), "false", workflowOk, operationMessage)
++                val nextState = if (workflowOk) ConfigState.Success else ConfigState.Error(operationMessage)
++                _uiState.update {
++                    it.copy(
++                        enabled = verifiedStatus.active,
++                        brokerStatus = verifiedStatus,
++                        configState = nextState,
++                    ).withMessage(uiMessage)
++                }
++                settleConfigState(nextState)
++                refreshAllNow()
++            } catch (error: Throwable) {
++                val message = error.message ?: "r0dump broker stop failed"
++                appendLog(app, LogType.ERROR, "broker.active", "true", "false", false, message)
++                setFeedbackState(ConfigState.Error(message), message)
++            } finally {
++                finishConfigOperation()
++            }
++        }
++    }
++
++    fun restoreDefaults() {
++        publishDisabledSnapshot(successMessage = "Defaults restored", uiSuccessMessage = "Defaults restored")
++    }
++
++    fun reloadCurrentProperties() {
++        val app = _uiState.value.selectedApplication ?: return showMessage("Select a target application first")
++        if (!beginActionOperation()) return
++        viewModelScope.launch(Dispatchers.IO) {
++            try {
++                val message = "Configuration reloaded"
++                appendLog(app, LogType.OPERATION, null, null, null, true, message)
++                refreshAllNow()
++                showMessage(message)
++            } finally {
++                finishActionOperation()
++            }
++        }
++    }
++
++    fun recordAdbCommandsCopied() {
++        val app = _uiState.value.selectedApplication ?: return showMessage("Select a target application first")
++        if (!beginActionOperation()) return
++        viewModelScope.launch(Dispatchers.IO) {
++            try {
++                val message = "adb commands copied"
++                appendLog(app, LogType.OPERATION, null, null, null, true, message)
++                showMessage(message)
++            } finally {
++                finishActionOperation()
++            }
++        }
++    }
++
++    fun launchTarget() {
++        val app = _uiState.value.selectedApplication ?: return showMessage("Select a target application first")
++        if (!beginActionOperation()) return
++        if (!app.launchable) {
++            val message = "Selected application has no launcher activity"
++            viewModelScope.launch(Dispatchers.IO) {
++                try {
++                    appendLog(app, LogType.ERROR, null, null, null, false, message)
++                    showError(message)
++                } finally {
++                    finishActionOperation()
++                }
++            }
++            return
++        }
++        viewModelScope.launch(Dispatchers.IO) {
++            try {
++                val result = packageRepository.launch(app.packageName)
++                val message = result.exceptionOrNull()?.message ?: "Target launched"
++                appendLog(app, if (result.isSuccess) LogType.OPERATION else LogType.ERROR, null, null, null, result.isSuccess, message)
++                refreshAllNow()
++                showOperationFeedback(result.isSuccess, message)
++            } finally {
++                finishActionOperation()
++            }
++        }
++    }
++
++    fun forceStopTarget() {
++        val app = _uiState.value.selectedApplication ?: return showMessage("Select a target application first")
++        if (!beginActionOperation()) return
++        viewModelScope.launch(Dispatchers.IO) {
++            try {
++                val result = packageRepository.forceStop(app.packageName)
++                val message = result.exceptionOrNull()?.message ?: "Target stopped"
++                appendLog(app, if (result.isSuccess) LogType.OPERATION else LogType.ERROR, null, null, null, result.isSuccess, message)
++                refreshAllNow()
++                showOperationFeedback(result.isSuccess, message)
++            } finally {
++                finishActionOperation()
++            }
++        }
++    }
++
++    private fun beginConfigOperation(): Boolean {
++        if (!operationInFlight.compareAndSet(false, true)) {
++            showBusyMessage()
++            return false
++        }
++        configOperationInFlight.set(true)
++        return true
++    }
++
++    private fun finishConfigOperation() {
++        configOperationInFlight.set(false)
++        operationInFlight.set(false)
++    }
++
++    private fun beginActionOperation(): Boolean {
++        if (!operationInFlight.compareAndSet(false, true)) {
++            showBusyMessage()
++            return false
++        }
++        actionOperationInFlight.set(true)
++        _uiState.update { it.copy(actionInFlight = true) }
++        return true
++    }
++
++    private fun finishActionOperation() {
++        actionOperationInFlight.set(false)
++        _uiState.update { it.copy(actionInFlight = false) }
++        operationInFlight.set(false)
++    }
++
++    private fun isOperationBusy(): Boolean = operationInFlight.get()
++
++    private fun showBusyMessage() {
++        showMessage(if (actionOperationInFlight.get()) "Action is already running" else "Configuration update is already running")
++    }
++
++    private fun appendLogAsync(app: ConfigApplication, type: LogType, key: String?, old: String?, new: String?, ok: Boolean, message: String?) {
++        viewModelScope.launch(Dispatchers.IO) {
++            appendLog(app, type, key, old, new, ok, message)
++        }
++    }
++
++    private fun appendLog(app: ConfigApplication, type: LogType, key: String?, old: String?, new: String?, ok: Boolean, message: String?) {
++        appendLogs(
++            listOf(
++                ConfigLog(
++                    timestamp = System.currentTimeMillis(),
++                    applicationId = app.id,
++                    packageName = app.packageName,
++                    type = type,
++                    key = key,
++                    oldValue = old,
++                    newValue = new,
++                    result = ok,
++                    message = message,
++                ),
++            ),
++        )
++    }
++
++    private fun appendLogs(logs: List<ConfigLog>) {
++        if (logs.isEmpty()) return
++        auditStore.appendAll(logs)
++        val selectedPackage = _uiState.value.selectedApplication?.packageName
++        _uiState.update { it.copy(auditLogs = auditStore.readRecent(packageName = selectedPackage)) }
++    }
++
++    private fun settleConfigState(expected: ConfigState) {
++        viewModelScope.launch {
++            delay(STATE_FEEDBACK_MS)
++            _uiState.update { state ->
++                if (state.configState == expected) {
++                    state.copy(configState = ConfigState.Idle)
++                } else {
++                    state
++                }
++            }
++        }
++    }
++
++    private fun setFeedbackState(configState: ConfigState, message: String?) {
++        _uiState.update { it.copy(configState = configState).withMessage(message) }
++        when (configState) {
++            ConfigState.Success,
++            is ConfigState.Error -> settleConfigState(configState)
++            ConfigState.Idle,
++            ConfigState.Updating -> Unit
++        }
++    }
++
++
++    private fun showOperationFeedback(ok: Boolean, message: String) {
++        if (ok) {
++            showMessage(message)
++        } else {
++            showError(message)
++        }
++    }
++
++    private fun showMessage(message: String) {
++        _uiState.update { it.withMessage(message) }
++    }
++
++    private fun showError(message: String) {
++        setFeedbackState(ConfigState.Error(message), message)
++    }
++
++    private fun showStartPreflightError(app: ConfigApplication, message: String) {
++        appendLogAsync(app, LogType.ERROR, "broker.active", "false", "true", false, message)
++        showError(message)
++    }
++}
+diff --git a/src/com/android/r0dumpmanager/data/control/R0dumpControlRepository.kt b/src/com/android/r0dumpmanager/data/control/R0dumpControlRepository.kt
+new file mode 100644
+index 0000000..a1ddf62
+--- /dev/null
++++ b/src/com/android/r0dumpmanager/data/control/R0dumpControlRepository.kt
+@@ -0,0 +1,136 @@
++package com.android.r0dumpmanager.data.control
++
++import android.os.ServiceManager
++import android.r0dump.IR0dumpControlService
++import android.r0dump.R0dumpConfigParcel
++import android.r0dump.R0dumpOperationResult
++import android.r0dump.R0dumpStatus
++import java.util.UUID
++
++data class BrokerStatus(
++    val runId: Long,
++    val generation: Long,
++    val packageName: String?,
++    val active: Boolean,
++    val ready: Boolean,
++    val publishAllowed: Boolean,
++    val recoveryState: RecoveryState,
++    val indexGeneration: Long,
++)
++
++enum class RecoveryState {
++    NOT_STARTED,
++    INDEXING,
++    READY,
++    FAILED,
++    UNKNOWN,
++}
++
++class R0dumpControlRepository {
++    fun status(): Result<BrokerStatus> = runCatching {
++        val status = service().status
++        BrokerStatus(
++            runId = status.runId,
++            generation = status.generation,
++            packageName = status.packageName?.takeIf { it.isNotBlank() },
++            active = status.active,
++            ready = status.ready,
++            publishAllowed = status.publishAllowed,
++            recoveryState = status.recoveryState.toRecoveryState(),
++            indexGeneration = status.indexGeneration,
++        )
++    }
++
++    fun capabilityMask(): Result<Long> = runCatching { service().capabilities.capabilityMask }
++
++    fun publish(watchPackage: String, dumpPointMask: Int, expectedGeneration: Long): Result<BrokerStatus> =
++        runCatching {
++            val result = service().publish(
++                R0dumpConfigParcel(CONTROL_SCHEMA_VERSION, watchPackage, dumpPointMask.toLong() and 0xffffffffL, 0L),
++                expectedGeneration,
++                UUID.randomUUID().toString(),
++            )
++            result.requireOk("publish")
++            BrokerStatus(
++                result.runId,
++                result.generation,
++                watchPackage,
++                active = true,
++                ready = true,
++                publishAllowed = true,
++                recoveryState = RecoveryState.READY,
++                indexGeneration = -1L,
++            )
++        }
++
++    fun stop(expectedRunId: Long, expectedGeneration: Long): Result<BrokerStatus> = runCatching {
++        val result = service().stop(expectedRunId, expectedGeneration, UUID.randomUUID().toString())
++        result.requireOk("stop")
++        BrokerStatus(
++            result.runId,
++            result.generation,
++            null,
++            active = false,
++            ready = true,
++            publishAllowed = true,
++            recoveryState = RecoveryState.READY,
++            indexGeneration = -1L,
++        )
++    }
++
++    /**
++     * An operation result is only an acknowledgement. The broker's second status read is the
++     * authoritative committed state, and must agree with the complete public status vector.
++     */
++    fun verifyStatus(expected: BrokerStatus): Result<BrokerStatus> = status().mapCatching { actual ->
++        check(actual.runId == expected.runId) {
++            "r0dump broker status run mismatch: expected=${expected.runId} actual=${actual.runId}"
++        }
++        check(actual.generation == expected.generation) {
++            "r0dump broker status generation mismatch: expected=${expected.generation} actual=${actual.generation}"
++        }
++        check(actual.active == expected.active) {
++            "r0dump broker status active mismatch: expected=${expected.active} actual=${actual.active}"
++        }
++        check(actual.packageName == expected.packageName) {
++            "r0dump broker status package mismatch: expected=${expected.packageName} actual=${actual.packageName}"
++        }
++        check(actual.ready == expected.ready) {
++            "r0dump broker status ready mismatch: expected=${expected.ready} actual=${actual.ready}"
++        }
++        check(actual.publishAllowed == expected.publishAllowed) {
++            "r0dump broker status publishAllowed mismatch: expected=${expected.publishAllowed} actual=${actual.publishAllowed}"
++        }
++        actual
++    }
++
++    private fun service(): IR0dumpControlService = IR0dumpControlService.Stub.asInterface(
++        requireNotNull(ServiceManager.getService(CONTROL_SERVICE)) { "r0dump control service is unavailable" },
++    )
++
++    private fun R0dumpOperationResult.requireOk(operation: String) {
++        check(error == R0dumpOperationResult.OK) {
++            "$operation rejected by r0dump broker: ${errorName(error)} (run=$runId generation=$generation)"
++        }
++    }
++
++    private fun errorName(error: Int): String = when (error) {
++        R0dumpOperationResult.STALE -> "stale"
++        R0dumpOperationResult.INVALID -> "invalid"
++        R0dumpOperationResult.DENIED -> "denied"
++        else -> "unknown($error)"
++    }
++
++    private fun Int.toRecoveryState(): RecoveryState = when (this) {
++        R0dumpStatus.RECOVERY_NOT_STARTED -> RecoveryState.NOT_STARTED
++        R0dumpStatus.RECOVERY_INDEXING -> RecoveryState.INDEXING
++        R0dumpStatus.RECOVERY_READY -> RecoveryState.READY
++        R0dumpStatus.RECOVERY_FAILED -> RecoveryState.FAILED
++        else -> RecoveryState.UNKNOWN
++    }
++
++    private companion object {
++        const val CONTROL_SERVICE = "r0dump"
++        const val CONTROL_SCHEMA_VERSION = 1
++    }
++}
+diff --git a/src/com/android/r0dumpmanager/data/log/ConfigAuditStore.kt b/src/com/android/r0dumpmanager/data/log/ConfigAuditStore.kt
+new file mode 100644
+index 0000000..f6f9af3
+--- /dev/null
++++ b/src/com/android/r0dumpmanager/data/log/ConfigAuditStore.kt
+@@ -0,0 +1,142 @@
++package com.android.r0dumpmanager.data.log
++
++import android.content.Context
++import com.android.r0dumpmanager.domain.log.ConfigLog
++import com.android.r0dumpmanager.domain.log.LogType
++import java.io.File
++import java.util.ArrayDeque
++
++private const val MAX_AUDIT_LOG_LINES = 2000
++
++class ConfigAuditStore(
++    context: Context,
++) {
++    private val file = File(context.filesDir, "r0dump_config_audit.tsv")
++    private val lock = Any()
++
++    fun append(log: ConfigLog) {
++        appendAll(listOf(log))
++    }
++
++    fun appendAll(logs: List<ConfigLog>) {
++        if (logs.isEmpty()) return
++        val text = logs.joinToString(separator = "\n", postfix = "\n") { encodeLine(it) }
++        synchronized(lock) {
++            file.parentFile?.mkdirs()
++            file.appendText(text, Charsets.UTF_8)
++            trimToRecentLinesLocked()
++        }
++    }
++
++    fun readRecent(packageName: String? = null, limit: Int = 100): List<ConfigLog> {
++        if (limit <= 0) return emptyList()
++        val recentLogs = synchronized(lock) {
++            if (!file.isFile) return@synchronized emptyList<ConfigLog>()
++            val logs = ArrayDeque<ConfigLog>(limit)
++            file.useLines(Charsets.UTF_8) { sequence ->
++                sequence.forEach { line ->
++                    val log = parse(line) ?: return@forEach
++                    if (packageName != null && log.packageName != packageName) return@forEach
++                    if (logs.size == limit) logs.removeFirst()
++                    logs.addLast(log)
++                }
++            }
++            logs.toList()
++        }
++        return recentLogs.asReversed()
++    }
++
++    private fun encodeLine(log: ConfigLog): String = listOf(
++        log.timestamp.toString(),
++        log.applicationId,
++        log.packageName,
++        log.type.name,
++        log.key.orEmpty(),
++        log.oldValue.orEmpty(),
++        log.newValue.orEmpty(),
++        log.result.toString(),
++        log.message.orEmpty(),
++    ).joinToString("\t") { escapeCell(it) }
++
++    private fun parse(line: String): ConfigLog? {
++        val parts = splitTsvLine(line).map { unescapeCell(it) }
++        if (parts.size < 9) return null
++        return ConfigLog(
++            timestamp = parts[0].toLongOrNull() ?: return null,
++            applicationId = parts[1],
++            packageName = parts[2],
++            type = runCatching { LogType.valueOf(parts[3]) }.getOrDefault(LogType.ERROR),
++            key = parts[4].ifEmpty { null },
++            oldValue = parts[5].ifEmpty { null },
++            newValue = parts[6].ifEmpty { null },
++            result = parts[7].toBoolean(),
++            message = parts[8].ifEmpty { null },
++        )
++    }
++
++    private fun trimToRecentLinesLocked() {
++        if (!file.isFile) return
++        val recentLines = ArrayDeque<String>(MAX_AUDIT_LOG_LINES)
++        var overflow = false
++        file.useLines(Charsets.UTF_8) { sequence ->
++            sequence.forEach { line ->
++                if (recentLines.size == MAX_AUDIT_LOG_LINES) {
++                    recentLines.removeFirst()
++                    overflow = true
++                }
++                recentLines.addLast(line)
++            }
++        }
++        if (overflow) {
++            file.writeText(recentLines.joinToString(separator = "\n", postfix = "\n"), Charsets.UTF_8)
++        }
++    }
++
++    private fun splitTsvLine(line: String): List<String> {
++        val parts = ArrayList<String>(9)
++        var start = 0
++        while (parts.size < 8) {
++            val tab = line.indexOf('\t', start)
++            if (tab < 0) return emptyList()
++            parts += line.substring(start, tab)
++            start = tab + 1
++        }
++        parts += line.substring(start)
++        return parts
++    }
++
++    private fun escapeCell(value: String): String = buildString(value.length) {
++        value.forEach { ch ->
++            when (ch) {
++                '\\' -> append("\\\\")
++                '\t' -> append("\\t")
++                '\n' -> append("\\n")
++                '\r' -> append("\\r")
++                else -> append(ch)
++            }
++        }
++    }
++
++    private fun unescapeCell(value: String): String = buildString(value.length) {
++        var index = 0
++        while (index < value.length) {
++            val ch = value[index]
++            if (ch == '\\' && index + 1 < value.length) {
++                when (value[index + 1]) {
++                    '\\' -> append('\\')
++                    't' -> append('\t')
++                    'n' -> append('\n')
++                    'r' -> append('\r')
++                    else -> {
++                        append(ch)
++                        append(value[index + 1])
++                    }
++                }
++                index += 2
++            } else {
++                append(ch)
++                index += 1
++            }
++        }
++    }
++}
+diff --git a/src/com/android/r0dumpmanager/data/logcat/R0dumpLogcatRepository.kt b/src/com/android/r0dumpmanager/data/logcat/R0dumpLogcatRepository.kt
+new file mode 100644
+index 0000000..685dea6
+--- /dev/null
++++ b/src/com/android/r0dumpmanager/data/logcat/R0dumpLogcatRepository.kt
+@@ -0,0 +1,21 @@
++package com.android.r0dumpmanager.data.logcat
++
++import java.util.concurrent.TimeUnit
++
++class R0dumpLogcatRepository {
++    fun readRecent(limit: Int = 80): Result<List<String>> = runCatching {
++        val process = ProcessBuilder("logcat", "-d", "-s", "r0dump", "-t", limit.toString())
++            .redirectErrorStream(true)
++            .start()
++        val output = process.inputStream.bufferedReader().readLines()
++        if (!process.waitFor(2, TimeUnit.SECONDS)) {
++            process.destroyForcibly()
++            error("logcat timed out")
++        }
++        val exitCode = process.exitValue()
++        if (exitCode != 0) {
++            error(output.takeLast(3).joinToString("; ").ifBlank { "logcat exited with $exitCode" })
++        }
++        output.takeLast(limit)
++    }
++}
+diff --git a/src/com/android/r0dumpmanager/data/packageinfo/PackageRepository.kt b/src/com/android/r0dumpmanager/data/packageinfo/PackageRepository.kt
+new file mode 100644
+index 0000000..1912d49
+--- /dev/null
++++ b/src/com/android/r0dumpmanager/data/packageinfo/PackageRepository.kt
+@@ -0,0 +1,57 @@
++package com.android.r0dumpmanager.data.packageinfo
++
++import android.app.ActivityManager
++import android.content.Context
++import android.content.Intent
++import android.content.pm.PackageManager
++import com.android.r0dumpmanager.domain.config.ConfigApplication
++import com.android.r0dumpmanager.domain.config.ConfigGroup
++import com.android.r0dumpmanager.domain.operation.SystemOperation
++
++class PackageRepository(
++    private val context: Context,
++) {
++    private val packageManager = context.packageManager
++
++    fun loadInstalledApplications(groups: List<ConfigGroup>, operations: List<SystemOperation>): List<ConfigApplication> = packageManager
++        .getInstalledApplications(PackageManager.MATCH_ALL)
++        .mapNotNull { applicationInfo ->
++            val packageName = applicationInfo.packageName ?: return@mapNotNull null
++            if (packageName == context.packageName) return@mapNotNull null
++            val launchable = packageManager.getLaunchIntentForPackage(packageName) != null
++            ConfigApplication(
++                id = packageName,
++                label = applicationInfo.loadLabel(packageManager)?.toString() ?: packageName,
++                packageName = packageName,
++                description = applicationInfo.sourceDir,
++                configGroups = groups,
++                operations = supportedOperations(operations, launchable),
++                launchable = launchable,
++            )
++        }
++        .distinctBy { it.packageName }
++        .sortedWith(
++            compareByDescending<ConfigApplication> { it.launchable }
++                .thenBy(String.CASE_INSENSITIVE_ORDER) { it.label },
++        )
++
++    private fun supportedOperations(operations: List<SystemOperation>, launchable: Boolean): List<SystemOperation> =
++        if (launchable) {
++            operations
++        } else {
++            operations.filterNot { it == SystemOperation.LaunchTarget }
++        }
++
++    fun launch(packageName: String): Result<Unit> = runCatching {
++        val intent = packageManager.getLaunchIntentForPackage(packageName)
++            ?: error("No launcher activity for $packageName")
++        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
++        context.startActivity(intent)
++    }
++
++    fun forceStop(packageName: String): Result<Unit> = runCatching {
++        val activityManager = context.getSystemService(ActivityManager::class.java)
++            ?: error("ActivityManager unavailable")
++        activityManager.forceStopPackage(packageName)
++    }
++}
+diff --git a/src/com/android/r0dumpmanager/data/reader/PrivateStoreModels.kt b/src/com/android/r0dumpmanager/data/reader/PrivateStoreModels.kt
+new file mode 100644
+index 0000000..fcd5af2
+--- /dev/null
++++ b/src/com/android/r0dumpmanager/data/reader/PrivateStoreModels.kt
+@@ -0,0 +1,138 @@
++package com.android.r0dumpmanager.data.reader
++
++import android.r0dump.R0dumpCapabilities
++import com.android.r0dumpmanager.data.control.RecoveryState
++
++object PrivateStoreCapabilities {
++    const val CAP_PRIVATE_STORE_CONTROL_V1: Long = R0dumpCapabilities.CAP_PRIVATE_STORE_CONTROL_V1
++
++    fun hasPrivateStoreControl(capabilityMask: Long?): Boolean =
++        capabilityMask != null &&
++            (capabilityMask and CAP_PRIVATE_STORE_CONTROL_V1) != 0L
++}
++
++enum class PrivateReaderAvailability {
++    UNAVAILABLE,
++    INDEXING,
++    READY,
++    FAILED,
++}
++
++data class PrivateReaderUiState(
++    val availability: PrivateReaderAvailability = PrivateReaderAvailability.UNAVAILABLE,
++    val indexGeneration: Long? = null,
++    val runs: List<PrivateRunSummary> = emptyList(),
++    val nextCursor: String? = null,
++    val message: String? = null,
++) {
++    val canRead: Boolean = availability == PrivateReaderAvailability.READY
++}
++
++object PrivateReaderGate {
++    fun state(
++        recoveryState: RecoveryState?,
++        capabilityMask: Long?,
++        indexGeneration: Long?,
++    ): PrivateReaderUiState = when {
++        recoveryState == RecoveryState.INDEXING -> PrivateReaderUiState(
++            availability = PrivateReaderAvailability.INDEXING,
++            message = "Verified private store is indexing",
++        )
++        recoveryState == RecoveryState.FAILED -> PrivateReaderUiState(
++            availability = PrivateReaderAvailability.FAILED,
++            message = "Verified private store recovery failed",
++        )
++        recoveryState == RecoveryState.NOT_STARTED -> PrivateReaderUiState(
++            availability = PrivateReaderAvailability.UNAVAILABLE,
++            message = "Verified private store recovery has not started",
++        )
++        recoveryState == RecoveryState.READY &&
++            PrivateStoreCapabilities.hasPrivateStoreControl(capabilityMask) &&
++            indexGeneration != null && indexGeneration > 0L -> PrivateReaderUiState(
++            availability = PrivateReaderAvailability.READY,
++            indexGeneration = indexGeneration,
++        )
++        else -> PrivateReaderUiState(
++            availability = PrivateReaderAvailability.UNAVAILABLE,
++            message = "Verified private store is unavailable",
++        )
++    }
++}
++
++data class PrivateRunSummary(
++    val packageName: String,
++    val runId: Long,
++    val state: String,
++    val active: Boolean,
++    val observationCount: Long,
++    val verifiedBytes: Long,
++    val exportable: Boolean,
++    val deletable: Boolean,
++)
++
++data class PrivateSessionSummary(
++    val opaqueSessionId: String,
++    val processName: String,
++    val state: String,
++    val acceptedWatermark: Long,
++    val resolvedWatermark: Long,
++    val committedWatermark: Long,
++)
++
++data class PrivateObservationSummary(
++    val sequence: Long,
++    val point: Int,
++    val phase: String,
++    val payload: String,
++    val terminalState: String,
++    val terminalReason: String,
++)
++
++data class PrivateRunPage(
++    val indexGeneration: Long,
++    val items: List<PrivateRunSummary>,
++    val nextCursor: String?,
++)
++
++data class PrivateSessionPage(
++    val indexGeneration: Long,
++    val items: List<PrivateSessionSummary>,
++    val nextCursor: String?,
++)
++
++data class PrivateObservationPage(
++    val indexGeneration: Long,
++    val items: List<PrivateObservationSummary>,
++    val nextCursor: String?,
++)
++
++data class PrivateExportTicket(
++    val exportId: String,
++    val packageName: String,
++    val runId: Long,
++    val indexGeneration: Long,
++)
++
++data class PrivateExportResult(
++    val exportId: String,
++    val packageName: String,
++    val runId: Long,
++    val indexGeneration: Long,
++    val bytesWritten: Long,
++    val archiveSha256: String?,
++    val partialOutput: Boolean,
++)
++
++data class PrivateDeleteResult(
++    val packageName: String,
++    val runId: Long,
++    val oldIndexGeneration: Long,
++    val newIndexGeneration: Long,
++    val reclaimPending: Boolean,
++)
++
++class PrivateStoreUnavailableException(message: String = "r0dump private-store service is unavailable") :
++    IllegalStateException(message)
++
++class PrivateStoreServiceException(val error: Int) :
++    IllegalStateException("r0dump private-store request failed: error=$error")
+diff --git a/src/com/android/r0dumpmanager/data/reader/R0dumpPrivateStoreRepository.kt b/src/com/android/r0dumpmanager/data/reader/R0dumpPrivateStoreRepository.kt
+new file mode 100644
+index 0000000..0785004
+--- /dev/null
++++ b/src/com/android/r0dumpmanager/data/reader/R0dumpPrivateStoreRepository.kt
+@@ -0,0 +1,513 @@
++package com.android.r0dumpmanager.data.reader
++
++import android.os.DeadObjectException
++import android.os.Handler
++import android.os.IBinder
++import android.os.Looper
++import android.os.ParcelFileDescriptor
++import android.os.RemoteException
++import android.os.ServiceManager
++import android.r0dump.IR0dumpControlService
++import android.r0dump.IR0dumpExportCallback
++import android.r0dump.R0dumpDeleteResult
++import android.r0dump.R0dumpExportResult
++import android.r0dump.R0dumpExportTicket as BinderExportTicket
++import android.r0dump.R0dumpObservationPage
++import android.r0dump.R0dumpObservationSummary
++import android.r0dump.R0dumpOperationResult
++import android.r0dump.R0dumpRunPage
++import android.r0dump.R0dumpRunSummary
++import android.r0dump.R0dumpSessionPage
++import android.r0dump.R0dumpSessionSummary
++import android.util.Log
++
++/**
++ * Typed private-store reader surface. The Binder adapter is intentionally the only implementation
++ * allowed to supply this API: no Manager caller receives private paths, FDs, or raw artifacts.
++ */
++interface PrivateStoreServiceAdapter {
++    fun listRuns(packageName: String, expectedIndexGeneration: Long, cursor: String?, pageSize: Int): PrivateRunPage
++
++    fun listSessions(
++        packageName: String,
++        runId: Long,
++        expectedIndexGeneration: Long,
++        cursor: String?,
++        pageSize: Int,
++    ): PrivateSessionPage
++
++    fun listObservations(
++        packageName: String,
++        runId: Long,
++        opaqueSessionId: String,
++        expectedIndexGeneration: Long,
++        cursor: String?,
++        pageSize: Int,
++    ): PrivateObservationPage
++
++    fun beginExportRun(
++        packageName: String,
++        runId: Long,
++        expectedIndexGeneration: Long,
++        destination: ParcelFileDescriptor,
++        requestId: String,
++        onFinished: (Result<PrivateExportResult>) -> Unit,
++    ): PrivateExportTicket
++
++    fun deleteRun(
++        packageName: String,
++        runId: Long,
++        expectedIndexGeneration: Long,
++        requestId: String,
++    ): PrivateDeleteResult
++}
++
++class R0dumpPrivateStoreRepository(
++    private val adapterProvider: () -> PrivateStoreServiceAdapter? = {
++        BinderPrivateStoreServiceAdapter.connect()
++    },
++) {
++    fun listRuns(
++        packageName: String,
++        expectedIndexGeneration: Long,
++        cursor: String?,
++        pageSize: Int,
++    ): Result<PrivateRunPage> = call { it.listRuns(packageName, expectedIndexGeneration, cursor, pageSize) }
++
++    fun listSessions(
++        packageName: String,
++        runId: Long,
++        expectedIndexGeneration: Long,
++        cursor: String?,
++        pageSize: Int,
++    ): Result<PrivateSessionPage> = call {
++        it.listSessions(packageName, runId, expectedIndexGeneration, cursor, pageSize)
++    }
++
++    fun listObservations(
++        packageName: String,
++        runId: Long,
++        opaqueSessionId: String,
++        expectedIndexGeneration: Long,
++        cursor: String?,
++        pageSize: Int,
++    ): Result<PrivateObservationPage> = call {
++        it.listObservations(packageName, runId, opaqueSessionId, expectedIndexGeneration, cursor, pageSize)
++    }
++
++    fun beginExportRun(
++        packageName: String,
++        runId: Long,
++        expectedIndexGeneration: Long,
++        destination: ParcelFileDescriptor,
++        requestId: String,
++        onFinished: (Result<PrivateExportResult>) -> Unit,
++    ): Result<PrivateExportTicket> = call {
++        it.beginExportRun(
++            packageName,
++            runId,
++            expectedIndexGeneration,
++            destination,
++            requestId,
++            onFinished,
++        )
++    }
++
++    fun deleteRun(
++        packageName: String,
++        runId: Long,
++        expectedIndexGeneration: Long,
++        requestId: String,
++    ): Result<PrivateDeleteResult> = call {
++        it.deleteRun(packageName, runId, expectedIndexGeneration, requestId)
++    }
++
++    private inline fun <T> call(operation: (PrivateStoreServiceAdapter) -> T): Result<T> = runCatching {
++        operation(adapterProvider() ?: throw PrivateStoreUnavailableException())
++    }.recoverCatching { failure ->
++        if (failure is DeadObjectException || failure is RemoteException) {
++            throw PrivateStoreUnavailableException()
++        }
++        throw failure
++    }
++}
++
++private class BinderPrivateStoreServiceAdapter(
++    private val service: IR0dumpControlService,
++) : PrivateStoreServiceAdapter {
++    override fun listRuns(
++        packageName: String,
++        expectedIndexGeneration: Long,
++        cursor: String?,
++        pageSize: Int,
++    ): PrivateRunPage = service.listRuns(packageName, expectedIndexGeneration, cursor, pageSize).toPrivatePage()
++
++    override fun listSessions(
++        packageName: String,
++        runId: Long,
++        expectedIndexGeneration: Long,
++        cursor: String?,
++        pageSize: Int,
++    ): PrivateSessionPage = service.listSessions(
++        packageName,
++        runId,
++        expectedIndexGeneration,
++        cursor,
++        pageSize,
++    ).toPrivatePage()
++
++    override fun listObservations(
++        packageName: String,
++        runId: Long,
++        opaqueSessionId: String,
++        expectedIndexGeneration: Long,
++        cursor: String?,
++        pageSize: Int,
++    ): PrivateObservationPage = service.listObservations(
++        packageName,
++        runId,
++        opaqueSessionId,
++        expectedIndexGeneration,
++        cursor,
++        pageSize,
++    ).toPrivatePage()
++
++    override fun beginExportRun(
++        packageName: String,
++        runId: Long,
++        expectedIndexGeneration: Long,
++        destination: ParcelFileDescriptor,
++        requestId: String,
++        onFinished: (Result<PrivateExportResult>) -> Unit,
++    ): PrivateExportTicket = PrivateExportStarter(
++        BinderPrivateExportDeathMonitor(service.asBinder()),
++    ).begin(
++        expectedPackageName = packageName,
++        expectedRunId = runId,
++        expectedIndexGeneration = expectedIndexGeneration,
++        onFinished = onFinished,
++    ) { callback ->
++        service.beginExportRun(
++            packageName,
++            runId,
++            expectedIndexGeneration,
++            destination,
++            requestId,
++            callback,
++        )
++    }
++
++    override fun deleteRun(
++        packageName: String,
++        runId: Long,
++        expectedIndexGeneration: Long,
++        requestId: String,
++    ): PrivateDeleteResult = service.deleteRun(
++        packageName,
++        runId,
++        expectedIndexGeneration,
++        requestId,
++    ).let { result ->
++        result.requireOk()
++        result.toPrivateResult()
++    }
++
++    companion object {
++        fun connect(): PrivateStoreServiceAdapter? = ServiceManager.getService(CONTROL_SERVICE)?.let {
++            BinderPrivateStoreServiceAdapter(IR0dumpControlService.Stub.asInterface(it))
++        }
++
++        private const val CONTROL_SERVICE = "r0dump"
++    }
++}
++
++interface PrivateExportDeathMonitor {
++    @Throws(RemoteException::class)
++    fun link(recipient: IBinder.DeathRecipient)
++
++    fun unlink(recipient: IBinder.DeathRecipient)
++}
++
++private class BinderPrivateExportDeathMonitor(
++    private val binder: IBinder,
++) : PrivateExportDeathMonitor {
++    override fun link(recipient: IBinder.DeathRecipient) {
++        binder.linkToDeath(recipient, 0)
++    }
++
++    override fun unlink(recipient: IBinder.DeathRecipient) {
++        try {
++            binder.unlinkToDeath(recipient, 0)
++        } catch (_: NoSuchElementException) {
++            // Binder may remove the recipient while delivering death.
++        }
++    }
++}
++
++private val privateExportMainHandler by lazy { Handler(Looper.getMainLooper()) }
++
++private fun dispatchPrivateExportOnMain(task: () -> Unit) {
++    privateExportMainHandler.post(task)
++}
++
++/** Owns the synchronous begin/validate/arm ordering used by the Binder adapter. */
++class PrivateExportStarter(
++    private val deathMonitor: PrivateExportDeathMonitor,
++    private val dispatcher: ((() -> Unit) -> Unit) = ::dispatchPrivateExportOnMain,
++) {
++    fun begin(
++        expectedPackageName: String,
++        expectedRunId: Long,
++        expectedIndexGeneration: Long,
++        onFinished: (Result<PrivateExportResult>) -> Unit,
++        request: (IR0dumpExportCallback) -> BinderExportTicket,
++    ): PrivateExportTicket {
++        val completion = PrivateExportCompletion(onFinished, dispatcher)
++        try {
++            val ticket = request(object : IR0dumpExportCallback.Stub() {
++                override fun onFinished(result: R0dumpExportResult) {
++                    completion.onBinderResult(result)
++                }
++            })
++            val acceptedTicket = ticket.toPrivateTicketValidated(
++                expectedPackageName,
++                expectedRunId,
++                expectedIndexGeneration,
++            )
++            completion.arm(deathMonitor)
++            return acceptedTicket
++        } catch (failure: Throwable) {
++            completion.abandon()
++            throw failure
++        }
++    }
++}
++
++/** Orders synchronous ticket acceptance before the first asynchronous export terminal. */
++class PrivateExportCompletion(
++    private val onFinished: (Result<PrivateExportResult>) -> Unit,
++    private val dispatcher: ((() -> Unit) -> Unit) = ::dispatchPrivateExportOnMain,
++) : IBinder.DeathRecipient {
++    private enum class State {
++        PENDING_ACCEPT,
++        LINKING,
++        ARMED,
++        FINISHED,
++        ABANDONED,
++    }
++
++    private val lock = Any()
++    private var state = State.PENDING_ACCEPT
++    private var pendingResult: Result<PrivateExportResult>? = null
++    private var linkedMonitor: PrivateExportDeathMonitor? = null
++
++    fun arm(deathMonitor: PrivateExportDeathMonitor) {
++        val buffered = synchronized(lock) {
++            if (state != State.PENDING_ACCEPT) return
++            pendingResult.also { result ->
++                pendingResult = null
++                state = if (result == null) State.LINKING else State.FINISHED
++            }
++        }
++        if (buffered != null) {
++            dispatch(buffered)
++            return
++        }
++
++        try {
++            deathMonitor.link(this)
++        } catch (_: RemoteException) {
++            acceptTerminal(Result.failure(PrivateStoreUnavailableException()))
++            return
++        }
++
++        val unlink = synchronized(lock) {
++            when (state) {
++                State.LINKING -> {
++                    linkedMonitor = deathMonitor
++                    state = State.ARMED
++                    false
++                }
++                State.FINISHED, State.ABANDONED -> true
++                else -> true
++            }
++        }
++        if (unlink) deathMonitor.unlink(this)
++    }
++
++    fun abandon() {
++        val monitor = synchronized(lock) {
++            pendingResult = null
++            when (state) {
++                State.PENDING_ACCEPT, State.LINKING -> {
++                    state = State.ABANDONED
++                    null
++                }
++                State.ARMED -> {
++                    state = State.ABANDONED
++                    linkedMonitor.also { linkedMonitor = null }
++                }
++                State.FINISHED, State.ABANDONED -> null
++            }
++        }
++        monitor?.unlink(this)
++    }
++
++    fun onBinderResult(result: R0dumpExportResult) {
++        acceptTerminal(runCatching {
++            result.requireOk()
++            PrivateExportResult(
++                exportId = result.exportId,
++                packageName = result.packageName,
++                runId = result.runId,
++                indexGeneration = result.indexGeneration,
++                bytesWritten = result.bytesWritten,
++                archiveSha256 = result.archiveSha256,
++                partialOutput = result.partialOutput,
++            )
++        })
++    }
++
++    override fun binderDied() {
++        acceptTerminal(Result.failure(PrivateStoreUnavailableException()))
++    }
++
++    private fun acceptTerminal(result: Result<PrivateExportResult>) {
++        var deliver: Result<PrivateExportResult>? = null
++        val monitor = synchronized(lock) {
++            when (state) {
++                State.PENDING_ACCEPT -> {
++                    if (pendingResult == null) pendingResult = result
++                    null
++                }
++                State.LINKING -> {
++                    state = State.FINISHED
++                    deliver = result
++                    null
++                }
++                State.ARMED -> {
++                    state = State.FINISHED
++                    deliver = result
++                    linkedMonitor.also { linkedMonitor = null }
++                }
++                State.FINISHED, State.ABANDONED -> return
++            }
++        }
++        monitor?.unlink(this)
++        deliver?.let(::dispatch)
++    }
++
++    private fun dispatch(result: Result<PrivateExportResult>) {
++        try {
++            dispatcher {
++                try {
++                    onFinished(result)
++                } catch (failure: RuntimeException) {
++                    Log.e(TAG, "Private export completion consumer failed", failure)
++                }
++            }
++        } catch (failure: RuntimeException) {
++            Log.e(TAG, "Private export completion dispatch failed", failure)
++        }
++    }
++
++    companion object {
++        private const val TAG = "R0dumpPrivateStore"
++    }
++}
++
++private fun R0dumpRunPage.toPrivatePage(): PrivateRunPage {
++    requireOk()
++    return PrivateRunPage(indexGeneration, items.map(R0dumpRunSummary::toPrivateSummary), nextCursor)
++}
++
++private fun R0dumpSessionPage.toPrivatePage(): PrivateSessionPage {
++    requireOk()
++    return PrivateSessionPage(indexGeneration, items.map(R0dumpSessionSummary::toPrivateSummary), nextCursor)
++}
++
++private fun R0dumpObservationPage.toPrivatePage(): PrivateObservationPage {
++    requireOk()
++    return PrivateObservationPage(
++        indexGeneration,
++        items.map(R0dumpObservationSummary::toPrivateSummary),
++        nextCursor,
++    )
++}
++
++private fun R0dumpRunSummary.toPrivateSummary() = PrivateRunSummary(
++    packageName = packageName,
++    runId = runId,
++    state = aggregateState,
++    active = active,
++    observationCount = observationCount,
++    verifiedBytes = verifiedBytes,
++    exportable = exportable,
++    deletable = deletable,
++)
++
++private fun R0dumpSessionSummary.toPrivateSummary() = PrivateSessionSummary(
++    opaqueSessionId = opaqueSessionId,
++    processName = processName,
++    state = state,
++    acceptedWatermark = acceptedWatermark,
++    resolvedWatermark = resolvedWatermark,
++    committedWatermark = committedWatermark,
++)
++
++private fun R0dumpObservationSummary.toPrivateSummary() = PrivateObservationSummary(
++    sequence = sequence,
++    point = point,
++    phase = phase,
++    payload = payload,
++    terminalState = terminalState,
++    terminalReason = reason,
++)
++
++private fun R0dumpDeleteResult.toPrivateResult() = PrivateDeleteResult(
++    packageName = packageName,
++    runId = runId,
++    oldIndexGeneration = oldIndexGeneration,
++    newIndexGeneration = newIndexGeneration,
++    reclaimPending = reclaimPending,
++)
++
++private fun R0dumpRunPage.requireOk() = throwIfError(error)
++
++private fun R0dumpSessionPage.requireOk() = throwIfError(error)
++
++private fun R0dumpObservationPage.requireOk() = throwIfError(error)
++
++private fun R0dumpDeleteResult.requireOk() = throwIfError(error)
++
++private fun android.r0dump.R0dumpExportTicket.requireOk() = throwIfError(error)
++
++private fun BinderExportTicket.toPrivateTicketValidated(
++    expectedPackageName: String,
++    expectedRunId: Long,
++    expectedIndexGeneration: Long,
++): PrivateExportTicket {
++    requireOk()
++    val validatedExportId = exportId
++    val validatedPackageName = packageName
++    if (validatedExportId.isNullOrEmpty() || validatedExportId.length > 128
++        || validatedExportId.any { !it.isLetterOrDigit() && it != '-' && it != '_' }
++        || validatedPackageName == null || validatedPackageName != expectedPackageName
++        || runId <= 0 || runId != expectedRunId
++        || indexGeneration <= 0 || indexGeneration != expectedIndexGeneration
++    ) {
++        throw PrivateStoreServiceException(R0dumpOperationResult.CORRUPT)
++    }
++    return PrivateExportTicket(
++        validatedExportId,
++        validatedPackageName,
++        runId,
++        indexGeneration,
++    )
++}
++
++private fun R0dumpExportResult.requireOk() = throwIfError(error)
++
++private fun throwIfError(error: Int) {
++    if (error != R0dumpOperationResult.OK) throw PrivateStoreServiceException(error)
++}
+diff --git a/src/com/android/r0dumpmanager/domain/config/ConfigModels.kt b/src/com/android/r0dumpmanager/domain/config/ConfigModels.kt
+new file mode 100644
+index 0000000..f260821
+--- /dev/null
++++ b/src/com/android/r0dumpmanager/domain/config/ConfigModels.kt
+@@ -0,0 +1,58 @@
++package com.android.r0dumpmanager.domain.config
++
++import com.android.r0dumpmanager.domain.operation.SystemOperation
++
++data class ConfigRegistry(
++    val applications: List<ConfigApplication>,
++)
++
++data class ConfigApplication(
++    val id: String,
++    val label: String,
++    val packageName: String,
++    val description: String? = null,
++    val configGroups: List<ConfigGroup>,
++    val operations: List<SystemOperation> = emptyList(),
++    val launchable: Boolean = true,
++)
++
++data class ConfigGroup(
++    val id: String,
++    val title: String,
++    val description: String? = null,
++    val items: List<ConfigItem>,
++)
++
++data class ConfigItem(
++    val key: String,
++    val title: String,
++    val description: String? = null,
++    val type: ConfigType,
++    val defaultValue: String,
++    val options: List<String> = emptyList(),
++    val requiresConfirmation: Boolean = false,
++    val applyMode: ApplyMode = ApplyMode.DIRECT,
++)
++
++enum class ConfigType {
++    BOOLEAN,
++    STRING,
++    INTEGER,
++    ENUM,
++    MASK,
++    PREFIX_LIST,
++}
++
++enum class ApplyMode {
++    DIRECT,
++    PROCESS_RESTART,
++    PROPERTY_CALLBACK,
++    INIT_TRIGGER,
++}
++
++sealed interface ConfigState {
++    object Idle : ConfigState
++    object Updating : ConfigState
++    object Success : ConfigState
++    data class Error(val message: String) : ConfigState
++}
+diff --git a/src/com/android/r0dumpmanager/domain/config/DumpPointRegistry.kt b/src/com/android/r0dumpmanager/domain/config/DumpPointRegistry.kt
+new file mode 100644
+index 0000000..1df895c
+--- /dev/null
++++ b/src/com/android/r0dumpmanager/domain/config/DumpPointRegistry.kt
+@@ -0,0 +1,56 @@
++package com.android.r0dumpmanager.domain.config
++
++data class DumpPoint(
++    val bit: Int,
++    val shortName: String,
++    val displayName: String,
++    val important: Boolean = false,
++)
++
++object DumpPointRegistry {
++    val points = listOf(
++        DumpPoint(0, "activitywalk", "ActivityThread class walk"),
++        DumpPoint(1, "methodinvoke", "ArtMethod Invoke", important = true),
++        DumpPoint(2, "loaderroute", "BaseDexClassLoader route"),
++        DumpPoint(3, "defineclass", "ClassLinker DefineClass", important = true),
++        DumpPoint(4, "classinit", "Class init before"),
++        DumpPoint(5, "classinitafter", "Class init after"),
++        DumpPoint(6, "loadclass", "ClassLinker LoadClass"),
++        DumpPoint(7, "fillmethods", "LoadClass helper fill methods"),
++        DumpPoint(8, "registerdex", "ClassLinker RegisterDexFile", important = true),
++        DumpPoint(9, "resolvemethod", "ClassLinker ResolveMethodId"),
++        DumpPoint(10, "verifyclass", "VerifyClass"),
++        DumpPoint(11, "reflectinvoke", "Reflect Invoke"),
++        DumpPoint(12, "oatcookie", "Create cookie from OatFileManager result"),
++        DumpPoint(13, "dexjavaroute", "DexFile Java route"),
++        DumpPoint(14, "dexnativeclass", "DexFile defineClassNative"),
++        DumpPoint(15, "dexmemory", "DexFile open in memory"),
++        DumpPoint(16, "opencommon", "DexFileLoader OpenCommon", important = true),
++        DumpPoint(17, "dexfileopen", "DexFile open file"),
++        DumpPoint(18, "imagedex", "ImageSpace Dex"),
++        DumpPoint(19, "instrumententer", "Instrumentation method enter"),
++        DumpPoint(20, "instrumentexit", "Instrumentation method exit"),
++        DumpPoint(21, "interpreter", "Interpreter execute"),
++        DumpPoint(22, "jitcompile", "JIT compile method"),
++        DumpPoint(23, "jitenter", "JIT method entered"),
++        DumpPoint(24, "oatdexopen", "OatDexFile open DexFile"),
++        DumpPoint(25, "oatload", "OatFileAssistant load DexFiles"),
++        DumpPoint(26, "oatmanageropen", "OatFileManager open DexFilesFromOat"),
++        DumpPoint(27, "oatregister", "OatFileManager register OatFile"),
++    )
++
++    val keyPoints = setOf("opencommon", "registerdex", "defineclass")
++
++    fun maskFor(bits: Set<Int>): Int {
++        var mask = 0
++        bits.forEach { bit ->
++            if (bit in 0..27) mask = mask or (1 shl bit)
++        }
++        return mask
++    }
++
++    fun bitsForMask(mask: Int): Set<Int> = points
++        .filter { (mask and (1 shl it.bit)) != 0 }
++        .map { it.bit }
++        .toSet()
++}
+diff --git a/src/com/android/r0dumpmanager/domain/config/FusionConfig.kt b/src/com/android/r0dumpmanager/domain/config/FusionConfig.kt
+new file mode 100644
+index 0000000..afa2ba0
+--- /dev/null
++++ b/src/com/android/r0dumpmanager/domain/config/FusionConfig.kt
+@@ -0,0 +1,34 @@
++package com.android.r0dumpmanager.domain.config
++
++data class FusionConfig(
++    val watchPackage: String = "",
++    val dumpPointMask: Int = 0,
++)
++
++data class ValidationResult(
++    val ok: Boolean,
++    val message: String = "",
++)
++
++/** Validation for the subset of configuration the current Broker AIDL accepts. */
++object FusionConfigValidator {
++    fun validateForStart(config: FusionConfig): ValidationResult {
++        if (config.watchPackage.isBlank()) return ValidationResult(false, "Select a target application first")
++        if (!isPackageName(config.watchPackage)) return ValidationResult(false, "Invalid package name")
++        if (config.dumpPointMask == 0) return ValidationResult(false, "Select at least one dump point")
++        if ((config.dumpPointMask and 0xf0000000.toInt()) != 0) {
++            return ValidationResult(false, "Reserved mask bits must be zero")
++        }
++        return ValidationResult(true)
++    }
++
++    private fun isPackageName(value: String): Boolean {
++        if (value.length !in 3..255) return false
++        val parts = value.split('.')
++        if (parts.size < 2 || parts.any { it.isEmpty() }) return false
++        return parts.all { part ->
++            (part.first().isLetter() || part.first() == '_') &&
++                part.all { it.isLetterOrDigit() || it == '_' }
++        }
++    }
++}
+diff --git a/src/com/android/r0dumpmanager/domain/config/R0dumpConfigRegistry.kt b/src/com/android/r0dumpmanager/domain/config/R0dumpConfigRegistry.kt
+new file mode 100644
+index 0000000..8a5bdaf
+--- /dev/null
++++ b/src/com/android/r0dumpmanager/domain/config/R0dumpConfigRegistry.kt
+@@ -0,0 +1,16 @@
++package com.android.r0dumpmanager.domain.config
++
++import com.android.r0dumpmanager.domain.operation.SystemOperation
++
++object R0dumpConfigRegistry {
++    val operations = listOf(
++        SystemOperation.ReloadCurrentProperties,
++        SystemOperation.LaunchTarget,
++        SystemOperation.ForceStopTarget,
++        SystemOperation.PublishDisabledConfig,
++        SystemOperation.RestoreDefaults,
++        SystemOperation.CopyAdbCommands,
++    )
++
++    val groups: List<ConfigGroup> = emptyList()
++}
+diff --git a/src/com/android/r0dumpmanager/domain/log/ConfigLog.kt b/src/com/android/r0dumpmanager/domain/log/ConfigLog.kt
+new file mode 100644
+index 0000000..56dee0d
+--- /dev/null
++++ b/src/com/android/r0dumpmanager/domain/log/ConfigLog.kt
+@@ -0,0 +1,20 @@
++package com.android.r0dumpmanager.domain.log
++
++data class ConfigLog(
++    val timestamp: Long,
++    val applicationId: String,
++    val packageName: String,
++    val type: LogType,
++    val key: String?,
++    val oldValue: String?,
++    val newValue: String?,
++    val result: Boolean,
++    val message: String?,
++)
++
++enum class LogType {
++    CONFIG_CHANGE,
++    OPERATION,
++    ERROR,
++    RUNTIME_EVENT,
++}
+diff --git a/src/com/android/r0dumpmanager/domain/operation/SystemOperation.kt b/src/com/android/r0dumpmanager/domain/operation/SystemOperation.kt
+new file mode 100644
+index 0000000..a33aa96
+--- /dev/null
++++ b/src/com/android/r0dumpmanager/domain/operation/SystemOperation.kt
+@@ -0,0 +1,15 @@
++package com.android.r0dumpmanager.domain.operation
++
++sealed class SystemOperation(
++    val id: String,
++    val title: String,
++    val description: String,
++    val destructive: Boolean = false,
++) {
++    object PublishDisabledConfig : SystemOperation("publish_disabled", "Stop Dump", "Stop the active broker session")
++    object RestoreDefaults : SystemOperation("restore_defaults", "Restore Defaults", "Stop the active broker session", destructive = true)
++    object ReloadCurrentProperties : SystemOperation("reload_properties", "Reload Configuration", "Re-read broker status")
++    object LaunchTarget : SystemOperation("launch_target", "Launch Target", "Start selected application")
++    object ForceStopTarget : SystemOperation("force_stop_target", "Force-stop Target", "Stop selected application", destructive = true)
++    object CopyAdbCommands : SystemOperation("copy_adb", "Copy adb Commands", "Copy read-only diagnostics")
++}
+diff --git a/src/com/android/r0dumpmanager/ui/MainScreen.kt b/src/com/android/r0dumpmanager/ui/MainScreen.kt
+new file mode 100644
+index 0000000..5e4f57c
+--- /dev/null
++++ b/src/com/android/r0dumpmanager/ui/MainScreen.kt
+@@ -0,0 +1,1123 @@
++package com.android.r0dumpmanager.ui
++
++import android.content.ClipData
++import android.content.ClipboardManager
++import android.content.Context
++import android.widget.ImageView
++import androidx.compose.animation.AnimatedVisibility
++import androidx.compose.animation.animateContentSize
++import androidx.compose.animation.fadeIn
++import androidx.compose.animation.fadeOut
++import androidx.compose.foundation.background
++import androidx.compose.foundation.clickable
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.ColumnScope
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.Spacer
++import androidx.compose.foundation.layout.WindowInsets
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.heightIn
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.safeDrawing
++import androidx.compose.foundation.layout.size
++import androidx.compose.foundation.lazy.LazyColumn
++import androidx.compose.foundation.lazy.items
++import androidx.compose.foundation.shape.CircleShape
++import androidx.compose.foundation.text.KeyboardOptions
++import androidx.compose.material3.Button
++import androidx.compose.material3.Card
++import androidx.compose.material3.AlertDialog
++import androidx.compose.material3.DropdownMenu
++import androidx.compose.material3.DropdownMenuItem
++import androidx.compose.material3.HorizontalDivider
++import androidx.compose.material3.LinearProgressIndicator
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.NavigationBar
++import androidx.compose.material3.NavigationBarItem
++import androidx.compose.material3.OutlinedButton
++import androidx.compose.material3.OutlinedTextField
++import androidx.compose.material3.Scaffold
++import androidx.compose.material3.SnackbarHost
++import androidx.compose.material3.SnackbarHostState
++import androidx.compose.material3.Surface
++import androidx.compose.material3.Switch
++import androidx.compose.material3.Text
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.collectAsState
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.saveable.rememberSaveable
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.draw.clip
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.hapticfeedback.HapticFeedbackType
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.platform.LocalDensity
++import androidx.compose.ui.platform.LocalHapticFeedback
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.text.input.KeyboardType
++import androidx.compose.ui.text.style.TextOverflow
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.viewinterop.AndroidView
++import androidx.navigation.compose.NavHost
++import androidx.navigation.compose.composable
++import androidx.navigation.compose.currentBackStackEntryAsState
++import androidx.navigation.compose.rememberNavController
++import com.android.r0dumpmanager.app.R0dumpManagerViewModel
++import com.android.r0dumpmanager.app.R0dumpUiState
++import com.android.r0dumpmanager.domain.config.ApplyMode
++import com.android.r0dumpmanager.domain.config.ConfigApplication
++import com.android.r0dumpmanager.domain.config.ConfigState
++import com.android.r0dumpmanager.domain.config.DumpPointRegistry
++import com.android.r0dumpmanager.domain.config.R0dumpConfigRegistry
++import com.android.r0dumpmanager.domain.log.ConfigLog
++import com.android.r0dumpmanager.domain.log.LogType
++import com.android.r0dumpmanager.domain.operation.SystemOperation
++import com.android.r0dumpmanager.ui.theme.successColor
++import com.android.r0dumpmanager.ui.theme.warningColor
++import java.text.DateFormat
++import java.util.Calendar
++import java.util.Date
++
++private enum class MainTab(val route: String, val title: String, val marker: String) {
++    Config("config", "Config", "⚙"),
++    Logs("logs", "Logs", "≡"),
++    Actions("actions", "Actions", "◉"),
++}
++
++private enum class LogFilter(val title: String) {
++    All("All"),
++    Config("Config"),
++    Action("Action"),
++    Error("Error"),
++}
++
++private enum class ActionSection(val title: String) {
++    General("General"),
++    Maintenance("Maintenance"),
++    Reset("Reset"),
++    Debug("Debug"),
++}
++
++@Composable
++fun MainScreen(viewModel: R0dumpManagerViewModel) {
++    val state by viewModel.uiState.collectAsState()
++    val navController = rememberNavController()
++    val backStackEntry by navController.currentBackStackEntryAsState()
++    val selectedRoute = backStackEntry?.destination?.route ?: MainTab.Config.route
++    val snackbarHostState = remember { SnackbarHostState() }
++
++    LaunchedEffect(state.messageSerial) {
++        val message = state.message
++        val messageSerial = state.messageSerial
++        if (messageSerial > 0L && !message.isNullOrBlank()) {
++            snackbarHostState.showSnackbar(message)
++            viewModel.consumeMessage(messageSerial)
++        }
++    }
++
++    Scaffold(
++        contentWindowInsets = WindowInsets.safeDrawing,
++        snackbarHost = { SnackbarHost(snackbarHostState) },
++        bottomBar = {
++            NavigationBar {
++                MainTab.values().forEach { tab ->
++                    NavigationBarItem(
++                        selected = selectedRoute == tab.route,
++                        onClick = {
++                            navController.navigate(tab.route) {
++                                popUpTo(navController.graph.startDestinationId) {
++                                    saveState = true
++                                }
++                                launchSingleTop = true
++                                restoreState = true
++                            }
++                        },
++                        icon = { Text(tab.marker) },
++                        label = { Text(tab.title) },
++                    )
++                }
++            }
++        },
++    ) { padding ->
++        Surface(
++            modifier = Modifier
++                .fillMaxSize()
++                .padding(padding),
++            color = MaterialTheme.colorScheme.background,
++        ) {
++            NavHost(
++                navController = navController,
++                startDestination = MainTab.Config.route,
++                enterTransition = { fadeIn() },
++                exitTransition = { fadeOut() },
++                popEnterTransition = { fadeIn() },
++                popExitTransition = { fadeOut() },
++            ) {
++                composable(MainTab.Config.route) { ConfigScreen(state, viewModel) }
++                composable(MainTab.Logs.route) { LogsScreen(state, viewModel) }
++                composable(MainTab.Actions.route) { ActionsScreen(state, viewModel) }
++            }
++        }
++    }
++}
++
++@Composable
++private fun PageHeader(title: String, subtitle: String, context: String? = null) {
++    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
++        Text(title, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
++        Text(subtitle, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
++        if (!context.isNullOrBlank()) {
++            Text(
++                context,
++                style = MaterialTheme.typography.labelLarge,
++                color = MaterialTheme.colorScheme.primary,
++                maxLines = 1,
++                overflow = TextOverflow.Ellipsis,
++            )
++        }
++    }
++}
++
++@Composable
++private fun ConfigScreen(state: R0dumpUiState, viewModel: R0dumpManagerViewModel) {
++    val editingEnabled = state.configState != ConfigState.Updating && !state.actionInFlight
++    LazyColumn(
++        modifier = Modifier.fillMaxSize(),
++        contentPadding = androidx.compose.foundation.layout.PaddingValues(16.dp),
++        verticalArrangement = Arrangement.spacedBy(16.dp),
++    ) {
++        item { PageHeader("Configuration", "R0dump broker") }
++        item { ApplicationSelector(state.applications, state.selectedApplication, viewModel::selectApplication, editingEnabled) }
++        item { RuntimeCard(state, viewModel) }
++        item { DumpPointsCard(state, viewModel) }
++        item { LegacyExternalCard(state) }
++        item { PropertySnapshotCard(state) }
++    }
++}
++
++private const val MaxVisibleApplications = 80
++
++@Composable
++private fun ApplicationSelector(
++    applications: List<ConfigApplication>,
++    selected: ConfigApplication?,
++    onSelected: (ConfigApplication) -> Unit,
++    enabled: Boolean = true,
++) {
++    var expanded by remember { mutableStateOf(false) }
++    var query by rememberSaveable { mutableStateOf("") }
++    val trimmedQuery = query.trim()
++    val filteredApplications = remember(applications, trimmedQuery) {
++        if (trimmedQuery.isEmpty()) {
++            applications
++        } else {
++            applications.filter { app ->
++                app.label.contains(trimmedQuery, ignoreCase = true) ||
++                    app.packageName.contains(trimmedQuery, ignoreCase = true)
++            }
++        }
++    }
++    val visibleApplications = filteredApplications.take(MaxVisibleApplications)
++
++    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
++        Text("Application", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary)
++        Box {
++            Card(
++                modifier = Modifier
++                    .fillMaxWidth()
++                    .clickable(enabled = enabled) { expanded = true },
++                shape = MaterialTheme.shapes.large,
++            ) {
++                Row(
++                    modifier = Modifier.padding(16.dp),
++                    horizontalArrangement = Arrangement.spacedBy(12.dp),
++                    verticalAlignment = Alignment.CenterVertically,
++                ) {
++                    AppIcon(selected?.label ?: selected?.packageName ?: "?", selected?.packageName)
++                    Column(Modifier.weight(1f)) {
++                        Text(selected?.label ?: "No target", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Medium)
++                        Text(selected?.targetSubtitle() ?: "Select a launchable app", color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
++                    }
++                }
++            }
++            DropdownMenu(
++                expanded = expanded && enabled,
++                onDismissRequest = { expanded = false },
++                modifier = Modifier.heightIn(max = 420.dp),
++            ) {
++                OutlinedTextField(
++                    value = query,
++                    onValueChange = { query = it },
++                    enabled = enabled,
++                    label = { Text("Search apps") },
++                    singleLine = true,
++                    modifier = Modifier
++                        .fillMaxWidth()
++                        .padding(horizontal = 12.dp, vertical = 8.dp),
++                )
++                if (visibleApplications.isEmpty()) {
++                    Text(
++                        "No matching applications",
++                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
++                        color = MaterialTheme.colorScheme.onSurfaceVariant,
++                    )
++                } else {
++                    visibleApplications.forEach { app ->
++                        DropdownMenuItem(
++                            text = {
++                                Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
++                                    AppIcon(app.label.ifBlank { app.packageName }, app.packageName)
++                                    Column(Modifier.fillMaxWidth()) {
++                                        Text(app.label, maxLines = 1, overflow = TextOverflow.Ellipsis)
++                                        Text(app.targetSubtitle(), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 2, overflow = TextOverflow.Ellipsis)
++                                    }
++                                }
++                            },
++                            onClick = {
++                                expanded = false
++                                query = ""
++                                onSelected(app)
++                            },
++                            enabled = enabled,
++                        )
++                    }
++                    if (filteredApplications.size > visibleApplications.size) {
++                        Text(
++                            "Showing ${visibleApplications.size} of ${filteredApplications.size}; refine search to narrow results",
++                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
++                            style = MaterialTheme.typography.labelMedium,
++                            color = MaterialTheme.colorScheme.onSurfaceVariant,
++                        )
++                    }
++                }
++            }
++        }
++    }
++}
++
++private fun ConfigApplication.targetSubtitle(): String =
++    if (launchable) packageName else "$packageName · no launcher activity"
++
++private fun ConfigApplication.contextLabel(): String =
++    if (label == packageName) packageName else "$label · $packageName"
++
++@Composable
++private fun AppIcon(text: String, packageName: String?) {
++    val context = LocalContext.current
++    val density = LocalDensity.current
++    val paddingPx = with(density) { 6.dp.roundToPx() }
++    val icon = remember(packageName) {
++        packageName?.let { name ->
++            runCatching { context.packageManager.getApplicationIcon(name) }.getOrNull()
++        }
++    }
++
++    if (icon == null) {
++        AppMonogram(text)
++        return
++    }
++
++    AndroidView(
++        modifier = Modifier
++            .size(40.dp)
++            .clip(CircleShape)
++            .background(MaterialTheme.colorScheme.primaryContainer),
++        factory = { viewContext ->
++            ImageView(viewContext).apply {
++                scaleType = ImageView.ScaleType.CENTER_INSIDE
++                setPadding(paddingPx, paddingPx, paddingPx, paddingPx)
++            }
++        },
++        update = { imageView ->
++            imageView.setPadding(paddingPx, paddingPx, paddingPx, paddingPx)
++            imageView.setImageDrawable(icon.constantState?.newDrawable() ?: icon)
++        },
++    )
++}
++
++@Composable
++private fun AppMonogram(text: String) {
++    val marker = text.firstOrNull { it.isLetterOrDigit() }?.uppercaseChar()?.toString() ?: "?"
++    Box(
++        modifier = Modifier
++            .size(40.dp)
++            .background(MaterialTheme.colorScheme.primaryContainer, CircleShape),
++        contentAlignment = Alignment.Center,
++    ) {
++        Text(
++            marker,
++            style = MaterialTheme.typography.titleMedium,
++            color = MaterialTheme.colorScheme.onPrimaryContainer,
++            fontWeight = FontWeight.SemiBold,
++        )
++    }
++}
++
++@Composable
++private fun RuntimeCard(state: R0dumpUiState, viewModel: R0dumpManagerViewModel) {
++    val updating = state.configState == ConfigState.Updating || state.actionInFlight
++    val canPublish = state.canPublish && !updating
++    val haptic = LocalHapticFeedback.current
++    LaunchedEffect(state.configState) {
++        when (state.configState) {
++            ConfigState.Success,
++            is ConfigState.Error -> haptic.performHapticFeedback(HapticFeedbackType.LongPress)
++            ConfigState.Idle,
++            ConfigState.Updating -> Unit
++        }
++    }
++    GroupCard(title = "Runtime") {
++        ConfigRow("Dump Status", state.dumpStatusDescription().withApplyModeHint(ApplyMode.PROCESS_RESTART)) {
++            Text(
++                if (state.enabled) "ON" else "OFF",
++                color = if (state.enabled) successColor() else MaterialTheme.colorScheme.onSurfaceVariant,
++                fontWeight = FontWeight.Medium,
++            )
++        }
++        DividerInset()
++        ConfigRow("Enable Dump", "Publish Fusion config and launch target".withApplyModeHint(ApplyMode.PROCESS_RESTART)) {
++            Button(onClick = viewModel::startDump, enabled = canPublish) { Text("Start") }
++        }
++        DividerInset()
++        ConfigRow("Force-stop before launch", "Required when target process is already alive") {
++            Switch(checked = state.forceStopBeforeLaunch, onCheckedChange = viewModel::setForceStopBeforeLaunch, enabled = !updating)
++        }
++        if (!state.forceStopBeforeLaunch) {
++            Text(
++                "Warning: an already-running target process may not read this new config until it restarts.",
++                style = MaterialTheme.typography.labelMedium,
++                color = warningColor(),
++                modifier = Modifier.padding(start = 40.dp, top = 4.dp, bottom = 4.dp),
++            )
++        }
++        DividerInset()
++        ConfigRow("Current mask", "${state.maskText} · ${state.selectedBits.size}/28 points".withApplyModeHint(ApplyMode.PROCESS_RESTART)) {
++            OutlinedButton(onClick = viewModel::stopDump, enabled = state.canStop && !updating) { Text("Stop") }
++        }
++        DividerInset()
++        ConfigRow("Generation", if (state.generationStable) "stable even generation" else "updating or incomplete odd generation") {
++            Text(
++                state.generationText,
++                color = if (state.generationStable) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error,
++                fontWeight = FontWeight.Medium,
++            )
++        }
++        if (!state.canPublish) {
++            DividerInset()
++            Text(
++                "Capture controls are unavailable until the broker is ready and allows publishing.",
++                style = MaterialTheme.typography.labelMedium,
++                color = warningColor(),
++            )
++        }
++        StateLine(state.configState)
++    }
++}
++
++@Composable
++private fun DumpPointsCard(state: R0dumpUiState, viewModel: R0dumpManagerViewModel) {
++    val editingEnabled = state.canPublish && state.configState != ConfigState.Updating && !state.actionInFlight
++    CollapsibleGroupCard(
++        title = "Dump Points",
++        summary = "${state.selectedBits.size}/28 selected · ${state.maskText} · ${ApplyMode.PROCESS_RESTART.uiHint}",
++        defaultExpanded = false,
++    ) {
++        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
++            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
++                OutlinedButton(onClick = { viewModel.applyPreset("key") }, enabled = editingEnabled, modifier = Modifier.weight(1f)) { Text("Key 3") }
++                OutlinedButton(onClick = { viewModel.applyPreset("active") }, enabled = editingEnabled, modifier = Modifier.weight(1f)) { Text("Active") }
++            }
++            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
++                OutlinedButton(onClick = { viewModel.applyPreset("all") }, enabled = editingEnabled, modifier = Modifier.weight(1f)) { Text("All") }
++                OutlinedButton(onClick = { viewModel.applyPreset("off") }, enabled = editingEnabled, modifier = Modifier.weight(1f)) { Text("Off") }
++            }
++        }
++        Spacer(Modifier.height(8.dp))
++        InlineCollapsibleSection(
++            title = "Point List",
++            summary = "28 alphabeta-ordered hooks; ${ApplyMode.PROCESS_RESTART.uiHint}",
++            defaultExpanded = false,
++        ) {
++            DumpPointRegistry.points.forEachIndexed { index, point ->
++                ConfigRow(point.shortName, point.displayName) {
++                    Switch(checked = point.bit in state.selectedBits, onCheckedChange = { viewModel.toggleDumpPoint(point.bit) }, enabled = editingEnabled)
++                }
++                if (index != DumpPointRegistry.points.lastIndex) DividerInset()
++            }
++        }
++    }
++}
++
++@Composable
++private fun LegacyExternalCard(state: R0dumpUiState) {
++    GroupCard(title = "Legacy External") {
++        ConfigRow("Private reader", state.privateReaderStatus) {}
++        if (state.privateReader.canRead) {
++            DividerInset()
++            ConfigRow(
++                "Verified private store",
++                "${state.privateReader.runs.size} runs · index ${state.privateReader.indexGeneration ?: "<unavailable>"}",
++            ) {}
++        }
++        DividerInset()
++        ConfigRow("Legacy external", "Read-only; never used as a private-reader fallback") {}
++    }
++}
++
++@Composable
++private fun PropertySnapshotCard(state: R0dumpUiState) {
++    val status = state.brokerStatus
++    CollapsibleGroupCard(
++        title = "Broker Status",
++        summary = if (status == null) "r0dump service unavailable" else "generation ${status.generation}",
++        defaultExpanded = false,
++    ) {
++        ConfigRow("Active", if (status?.active == true) "yes" else "no") {}
++        DividerInset()
++        ConfigRow("Run ID", status?.runId?.toString() ?: "<unavailable>") {}
++        DividerInset()
++        ConfigRow("Generation", status?.generation?.toString() ?: "<unavailable>") {}
++        DividerInset()
++        ConfigRow("Target", status?.packageName ?: "<none>") {}
++        DividerInset()
++        ConfigRow("Broker ready", status?.ready?.toString() ?: "<unavailable>") {}
++        DividerInset()
++        ConfigRow("Publish allowed", status?.publishAllowed?.toString() ?: "<unavailable>") {}
++        DividerInset()
++        ConfigRow("Recovery", status?.recoveryState?.name ?: "UNKNOWN") {}
++    }
++}
++
++@Composable
++private fun LogsScreen(state: R0dumpUiState, viewModel: R0dumpManagerViewModel) {
++    var filter by rememberSaveable { mutableStateOf(LogFilter.All) }
++    LazyColumn(
++        modifier = Modifier.fillMaxSize(),
++        contentPadding = androidx.compose.foundation.layout.PaddingValues(16.dp),
++        verticalArrangement = Arrangement.spacedBy(14.dp),
++    ) {
++        item { PageHeader("Logs", "Configuration history", state.selectedApplication?.contextLabel()) }
++        item { CompactTargetSelectorCard(state.applications, state.selectedApplication, viewModel::selectApplication, state.configState != ConfigState.Updating && !state.actionInFlight) }
++        item { Button(onClick = viewModel::reloadCurrentProperties, enabled = state.configState != ConfigState.Updating && !state.actionInFlight && state.selectedApplication != null) { Text("Refresh") } }
++        item {
++            RuntimeLogcatCard(state.runtimeLogs)
++        }
++        item {
++            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
++                LogFilter.values().forEach { candidate ->
++                    val onClick = { filter = candidate }
++                    if (filter == candidate) {
++                        Button(onClick = onClick) { Text(candidate.title) }
++                    } else {
++                        OutlinedButton(onClick = onClick) { Text(candidate.title) }
++                    }
++                }
++            }
++        }
++        item { Text("Audit", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary) }
++        val visibleAuditLogs = state.auditLogs.filter { log ->
++            state.selectedApplication == null || log.packageName == state.selectedApplication.packageName
++        }.filter { log ->
++            when (filter) {
++                LogFilter.All -> true
++                LogFilter.Config -> log.type == LogType.CONFIG_CHANGE
++                LogFilter.Action -> log.type == LogType.OPERATION
++                LogFilter.Error -> log.type == LogType.ERROR || !log.result
++            }
++        }
++        if (visibleAuditLogs.isEmpty()) {
++            item { Text("No audit logs", color = MaterialTheme.colorScheme.onSurfaceVariant) }
++        } else {
++            visibleAuditLogs.groupBy { logDayLabel(it.timestamp) }.forEach { (dayLabel, dayLogs) ->
++                item {
++                    Text(
++                        dayLabel,
++                        style = MaterialTheme.typography.labelLarge,
++                        color = MaterialTheme.colorScheme.primary,
++                    )
++                }
++                items(dayLogs) { log -> AuditLogRow(log) }
++            }
++        }
++    }
++}
++
++@Composable
++private fun RuntimeLogcatCard(lines: List<String>) {
++    CollapsibleGroupCard(
++        title = "Runtime logcat · r0dump",
++        summary = if (lines.isEmpty()) "No runtime logcat entries" else "${lines.size} lines · expand to inspect",
++        defaultExpanded = false,
++    ) {
++        if (lines.isEmpty()) {
++            Text("No runtime logcat entries", color = MaterialTheme.colorScheme.onSurfaceVariant)
++        } else {
++            lines.forEachIndexed { index, line ->
++                Text(
++                    line,
++                    style = MaterialTheme.typography.bodySmall,
++                    maxLines = 2,
++                    overflow = TextOverflow.Ellipsis,
++                )
++                if (index != lines.lastIndex) Spacer(Modifier.height(4.dp))
++            }
++        }
++    }
++}
++
++@Composable
++private fun ActionsScreen(state: R0dumpUiState, viewModel: R0dumpManagerViewModel) {
++    val haptic = LocalHapticFeedback.current
++    val context = LocalContext.current
++    var pendingOperation by remember { mutableStateOf<SystemOperation?>(null) }
++    val targetPackage = state.selectedApplication?.packageName ?: "<package>"
++    val operations = state.selectedApplication?.operations ?: R0dumpConfigRegistry.operations
++    val targetLaunchable = state.selectedApplication?.launchable == true
++    val adbCommands = remember(state, targetPackage, targetLaunchable) {
++        buildAdbCommands(state, targetPackage, targetLaunchable)
++    }
++    val adbCommandLineCount = remember(adbCommands) { adbCommands.lineSequence().count() }
++
++    fun runOperation(operation: SystemOperation) {
++        if (state.configState == ConfigState.Updating || state.actionInFlight || state.selectedApplication == null) return
++        when (operation) {
++            SystemOperation.ReloadCurrentProperties -> viewModel.reloadCurrentProperties()
++            SystemOperation.LaunchTarget -> viewModel.launchTarget()
++            SystemOperation.ForceStopTarget -> {
++                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
++                viewModel.forceStopTarget()
++            }
++            SystemOperation.PublishDisabledConfig -> viewModel.stopDump()
++            SystemOperation.RestoreDefaults -> {
++                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
++                viewModel.restoreDefaults()
++            }
++            SystemOperation.CopyAdbCommands -> {
++                copyTextToClipboard(context, "r0dump adb commands", adbCommands)
++                viewModel.recordAdbCommandsCopied()
++            }
++        }
++    }
++
++    fun requestOperation(operation: SystemOperation) {
++        if (state.configState == ConfigState.Updating || state.actionInFlight || state.selectedApplication == null) return
++        if (operation.destructive) {
++            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
++            pendingOperation = operation
++        } else {
++            runOperation(operation)
++        }
++    }
++
++    pendingOperation?.let { operation ->
++        AlertDialog(
++            onDismissRequest = { pendingOperation = null },
++            title = { Text(operation.title) },
++            text = { Text("${operation.description}\n\nTarget: ${state.selectedApplication?.contextLabel() ?: "No target selected"}") },
++            confirmButton = {
++                Button(
++                    onClick = {
++                        pendingOperation = null
++                        runOperation(operation)
++                    },
++                ) {
++                    Text("Confirm")
++                }
++            },
++            dismissButton = {
++                OutlinedButton(onClick = { pendingOperation = null }) {
++                    Text("Cancel")
++                }
++            },
++        )
++    }
++
++    val sections = ActionSection.values().mapNotNull { section ->
++        val sectionOperations = operations.filter { it.section == section }
++        if (sectionOperations.isEmpty()) null else section to sectionOperations
++    }
++
++    LazyColumn(
++        modifier = Modifier.fillMaxSize(),
++        contentPadding = androidx.compose.foundation.layout.PaddingValues(16.dp),
++        verticalArrangement = Arrangement.spacedBy(16.dp),
++    ) {
++        item { PageHeader("Actions", "System operations", state.selectedApplication?.contextLabel()) }
++        item { CompactTargetSelectorCard(state.applications, state.selectedApplication, viewModel::selectApplication, state.configState != ConfigState.Updating && !state.actionInFlight) }
++        sections.forEach { (section, sectionOperations) ->
++            if (section == ActionSection.Debug) {
++                item {
++                    CollapsibleGroupCard(
++                        title = section.title,
++                        summary = sectionOperations.joinToString(" · ") { it.title },
++                        defaultExpanded = false,
++                    ) {
++                        sectionOperations.forEachIndexed { index, operation ->
++                            val enabled = state.configState != ConfigState.Updating && !state.actionInFlight && state.selectedApplication != null
++                            val supportText = when {
++                                state.configState == ConfigState.Updating -> "Configuration update is running"
++                                state.actionInFlight -> "Action is running"
++                                state.selectedApplication == null -> "No target selected"
++                                else -> null
++                            }
++                            ActionCard(operation, operation.marker, operation.accentColor(), enabled, supportText) {
++                                requestOperation(operation)
++                            }
++                            if (index != sectionOperations.lastIndex) Spacer(Modifier.height(12.dp))
++                        }
++                        Spacer(Modifier.height(12.dp))
++                        InlineCollapsibleSection(
++                            title = "ADB Command Preview",
++                            summary = "$adbCommandLineCount lines · inspect generated commands before copying",
++                            defaultExpanded = false,
++                        ) {
++                            Text(
++                                adbCommands,
++                                style = MaterialTheme.typography.bodySmall,
++                                color = MaterialTheme.colorScheme.onSurfaceVariant,
++                            )
++                        }
++                    }
++                }
++            } else {
++                item { Text(section.title, style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary) }
++                items(sectionOperations) { operation ->
++                    val enabled = state.configState != ConfigState.Updating &&
++                        !state.actionInFlight &&
++                        state.selectedApplication != null &&
++                        (operation != SystemOperation.LaunchTarget || state.selectedApplication.launchable)
++                    val supportText = when {
++                        state.configState == ConfigState.Updating -> "Configuration update is running"
++                        state.actionInFlight -> "Action is running"
++                        state.selectedApplication == null -> "No target selected"
++                        operation == SystemOperation.LaunchTarget && !state.selectedApplication.launchable -> "No launcher activity"
++                        else -> null
++                    }
++                    ActionCard(operation, operation.marker, operation.accentColor(), enabled, supportText) {
++                        requestOperation(operation)
++                    }
++                }
++            }
++        }
++    }
++}
++
++@Composable
++private fun CompactTargetSelectorCard(
++    applications: List<ConfigApplication>,
++    selected: ConfigApplication?,
++    onSelected: (ConfigApplication) -> Unit,
++    enabled: Boolean = true,
++) {
++    var expanded by rememberSaveable { mutableStateOf(false) }
++    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
++        Text("Target", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary)
++        Card(modifier = Modifier.fillMaxWidth(), shape = MaterialTheme.shapes.large) {
++            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
++                Row(
++                    horizontalArrangement = Arrangement.spacedBy(12.dp),
++                    verticalAlignment = Alignment.CenterVertically,
++                ) {
++                    AppIcon(selected?.label ?: selected?.packageName ?: "?", selected?.packageName)
++                    Column(Modifier.weight(1f)) {
++                        Text(
++                            selected?.label ?: "No target selected",
++                            style = MaterialTheme.typography.titleMedium,
++                            fontWeight = FontWeight.Medium,
++                            maxLines = 1,
++                            overflow = TextOverflow.Ellipsis,
++                        )
++                        Text(
++                            selected?.targetSubtitle() ?: "Select target application",
++                            color = MaterialTheme.colorScheme.onSurfaceVariant,
++                            maxLines = 1,
++                            overflow = TextOverflow.Ellipsis,
++                        )
++                    }
++                    OutlinedButton(onClick = { expanded = !expanded }, enabled = enabled) {
++                        Text(if (expanded) "Hide" else "Change")
++                    }
++                }
++                AnimatedVisibility(visible = expanded && enabled) {
++                    Column {
++                        DividerInset()
++                        ApplicationSelector(
++                            applications = applications,
++                            selected = selected,
++                            onSelected = { application ->
++                                expanded = false
++                                onSelected(application)
++                            },
++                            enabled = enabled,
++                        )
++                    }
++                }
++            }
++        }
++    }
++}
++
++
++private fun buildAdbCommands(state: R0dumpUiState, targetPackage: String, targetLaunchable: Boolean): String {
++    val lines = mutableListOf<String>()
++    lines += "# r0dump broker diagnostics (read-only)"
++    lines += "# Start and Stop are only available through the R0dump Manager broker control API."
++    lines += "adb logcat -s r0dump"
++    lines += "adb shell cmd r0dump status"
++    lines += "# selected target: $targetPackage (${if (targetLaunchable) "launchable" else "no launcher"})"
++    lines += "# broker generation: ${state.generation ?: "unavailable"}"
++    return lines.joinToString("\n")
++}
++
++private val SystemOperation.section: ActionSection
++    get() = when (this) {
++        SystemOperation.ReloadCurrentProperties,
++        SystemOperation.LaunchTarget -> ActionSection.General
++        SystemOperation.ForceStopTarget,
++        SystemOperation.PublishDisabledConfig -> ActionSection.Maintenance
++        SystemOperation.RestoreDefaults -> ActionSection.Reset
++        SystemOperation.CopyAdbCommands -> ActionSection.Debug
++    }
++
++@Composable
++private fun SystemOperation.accentColor(): Color {
++    val warning = warningColor()
++    return when (this) {
++        SystemOperation.RestoreDefaults -> MaterialTheme.colorScheme.error
++        SystemOperation.ForceStopTarget,
++        SystemOperation.PublishDisabledConfig -> warning
++        else -> MaterialTheme.colorScheme.primary
++    }
++}
++
++private val SystemOperation.marker: String
++    get() = when (this) {
++        SystemOperation.ReloadCurrentProperties -> "↻"
++        SystemOperation.LaunchTarget -> "▶"
++        SystemOperation.ForceStopTarget -> "■"
++        SystemOperation.PublishDisabledConfig -> "■"
++        SystemOperation.RestoreDefaults -> "⟳"
++        SystemOperation.CopyAdbCommands -> "{}"
++    }
++
++@Composable
++private fun GroupCard(title: String, content: @Composable ColumnScope.() -> Unit) {
++    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
++        Text(title, style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary)
++        Card(modifier = Modifier.fillMaxWidth(), shape = MaterialTheme.shapes.large) {
++            Column(Modifier.padding(16.dp), content = content)
++        }
++    }
++}
++
++@Composable
++private fun CollapsibleGroupCard(
++    title: String,
++    summary: String,
++    defaultExpanded: Boolean,
++    content: @Composable ColumnScope.() -> Unit,
++) {
++    var expanded by rememberSaveable(title) { mutableStateOf(defaultExpanded) }
++    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
++        Text(title, style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary)
++        Card(
++            modifier = Modifier
++                .fillMaxWidth()
++                .animateContentSize(),
++            shape = MaterialTheme.shapes.large,
++        ) {
++            Column(Modifier.padding(16.dp)) {
++                Row(
++                    modifier = Modifier
++                        .fillMaxWidth()
++                        .clickable { expanded = !expanded },
++                    horizontalArrangement = Arrangement.spacedBy(12.dp),
++                    verticalAlignment = Alignment.CenterVertically,
++                ) {
++                    Column(modifier = Modifier.weight(1f)) {
++                        Text(if (expanded) "Collapse" else "Expand", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
++                        Text(summary, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
++                    }
++                    Text(if (expanded) "▾" else "▸", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary)
++                }
++                AnimatedVisibility(visible = expanded) {
++                    Column {
++                        Spacer(Modifier.height(8.dp))
++                        DividerInset()
++                        content()
++                    }
++                }
++            }
++        }
++    }
++}
++
++@Composable
++private fun InlineCollapsibleSection(
++    title: String,
++    summary: String,
++    defaultExpanded: Boolean,
++    content: @Composable ColumnScope.() -> Unit,
++) {
++    var expanded by rememberSaveable(title) { mutableStateOf(defaultExpanded) }
++    Column(
++        modifier = Modifier
++            .fillMaxWidth()
++            .animateContentSize(),
++    ) {
++        Row(
++            modifier = Modifier
++                .fillMaxWidth()
++                .clickable { expanded = !expanded }
++                .padding(vertical = 8.dp),
++            horizontalArrangement = Arrangement.spacedBy(12.dp),
++            verticalAlignment = Alignment.CenterVertically,
++        ) {
++            Column(Modifier.weight(1f)) {
++                Text(title, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium)
++                Text(summary, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
++            }
++            Text(if (expanded) "Hide" else "Show", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
++        }
++        AnimatedVisibility(visible = expanded) {
++            Column {
++                DividerInset()
++                content()
++            }
++        }
++    }
++}
++
++@Composable
++private fun ConfigRow(title: String, description: String, trailing: @Composable () -> Unit) {
++    Row(
++        modifier = Modifier
++            .fillMaxWidth()
++            .padding(vertical = 8.dp),
++        horizontalArrangement = Arrangement.spacedBy(12.dp),
++        verticalAlignment = Alignment.CenterVertically,
++    ) {
++        Column(modifier = Modifier.weight(1f)) {
++            Text(title, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
++            if (description.isNotBlank()) Text(description, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 2, overflow = TextOverflow.Ellipsis)
++        }
++        trailing()
++    }
++}
++
++@Composable
++private fun DividerInset() {
++    HorizontalDivider(modifier = Modifier.padding(start = 16.dp), color = MaterialTheme.colorScheme.outlineVariant)
++}
++
++@Composable
++private fun StateLine(state: ConfigState) {
++    val text = when (state) {
++        ConfigState.Idle -> "Idle"
++        ConfigState.Updating -> "Updating…"
++        ConfigState.Success -> "Applied"
++        is ConfigState.Error -> "Error: ${state.message}"
++    }
++    val success = successColor()
++    val color = when (state) {
++        ConfigState.Idle -> MaterialTheme.colorScheme.onSurfaceVariant
++        ConfigState.Updating -> MaterialTheme.colorScheme.primary
++        ConfigState.Success -> success
++        is ConfigState.Error -> MaterialTheme.colorScheme.error
++    }
++    Column(verticalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
++        Row(
++            horizontalArrangement = Arrangement.spacedBy(8.dp),
++            verticalAlignment = Alignment.CenterVertically,
++        ) {
++            Box(
++                modifier = Modifier
++                    .size(8.dp)
++                    .background(color, CircleShape),
++            )
++            Text(text, style = MaterialTheme.typography.labelLarge, color = color)
++        }
++        if (state == ConfigState.Updating) {
++            LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
++        }
++    }
++}
++
++@Composable
++private fun AuditLogRow(log: ConfigLog) {
++    val canExpand = log.type == LogType.ERROR || !log.result
++    var expanded by rememberSaveable(log.timestamp, log.key, log.message) { mutableStateOf(false) }
++    Row(
++        horizontalArrangement = Arrangement.spacedBy(12.dp),
++        modifier = Modifier
++            .fillMaxWidth()
++            .clickable(enabled = canExpand) { expanded = !expanded },
++    ) {
++        Text(DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(log.timestamp)), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
++        AuditStatusDot(log)
++        Column(modifier = Modifier.weight(1f)) {
++            Text(log.key?.removePrefix("persist.sys.r0dump.fusion.") ?: log.type.name, fontWeight = FontWeight.Medium)
++            Text(
++                listOfNotNull(log.oldValue, log.newValue).joinToString(" → ").ifBlank { log.message.orEmpty() },
++                color = MaterialTheme.colorScheme.onSurfaceVariant,
++                maxLines = 2,
++                overflow = TextOverflow.Ellipsis,
++            )
++            Text(log.statusText(), style = MaterialTheme.typography.labelMedium, color = log.statusTextColor())
++            if (expanded) {
++                Spacer(Modifier.height(8.dp))
++                Text("Package: ${log.packageName}", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
++                Text("Type: ${log.type.name}", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
++                log.key?.let { Text("Property: $it", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant) }
++                log.message?.takeIf { it.isNotBlank() }?.let {
++                    Text(
++                        it,
++                        style = MaterialTheme.typography.bodySmall,
++                        color = if (log.result) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.error,
++                        maxLines = 4,
++                        overflow = TextOverflow.Ellipsis,
++                    )
++                }
++            }
++        }
++    }
++}
++
++@Composable
++private fun AuditStatusDot(log: ConfigLog) {
++    Box(
++        modifier = Modifier
++            .padding(top = 4.dp)
++            .size(10.dp)
++            .background(log.statusColor(), CircleShape),
++    )
++}
++
++@Composable
++private fun ConfigLog.statusColor(): Color = when {
++    !result || type == LogType.ERROR -> MaterialTheme.colorScheme.error
++    type == LogType.OPERATION -> MaterialTheme.colorScheme.primary
++    type == LogType.RUNTIME_EVENT -> warningColor()
++    else -> successColor()
++}
++
++@Composable
++private fun ConfigLog.statusTextColor(): Color = when {
++    !result || type == LogType.ERROR -> MaterialTheme.colorScheme.error
++    type == LogType.RUNTIME_EVENT -> warningColor()
++    else -> successColor()
++}
++
++private fun ConfigLog.statusText(): String = when {
++    !result || type == LogType.ERROR -> "Failed"
++    type == LogType.OPERATION -> "Completed"
++    type == LogType.RUNTIME_EVENT -> "Observed"
++    else -> "Applied"
++}
++
++@Composable
++private fun ActionCard(
++    operation: SystemOperation,
++    marker: String,
++    accentColor: Color,
++    enabled: Boolean = true,
++    supportText: String? = null,
++    onClick: () -> Unit,
++) {
++    val effectiveAccent = if (enabled) accentColor else MaterialTheme.colorScheme.onSurfaceVariant
++    val titleColor = if (enabled) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant
++    Card(
++        modifier = Modifier
++            .fillMaxWidth()
++            .clickable(enabled = enabled, onClick = onClick),
++        shape = MaterialTheme.shapes.large,
++    ) {
++        Row(Modifier.padding(20.dp), horizontalArrangement = Arrangement.spacedBy(16.dp), verticalAlignment = Alignment.CenterVertically) {
++            Text(
++                marker,
++                style = MaterialTheme.typography.headlineSmall,
++                color = effectiveAccent,
++                fontWeight = FontWeight.SemiBold,
++            )
++            Column(Modifier.weight(1f)) {
++                Text(
++                    operation.title,
++                    style = MaterialTheme.typography.titleMedium,
++                    color = titleColor,
++                    fontWeight = FontWeight.SemiBold,
++                    maxLines = 1,
++                    overflow = TextOverflow.Ellipsis,
++                )
++                Text(
++                    operation.description,
++                    color = MaterialTheme.colorScheme.onSurfaceVariant,
++                    maxLines = 2,
++                    overflow = TextOverflow.Ellipsis,
++                )
++                Text(
++                    supportText ?: operation.section.title,
++                    style = MaterialTheme.typography.labelMedium,
++                    color = effectiveAccent,
++                    fontWeight = FontWeight.Medium,
++                    maxLines = 1,
++                    overflow = TextOverflow.Ellipsis,
++                )
++            }
++        }
++    }
++}
++
++private fun logDayLabel(timestamp: Long): String {
++    val current = Calendar.getInstance()
++    val target = Calendar.getInstance().apply { timeInMillis = timestamp }
++    val yesterday = Calendar.getInstance().apply { add(Calendar.DAY_OF_YEAR, -1) }
++    return when {
++        current.isSameDay(target) -> "Today"
++        yesterday.isSameDay(target) -> "Yesterday"
++        else -> DateFormat.getDateInstance(DateFormat.MEDIUM).format(Date(timestamp))
++    }
++}
++
++private fun Calendar.isSameDay(other: Calendar): Boolean =
++    get(Calendar.YEAR) == other.get(Calendar.YEAR) &&
++        get(Calendar.DAY_OF_YEAR) == other.get(Calendar.DAY_OF_YEAR)
++
++private fun R0dumpUiState.dumpStatusDescription(): String =
++    if (enabled) "enabled for ${watchPackage ?: selectedApplication?.packageName ?: "<unknown>"}" else "stopped"
++
++private fun formatBytes(bytes: Long): String = when {
++    bytes >= 1024L * 1024L -> "${bytes / (1024L * 1024L)} MB"
++    bytes >= 1024L -> "${bytes / 1024L} KB"
++    else -> "$bytes B"
++}
++
++private fun formatTimestamp(timestamp: Long): String =
++    if (timestamp > 0L) DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT).format(Date(timestamp)) else "No files"
++
++private fun copyTextToClipboard(context: Context, label: String, text: String) {
++    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
++    clipboard.setPrimaryClip(ClipData.newPlainText(label, text))
++}
++
++private fun String?.withApplyModeHint(applyMode: ApplyMode): String {
++    val hint = applyMode.uiHint
++    return listOfNotNull(this?.takeIf { it.isNotBlank() }, hint.takeIf { it.isNotBlank() })
++        .joinToString(" · ")
++}
++
++private val ApplyMode.uiHint: String
++    get() = when (this) {
++        ApplyMode.DIRECT -> "Applied"
++        ApplyMode.PROPERTY_CALLBACK -> "Applied after listener refresh"
++        ApplyMode.INIT_TRIGGER -> "Applied by init trigger"
++        ApplyMode.PROCESS_RESTART -> "Requires target restart"
++    }
+diff --git a/src/com/android/r0dumpmanager/ui/theme/Theme.kt b/src/com/android/r0dumpmanager/ui/theme/Theme.kt
+new file mode 100644
+index 0000000..9208130
+--- /dev/null
++++ b/src/com/android/r0dumpmanager/ui/theme/Theme.kt
+@@ -0,0 +1,71 @@
++package com.android.r0dumpmanager.ui.theme
++
++import android.os.Build
++import androidx.compose.foundation.isSystemInDarkTheme
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.Shapes
++import androidx.compose.material3.Typography
++import androidx.compose.material3.darkColorScheme
++import androidx.compose.material3.dynamicDarkColorScheme
++import androidx.compose.material3.dynamicLightColorScheme
++import androidx.compose.material3.lightColorScheme
++import androidx.compose.runtime.Composable
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.unit.dp
++
++private val LightColors = lightColorScheme(
++    primary = Color(0xFF465D91),
++    primaryContainer = Color(0xFFD9E2FF),
++    onPrimaryContainer = Color(0xFF001A41),
++    background = Color(0xFFFAF8FF),
++    surface = Color(0xFFFAF8FF),
++    surfaceVariant = Color(0xFFEEECF4),
++    outline = Color(0xFF757780),
++    outlineVariant = Color(0xFFC5C6D0),
++)
++
++private val DarkColors = darkColorScheme(
++    primary = Color(0xFFAFC6FF),
++    primaryContainer = Color(0xFF2D4678),
++    background = Color(0xFF121318),
++    surface = Color(0xFF121318),
++    surfaceVariant = Color(0xFF1E2025),
++    outline = Color(0xFF8F909A),
++)
++
++val SuccessColor = Color(0xFF386A20)
++val DarkSuccessColor = Color(0xFF9DD67D)
++val WarningColor = Color(0xFF805500)
++val DarkWarningColor = Color(0xFFFABB63)
++
++@Composable
++fun successColor(): Color = if (isSystemInDarkTheme()) DarkSuccessColor else SuccessColor
++
++@Composable
++fun warningColor(): Color = if (isSystemInDarkTheme()) DarkWarningColor else WarningColor
++
++@Composable
++fun R0dumpManagerTheme(
++    darkTheme: Boolean = isSystemInDarkTheme(),
++    dynamicColor: Boolean = true,
++    content: @Composable () -> Unit,
++) {
++    val context = LocalContext.current
++    val colors = when {
++        dynamicColor && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && darkTheme -> dynamicDarkColorScheme(context)
++        dynamicColor && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> dynamicLightColorScheme(context)
++        darkTheme -> DarkColors
++        else -> LightColors
++    }
++    MaterialTheme(
++        colorScheme = colors,
++        typography = Typography(),
++        shapes = Shapes(
++            small = androidx.compose.foundation.shape.RoundedCornerShape(12.dp),
++            medium = androidx.compose.foundation.shape.RoundedCornerShape(20.dp),
++            large = androidx.compose.foundation.shape.RoundedCornerShape(28.dp),
++        ),
++        content = content,
++    )
++}
+diff --git a/src/com/android/r0dumpmanager/ui/welcome/WelcomeScreen.kt b/src/com/android/r0dumpmanager/ui/welcome/WelcomeScreen.kt
+new file mode 100644
+index 0000000..33bfae8
+--- /dev/null
++++ b/src/com/android/r0dumpmanager/ui/welcome/WelcomeScreen.kt
+@@ -0,0 +1,71 @@
++package com.android.r0dumpmanager.ui.welcome
++
++import android.os.Build
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Spacer
++import androidx.compose.foundation.layout.WindowInsets
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.safeDrawing
++import androidx.compose.foundation.layout.windowInsetsPadding
++import androidx.compose.material3.Card
++import androidx.compose.material3.FilledTonalButton
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.Surface
++import androidx.compose.material3.Text
++import androidx.compose.runtime.Composable
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.unit.dp
++
++@Composable
++fun WelcomeScreen(onEnter: () -> Unit) {
++    Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
++        Column(
++            modifier = Modifier
++                .fillMaxSize()
++                .windowInsetsPadding(WindowInsets.safeDrawing)
++                .padding(24.dp),
++            verticalArrangement = Arrangement.SpaceBetween,
++            horizontalAlignment = Alignment.CenterHorizontally,
++        ) {
++            Spacer(Modifier.height(24.dp))
++            Column(horizontalAlignment = Alignment.CenterHorizontally) {
++                Card(shape = MaterialTheme.shapes.large) {
++                    Text(
++                        text = "R0",
++                        modifier = Modifier.padding(horizontal = 30.dp, vertical = 24.dp),
++                        style = MaterialTheme.typography.headlineLarge,
++                        color = MaterialTheme.colorScheme.primary,
++                        fontWeight = FontWeight.Bold,
++                    )
++                }
++                Spacer(Modifier.height(24.dp))
++                Text("R0dump Manager", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.SemiBold)
++                Text("Android 16 system config control console", color = MaterialTheme.colorScheme.onSurfaceVariant)
++            }
++            Card(modifier = Modifier.fillMaxWidth(), shape = MaterialTheme.shapes.large) {
++                Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
++                    InfoRow("Android", Build.VERSION.RELEASE_OR_CODENAME)
++                    InfoRow("Device", Build.MODEL)
++                    InfoRow("Build", Build.DISPLAY)
++                }
++            }
++            FilledTonalButton(onClick = onEnter, modifier = Modifier.fillMaxWidth()) {
++                Text("Enter configuration")
++            }
++        }
++    }
++}
++
++@Composable
++private fun InfoRow(label: String, value: String) {
++    Column {
++        Text(label, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
++        Text(value, style = MaterialTheme.typography.bodyLarge)
++    }
++}
+diff --git a/tests/AndroidManifest.xml b/tests/AndroidManifest.xml
+new file mode 100644
+index 0000000..5b00497
+--- /dev/null
++++ b/tests/AndroidManifest.xml
+@@ -0,0 +1,7 @@
++<?xml version="1.0" encoding="utf-8"?>
++<manifest xmlns:android="http://schemas.android.com/apk/res/android"
++    package="com.android.r0dumpmanager.tests">
++    <instrumentation
++        android:name="androidx.test.runner.AndroidJUnitRunner"
++        android:targetPackage="com.android.r0dumpmanager" />
++</manifest>
+diff --git a/tests/src/com/android/r0dumpmanager/data/reader/PrivateStoreReaderContractTest.kt b/tests/src/com/android/r0dumpmanager/data/reader/PrivateStoreReaderContractTest.kt
+new file mode 100644
+index 0000000..40548d9
+--- /dev/null
++++ b/tests/src/com/android/r0dumpmanager/data/reader/PrivateStoreReaderContractTest.kt
+@@ -0,0 +1,381 @@
++package com.android.r0dumpmanager.data.reader
++
++import android.os.DeadObjectException
++import android.os.IBinder
++import android.os.ParcelFileDescriptor
++import android.os.RemoteException
++import android.r0dump.R0dumpExportResult
++import android.r0dump.R0dumpExportTicket
++import android.r0dump.R0dumpOperationResult
++import com.android.r0dumpmanager.data.control.RecoveryState
++import java.util.Collections
++import java.util.concurrent.CountDownLatch
++import java.util.concurrent.atomic.AtomicInteger
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class PrivateStoreReaderContractTest {
++    @Test
++    fun exactPrivateStoreBitEnablesReader() {
++        assertTrue(
++            PrivateStoreCapabilities.hasPrivateStoreControl(
++                PrivateStoreCapabilities.CAP_PRIVATE_STORE_CONTROL_V1,
++            ),
++        )
++        assertFalse(PrivateStoreCapabilities.hasPrivateStoreControl(0L))
++        assertFalse(PrivateStoreCapabilities.hasPrivateStoreControl(null))
++    }
++
++    @Test
++    fun unrelatedCapabilityDoesNotEnableReader() {
++        val unrelatedCapability = 1L shl 9
++        assertFalse(PrivateStoreCapabilities.hasPrivateStoreControl(unrelatedCapability))
++        assertEquals(
++            PrivateReaderAvailability.UNAVAILABLE,
++            PrivateReaderGate.state(RecoveryState.READY, unrelatedCapability, 1L).availability,
++        )
++    }
++
++    @Test
++    fun readyWithoutPositiveIndexGenerationDoesNotEnableReader() {
++        val capability = PrivateStoreCapabilities.CAP_PRIVATE_STORE_CONTROL_V1
++        assertFalse(PrivateReaderGate.state(RecoveryState.READY, capability, 0L).canRead)
++        assertFalse(PrivateReaderGate.state(RecoveryState.READY, capability, -1L).canRead)
++        assertTrue(PrivateReaderGate.state(RecoveryState.READY, capability, 1L).canRead)
++    }
++
++    @Test
++    fun unavailableServiceMapsToPrivateStoreUnavailable() {
++        val result = R0dumpPrivateStoreRepository { null }.listRuns(
++            packageName = "com.example.target",
++            expectedIndexGeneration = 0L,
++            cursor = null,
++            pageSize = 20,
++        )
++
++        assertTrue(result.isFailure)
++        assertTrue(result.exceptionOrNull() is PrivateStoreUnavailableException)
++    }
++
++    @Test
++    fun binderDeathClearsToPrivateStoreUnavailable() {
++        val deadAdapter = object : PrivateStoreServiceAdapter {
++            override fun listRuns(
++                packageName: String,
++                expectedIndexGeneration: Long,
++                cursor: String?,
++                pageSize: Int,
++            ): PrivateRunPage = throw DeadObjectException()
++
++            override fun listSessions(
++                packageName: String,
++                runId: Long,
++                expectedIndexGeneration: Long,
++                cursor: String?,
++                pageSize: Int,
++            ): PrivateSessionPage = error("unexpected listSessions")
++
++            override fun listObservations(
++                packageName: String,
++                runId: Long,
++                opaqueSessionId: String,
++                expectedIndexGeneration: Long,
++                cursor: String?,
++                pageSize: Int,
++            ): PrivateObservationPage = error("unexpected listObservations")
++
++            override fun beginExportRun(
++                packageName: String,
++                runId: Long,
++                expectedIndexGeneration: Long,
++                destination: ParcelFileDescriptor,
++                requestId: String,
++                onFinished: (Result<PrivateExportResult>) -> Unit,
++            ): PrivateExportTicket = error("unexpected beginExportRun")
++
++            override fun deleteRun(
++                packageName: String,
++                runId: Long,
++                expectedIndexGeneration: Long,
++                requestId: String,
++            ): PrivateDeleteResult = error("unexpected deleteRun")
++        }
++
++        val result = R0dumpPrivateStoreRepository { deadAdapter }.listRuns(
++            packageName = "com.example.target",
++            expectedIndexGeneration = 1L,
++            cursor = null,
++            pageSize = 20,
++        )
++
++        assertTrue(result.isFailure)
++        assertTrue(result.exceptionOrNull() is PrivateStoreUnavailableException)
++    }
++
++    @Test
++    fun nonOkExportCallbackCompletesExactlyOnce() {
++        val results = mutableListOf<Result<PrivateExportResult>>()
++        val completion = PrivateExportCompletion(
++            onFinished = { results.add(it) },
++            dispatcher = { it() },
++        )
++        val failure = R0dumpExportResult(
++            R0dumpOperationResult.DESTINATION_ERROR,
++            "export-1",
++            "com.example.target",
++            7L,
++            3L,
++            0L,
++            null,
++            true,
++        )
++
++        completion.onBinderResult(failure)
++        completion.onBinderResult(failure)
++        completion.binderDied()
++        assertTrue(results.isEmpty())
++
++        completion.arm(FakePrivateExportDeathMonitor())
++
++        assertEquals(1, results.size)
++        assertTrue(results.single().isFailure)
++        assertEquals(
++            R0dumpOperationResult.DESTINATION_ERROR,
++            (results.single().exceptionOrNull() as PrivateStoreServiceException).error,
++        )
++    }
++
++    @Test
++    fun exportBinderDeathCompletesExactlyOnce() {
++        val results = mutableListOf<Result<PrivateExportResult>>()
++        val completion = PrivateExportCompletion(
++            onFinished = { results.add(it) },
++            dispatcher = { it() },
++        )
++        val monitor = FakePrivateExportDeathMonitor(
++            onLink = { it.binderDied() },
++        )
++
++        completion.arm(monitor)
++        completion.binderDied()
++        completion.onBinderResult(successExportResult())
++
++        assertEquals(1, results.size)
++        assertTrue(results.single().isFailure)
++        assertTrue(results.single().exceptionOrNull() is PrivateStoreUnavailableException)
++        assertEquals(1, monitor.linkCount.get())
++        assertEquals(1, monitor.unlinkCount.get())
++    }
++
++    @Test
++    fun earlyCallbackIsDeliveredOnlyAfterAcceptedTicket() {
++        val results = mutableListOf<Result<PrivateExportResult>>()
++        val monitor = FakePrivateExportDeathMonitor()
++        val starter = PrivateExportStarter(
++            deathMonitor = monitor,
++            dispatcher = { it() },
++        )
++        var deliveredInsideRequest = false
++
++        val ticket = starter.begin(
++            expectedPackageName = "com.example.target",
++            expectedRunId = 7L,
++            expectedIndexGeneration = 3L,
++            onFinished = { results.add(it) },
++        ) { callback ->
++            callback.onFinished(successExportResult())
++            deliveredInsideRequest = results.isNotEmpty()
++            R0dumpExportTicket(
++                R0dumpOperationResult.OK,
++                "export-1",
++                "com.example.target",
++                7L,
++                3L,
++            )
++        }
++
++        assertFalse(deliveredInsideRequest)
++        assertEquals("export-1", ticket.exportId)
++        assertEquals(1, results.size)
++        assertEquals(0, monitor.linkCount.get())
++    }
++
++    @Test
++    fun earlyCallbackIsAbandonedWhenTicketIsRejected() {
++        val results = mutableListOf<Result<PrivateExportResult>>()
++        val monitor = FakePrivateExportDeathMonitor()
++        val starter = PrivateExportStarter(
++            deathMonitor = monitor,
++            dispatcher = { it() },
++        )
++
++        val begin = runCatching {
++            starter.begin(
++                expectedPackageName = "com.example.target",
++                expectedRunId = 7L,
++                expectedIndexGeneration = 3L,
++                onFinished = { results.add(it) },
++            ) { callback ->
++                callback.onFinished(successExportResult())
++                R0dumpExportTicket(
++                    R0dumpOperationResult.UNSUPPORTED,
++                    null,
++                    "com.example.target",
++                    7L,
++                    -1L,
++                )
++            }
++        }
++
++        assertTrue(begin.isFailure)
++        assertTrue(results.isEmpty())
++        assertEquals(0, monitor.linkCount.get())
++    }
++
++    @Test
++    fun malformedAcceptedTicketAbandonsEarlyCallback() {
++        val results = mutableListOf<Result<PrivateExportResult>>()
++        val monitor = FakePrivateExportDeathMonitor()
++        val starter = PrivateExportStarter(
++            deathMonitor = monitor,
++            dispatcher = { it() },
++        )
++
++        val begin = runCatching {
++            starter.begin(
++                expectedPackageName = "com.example.target",
++                expectedRunId = 7L,
++                expectedIndexGeneration = 3L,
++                onFinished = { results.add(it) },
++            ) { callback ->
++                callback.onFinished(successExportResult())
++                R0dumpExportTicket(
++                    R0dumpOperationResult.OK,
++                    null,
++                    "com.example.target",
++                    7L,
++                    3L,
++                )
++            }
++        }
++
++        assertTrue(begin.isFailure)
++        assertEquals(
++            R0dumpOperationResult.CORRUPT,
++            (begin.exceptionOrNull() as PrivateStoreServiceException).error,
++        )
++        assertTrue(results.isEmpty())
++        assertEquals(0, monitor.linkCount.get())
++    }
++
++    @Test
++    fun deathLinkFailureCompletesAsUnavailable() {
++        val results = mutableListOf<Result<PrivateExportResult>>()
++        val completion = PrivateExportCompletion(
++            onFinished = { results.add(it) },
++            dispatcher = { it() },
++        )
++        val monitor = FakePrivateExportDeathMonitor(failLink = true)
++
++        completion.arm(monitor)
++
++        assertEquals(1, results.size)
++        assertTrue(results.single().exceptionOrNull() is PrivateStoreUnavailableException)
++        assertEquals(1, monitor.linkCount.get())
++        assertEquals(0, monitor.unlinkCount.get())
++    }
++
++    @Test
++    fun exportCallbackAndDeathRaceCompletesExactlyOnce() {
++        repeat(100) {
++            val results = Collections.synchronizedList(mutableListOf<Result<PrivateExportResult>>())
++            val completion = PrivateExportCompletion(
++                onFinished = { results.add(it) },
++                dispatcher = { it() },
++            )
++            val monitor = FakePrivateExportDeathMonitor()
++            completion.arm(monitor)
++            val start = CountDownLatch(1)
++            val callbackThread = Thread {
++                start.await()
++                completion.onBinderResult(successExportResult())
++            }
++            val deathThread = Thread {
++                start.await()
++                completion.binderDied()
++            }
++
++            callbackThread.start()
++            deathThread.start()
++            start.countDown()
++            callbackThread.join()
++            deathThread.join()
++
++            assertEquals(1, results.size)
++            assertEquals(1, monitor.unlinkCount.get())
++        }
++    }
++
++    @Test
++    fun exportConsumerFailureDoesNotEscapeCompletionDispatcher() {
++        var callbackCount = 0
++        val completion = PrivateExportCompletion(
++            onFinished = {
++                callbackCount++
++                throw IllegalStateException("consumer failure")
++            },
++            dispatcher = { it() },
++        )
++
++        completion.onBinderResult(successExportResult())
++        completion.arm(FakePrivateExportDeathMonitor())
++
++        assertEquals(1, callbackCount)
++    }
++
++    @Test
++    fun exportDispatcherFailureDoesNotEscapeBinderCallback() {
++        var callbackCount = 0
++        val completion = PrivateExportCompletion(
++            onFinished = { callbackCount++ },
++            dispatcher = { throw IllegalStateException("dispatcher failure") },
++        )
++
++        completion.onBinderResult(successExportResult())
++        completion.arm(FakePrivateExportDeathMonitor())
++        completion.binderDied()
++
++        assertEquals(0, callbackCount)
++    }
++}
++
++private fun successExportResult() = R0dumpExportResult(
++    R0dumpOperationResult.OK,
++    "export-1",
++    "com.example.target",
++    7L,
++    3L,
++    128L,
++    "a".repeat(64),
++    false,
++)
++
++private class FakePrivateExportDeathMonitor(
++    private val failLink: Boolean = false,
++    private val onLink: ((IBinder.DeathRecipient) -> Unit)? = null,
++) : PrivateExportDeathMonitor {
++    val linkCount = AtomicInteger()
++    val unlinkCount = AtomicInteger()
++
++    override fun link(recipient: IBinder.DeathRecipient) {
++        linkCount.incrementAndGet()
++        if (failLink) throw RemoteException("dead binder")
++        onLink?.invoke(recipient)
++    }
++
++    override fun unlink(recipient: IBinder.DeathRecipient) {
++        unlinkCount.incrementAndGet()
++    }
++}
+diff --git a/tools/final_acceptance.sh b/tools/final_acceptance.sh
+new file mode 100755
+index 0000000..0373a15
+--- /dev/null
++++ b/tools/final_acceptance.sh
+@@ -0,0 +1,128 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++# R0dump Manager final acceptance wrapper.
++#
++# This script intentionally does NOT flash partitions. It is the reproducible
++# post-flash gate to run after the latest system.img has already been installed.
++# By default it is non-destructive: source checks + device/system identity + UI
++# smoke only. Broker mutations are deliberately not driven by this script. Use
++# --preflight-only before flashing to collect
++# current hashes without running the post-flash gate.
++#
++# Examples:
++#   ADB=adb ADB_HOST=127.0.0.1 ADB_PORT=5038 ADB_SERIAL=f5e3adbc \
++#     packages/apps/R0dumpManager/tools/final_acceptance.sh
++
++ADB="${ADB:-adb}"
++ADB_HOST="${ADB_HOST:-127.0.0.1}"
++ADB_PORT="${ADB_PORT:-5038}"
++ADB_SERIAL="${ADB_SERIAL:-f5e3adbc}"
++OUT_DIR="${OUT_DIR:-out/target/product/lemonade}"
++ROOT_DIR="${ROOT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)}"
++TOOLS_DIR="$ROOT_DIR/packages/apps/R0dumpManager/tools"
++ARTIFACT_DIR="${ARTIFACT_DIR:-/tmp/r0dump-manager-final-acceptance-$(date +%Y%m%d-%H%M%S)}"
++ALLOW_START_DUMP=0
++TARGET_PACKAGE="${TARGET_PACKAGE:-com.android.settings}"
++RESET_MANAGER_DATA=0
++PREFLIGHT_ONLY=0
++
++while [[ $# -gt 0 ]]; do
++  case "$1" in
++    --allow-start-dump)
++      ALLOW_START_DUMP=1
++      shift
++      ;;
++    --target)
++      TARGET_PACKAGE="${2:?missing target package}"
++      shift 2
++      ;;
++    --reset-manager-data)
++      RESET_MANAGER_DATA=1
++      shift
++      ;;
++    --preflight-only)
++      PREFLIGHT_ONLY=1
++      shift
++      ;;
++    --artifact-dir)
++      ARTIFACT_DIR="${2:?missing artifact dir}"
++      shift 2
++      ;;
++    -h|--help)
++      sed -n '1,31p' "$0"
++      exit 0
++      ;;
++    *)
++      echo "unknown argument: $1" >&2
++      exit 2
++      ;;
++  esac
++done
++
++mkdir -p "$ARTIFACT_DIR"
++
++log() { printf '\n== %s ==\n' "$*"; }
++adb_base=("$ADB" -H "$ADB_HOST" -P "$ADB_PORT" -s "$ADB_SERIAL")
++adb_device() { "${adb_base[@]}" "$@"; }
++
++log "tool configuration"
++{
++  echo "ROOT_DIR=$ROOT_DIR"
++  echo "OUT_DIR=$OUT_DIR"
++  echo "ADB=$ADB"
++  echo "ADB_ENDPOINT=$ADB_HOST:$ADB_PORT"
++  echo "ADB_SERIAL=$ADB_SERIAL"
++  echo "ARTIFACT_DIR=$ARTIFACT_DIR"
++  echo "TARGET_PACKAGE=$TARGET_PACKAGE"
++  echo "ALLOW_START_DUMP=$ALLOW_START_DUMP"
++  echo "RESET_MANAGER_DATA=$RESET_MANAGER_DATA"
++  echo "PREFLIGHT_ONLY=$PREFLIGHT_ONLY"
++} | tee "$ARTIFACT_DIR/final_acceptance_config.txt"
++
++log "source contracts"
++"$TOOLS_DIR/validate_source_contracts.sh" | tee "$ARTIFACT_DIR/source_contracts.txt"
++
++log "local artifact hashes"
++sha256sum \
++  "$OUT_DIR/system.img" \
++  "$OUT_DIR/system/priv-app/R0dumpManager/R0dumpManager.apk" \
++  "$OUT_DIR/system/etc/selinux/plat_sepolicy.cil" \
++  "$OUT_DIR/system/etc/permissions/privapp-permissions-com.android.r0dumpmanager.xml" \
++  | tee "$ARTIFACT_DIR/local_hashes.txt"
++
++if [[ "$PREFLIGHT_ONLY" -eq 1 ]]; then
++  log "device preflight hashes"
++  {
++    "$ADB" -H "$ADB_HOST" -P "$ADB_PORT" devices -l || true
++    adb_device shell 'sha256sum /system/priv-app/R0dumpManager/R0dumpManager.apk 2>/dev/null || true' || true
++    adb_device shell 'sha256sum /system/etc/selinux/plat_sepolicy.cil 2>/dev/null || true' || true
++    adb_device shell 'sha256sum /system/etc/permissions/privapp-permissions-com.android.r0dumpmanager.xml 2>/dev/null || true' || true
++  } | tee "$ARTIFACT_DIR/device_preflight_hashes.txt"
++  log "preflight summary"
++  cat <<SUMMARY | tee "$ARTIFACT_DIR/summary.txt"
++PASS: R0dumpManager final acceptance preflight completed
++Artifacts: $ARTIFACT_DIR
++Post-flash validation: skipped by --preflight-only
++SUMMARY
++  exit 0
++fi
++
++log "post-flash manager validation"
++post_args=(--require-system-match --target "$TARGET_PACKAGE" --artifact-dir "$ARTIFACT_DIR/post_flash")
++if [[ "$RESET_MANAGER_DATA" -eq 1 ]]; then
++  post_args+=(--reset-manager-data)
++fi
++if [[ "$ALLOW_START_DUMP" -eq 1 ]]; then
++  post_args+=(--allow-start-dump)
++fi
++ADB="$ADB" ADB_HOST="$ADB_HOST" ADB_PORT="$ADB_PORT" ADB_SERIAL="$ADB_SERIAL" \
++  OUT_DIR="$OUT_DIR" "$TOOLS_DIR/validate_post_flash.sh" "${post_args[@]}" \
++  | tee "$ARTIFACT_DIR/post_flash_validation.txt"
++
++log "final acceptance summary"
++cat <<SUMMARY | tee "$ARTIFACT_DIR/summary.txt"
++PASS: R0dumpManager final acceptance wrapper completed
++Artifacts: $ARTIFACT_DIR
++Broker status validation: enabled
++SUMMARY
+diff --git a/tools/validate_post_flash.sh b/tools/validate_post_flash.sh
+new file mode 100755
+index 0000000..040cfa4
+--- /dev/null
++++ b/tools/validate_post_flash.sh
+@@ -0,0 +1,110 @@
++#!/usr/bin/env bash
++# R0dump Manager post-flash validation for the D-110 broker control boundary.
++set -euo pipefail
++
++ADB_BIN="${ADB:-adb}"
++ADB_HOST="${ADB_HOST:-127.0.0.1}"
++ADB_PORT="${ADB_PORT:-5038}"
++ADB_SERIAL="${ADB_SERIAL:-}"
++OUT_DIR="${OUT_DIR:-out/target/product/lemonade}"
++ARTIFACT_DIR="${ARTIFACT_DIR:-/tmp/r0dump-manager-validation}"
++REQUIRE_SYSTEM_MATCH=0
++RESET_MANAGER_DATA=0
++
++while [[ $# -gt 0 ]]; do
++  case "$1" in
++    --require-system-match) REQUIRE_SYSTEM_MATCH=1 ;;
++    --reset-manager-data) RESET_MANAGER_DATA=1 ;;
++    --target|--allow-start-dump)
++      # The Manager owns mutations through Binder; this post-flash check is read-only.
++      [[ "$1" == "--target" ]] && shift
++      ;;
++    --artifact-dir) ARTIFACT_DIR="${2:?missing artifact dir}"; shift ;;
++    -h|--help) sed -n '1,24p' "$0"; exit 0 ;;
++    *) echo "unknown argument: $1" >&2; exit 2 ;;
++  esac
++  shift
++done
++
++mkdir -p "$ARTIFACT_DIR"
++log() { printf '\n== %s ==\n' "$*"; }
++adb_base=("$ADB_BIN" -H "$ADB_HOST" -P "$ADB_PORT")
++adb_host() { "${adb_base[@]}" "$@"; }
++adb_device() {
++  local args=("${adb_base[@]}")
++  [[ -n "$ADB_SERIAL" ]] && args+=(-s "$ADB_SERIAL")
++  args+=("$@")
++  "${args[@]}"
++}
++
++log "explicit adb 5038 contract"
++echo "endpoint=$ADB_HOST:$ADB_PORT" | tee "$ARTIFACT_DIR/adb_endpoint.txt"
++adb_host devices -l | tee "$ARTIFACT_DIR/devices.txt"
++if [[ -z "$ADB_SERIAL" ]]; then
++  ADB_SERIAL="$(awk '$2 == "device" { print $1 }' "$ARTIFACT_DIR/devices.txt")"
++fi
++[[ -n "$ADB_SERIAL" ]] || { echo "FAIL: no device on explicit adb endpoint $ADB_HOST:$ADB_PORT" >&2; exit 1; }
++[[ "$(grep -c "^$ADB_SERIAL[[:space:]]\+device" "$ARTIFACT_DIR/devices.txt")" -eq 1 ]] || {
++  echo "FAIL: expected exactly one device transport for serial $ADB_SERIAL" >&2; exit 1;
++}
++grep "^$ADB_SERIAL[[:space:]]" "$ARTIFACT_DIR/devices.txt" | tee "$ARTIFACT_DIR/device_transport.txt"
++adb_device shell 'cmd package list users >/dev/null' || {
++  echo "FAIL: selected device shell is not ready for package-manager checks" >&2; exit 1;
++}
++
++local_apk="$OUT_DIR/system/priv-app/R0dumpManager/R0dumpManager.apk"
++local_privapp="$OUT_DIR/system/etc/permissions/privapp-permissions-com.android.r0dumpmanager.xml"
++if [[ "$REQUIRE_SYSTEM_MATCH" -eq 1 ]]; then
++  [[ -f "$local_apk" && -f "$local_privapp" ]] || { echo "FAIL: missing local Manager artifacts" >&2; exit 1; }
++  sha256sum "$local_apk" "$local_privapp" | tee "$ARTIFACT_DIR/local_hashes.txt"
++  adb_device shell 'sha256sum /system/priv-app/R0dumpManager/R0dumpManager.apk /system/etc/permissions/privapp-permissions-com.android.r0dumpmanager.xml' \
++    | tr -d '\r' | tee "$ARTIFACT_DIR/device_hashes.txt"
++  grep -q "$(sha256sum "$local_apk" | awk '{print $1}')" "$ARTIFACT_DIR/device_hashes.txt" || {
++    echo "FAIL: device Manager APK does not match local artifact" >&2; exit 1;
++  }
++  grep -q "$(sha256sum "$local_privapp" | awk '{print $1}')" "$ARTIFACT_DIR/device_hashes.txt" || {
++    echo "FAIL: device Manager privapp allowlist does not match local artifact" >&2; exit 1;
++  }
++fi
++
++log "broker binder service and status"
++adb_device shell service check r0dump | tr -d '\r' | tee "$ARTIFACT_DIR/service_check_r0dump.txt"
++grep -Eqi 'found|r0dump' "$ARTIFACT_DIR/service_check_r0dump.txt" || {
++  echo "FAIL: r0dump Binder service is unavailable" >&2; exit 1;
++}
++adb_device shell cmd r0dump status | tr -d '\r' | tee "$ARTIFACT_DIR/broker_status_before.txt"
++[[ -s "$ARTIFACT_DIR/broker_status_before.txt" ]] || { echo "FAIL: r0dump broker returned no status" >&2; exit 1; }
++for status_field in ready publish_allowed recovery_state; do
++  grep -q "${status_field}=" "$ARTIFACT_DIR/broker_status_before.txt" || {
++    echo "FAIL: r0dump broker status omitted $status_field" >&2; exit 1;
++  }
++done
++
++log "manager permission and read-only UI smoke"
++adb_device shell dumpsys package com.android.r0dumpmanager > "$ARTIFACT_DIR/package.txt"
++grep -q 'android.permission.MANAGE_R0DUMP: granted=true' "$ARTIFACT_DIR/package.txt" || {
++  echo "FAIL: MANAGE_R0DUMP is not granted to R0dumpManager" >&2; exit 1;
++}
++if [[ "$RESET_MANAGER_DATA" -eq 1 ]]; then
++  adb_device shell pm clear com.android.r0dumpmanager | tee "$ARTIFACT_DIR/manager_data_reset.txt"
++fi
++adb_device shell am force-stop com.android.r0dumpmanager
++adb_device shell am start -n com.android.r0dumpmanager/.MainActivity >/dev/null
++sleep 2
++adb_device shell uiautomator dump /sdcard/r0dump_manager_broker_status.xml >/dev/null
++adb_device pull /sdcard/r0dump_manager_broker_status.xml "$ARTIFACT_DIR/manager_broker_status.xml" >/dev/null
++grep -q 'Broker Status' "$ARTIFACT_DIR/manager_broker_status.xml" || {
++  echo "FAIL: Manager UI does not expose broker status" >&2; exit 1;
++}
++adb_device shell cmd r0dump status | tr -d '\r' | tee "$ARTIFACT_DIR/broker_status_after.txt"
++for status_field in ready publish_allowed recovery_state; do
++  grep -q "${status_field}=" "$ARTIFACT_DIR/broker_status_after.txt" || {
++    echo "FAIL: post-open r0dump broker status omitted $status_field" >&2; exit 1;
++  }
++done
++cmp -s "$ARTIFACT_DIR/broker_status_before.txt" "$ARTIFACT_DIR/broker_status_after.txt" || {
++  echo "FAIL: read-only Manager open changed broker status" >&2; exit 1;
++}
++
++echo "PASS: R0dumpManager broker post-flash validation completed"
++echo "Artifacts: $ARTIFACT_DIR"
+diff --git a/tools/validate_source_contracts.sh b/tools/validate_source_contracts.sh
+new file mode 100755
+index 0000000..7b1f102
+--- /dev/null
++++ b/tools/validate_source_contracts.sh
+@@ -0,0 +1,224 @@
++#!/usr/bin/env bash
++# Static source-contract checks for the D-110 r0dump Manager broker boundary.
++set -euo pipefail
++
++ROOT_DIR="$(cd "$(dirname "$0")/../../../.." && pwd)"
++APP_DIR="$ROOT_DIR/packages/apps/R0dumpManager"
++
++python3 - "$APP_DIR" <<'PY'
++from pathlib import Path
++import sys
++import xml.etree.ElementTree as ET
++
++app = Path(sys.argv[1])
++errors = []
++
++def read(relative):
++    return (app / relative).read_text()
++
++sources = "\n".join(path.read_text(errors="ignore") for path in (app / "src").rglob("*.kt"))
++control = read("src/com/android/r0dumpmanager/data/control/R0dumpControlRepository.kt")
++view_model = read("src/com/android/r0dumpmanager/app/R0dumpManagerViewModel.kt")
++screen = read("src/com/android/r0dumpmanager/ui/MainScreen.kt")
++reader_models = read("src/com/android/r0dumpmanager/data/reader/PrivateStoreModels.kt")
++reader_repository = read("src/com/android/r0dumpmanager/data/reader/R0dumpPrivateStoreRepository.kt")
++reader_tests = read("tests/src/com/android/r0dumpmanager/data/reader/PrivateStoreReaderContractTest.kt")
++post_flash = read("tools/validate_post_flash.sh")
++final_acceptance = read("tools/final_acceptance.sh")
++
++for forbidden in ("SystemProperties", "AndroidPropertyManager", "R0dumpPropertyStore", "PropertyManager"):
++    if forbidden in sources:
++        errors.append(f"Manager production source must not contain {forbidden}")
++for forbidden in ("schema3", "Schema3", "setprop"):
++    if forbidden in sources:
++        errors.append(f"Manager must not contain legacy external {forbidden} production path")
++
++manager_source = view_model + screen + reader_models
++for required in (
++    "IR0dumpControlService",
++    "ServiceManager.getService(CONTROL_SERVICE)",
++    "R0dumpConfigParcel(CONTROL_SCHEMA_VERSION",
++    "fun status(): Result<BrokerStatus>",
++    "fun publish(",
++    "fun stop(",
++    "fun capabilityMask(): Result<Long>",
++    "R0dumpStatus.RECOVERY_NOT_STARTED",
++    "R0dumpStatus.RECOVERY_INDEXING",
++    "R0dumpStatus.RECOVERY_READY",
++    "R0dumpStatus.RECOVERY_FAILED",
++    "R0dumpOperationResult.STALE",
++):
++    if required not in control:
++        errors.append(f"Broker repository missing: {required}")
++for required in (
++    "private val controlRepository = R0dumpControlRepository()",
++    "controlRepository.status()",
++    "controlRepository.publish(app.packageName, state.mask, beforeStatus.generation)",
++    "controlRepository.stop(beforeStatus.runId, beforeStatus.generation)",
++    "controlRepository.verifyStatus(result.getOrThrow()).getOrThrow()",
++):
++    if required not in view_model:
++        errors.append(f"ViewModel must use broker control API: {required}")
++if "adb shell setprop" in screen:
++    errors.append("UI must not offer property-write commands")
++if "adb shell cmd r0dump status" not in screen:
++    errors.append("Read-only adb diagnostics must query Broker status through cmd r0dump")
++if (app / "src/com/android/r0dumpmanager/data/dump/DumpDirectoryRepository.kt").exists():
++    errors.append("Private reader is not available; Manager must not scan Legacy external output")
++for forbidden in (
++    "ActiveInvokeCard",
++    "EvidenceCard",
++    "OutputCard",
++    "OpenDumpDirectory",
++    "openDumpDirectory",
++    "/sdcard/download/r0dump",
++):
++    if forbidden in sources:
++        errors.append(f"Unsupported capability/private-reader UI remains exposed: {forbidden}")
++if "private fun LegacyExternalCard(state: R0dumpUiState)" not in screen or "never used as a private-reader fallback" not in screen:
++    errors.append("Legacy external state must remain explicit and read-only until Broker reader rollout")
++for required in (
++    "val capabilityMask: Long? = null",
++    "val canPublish: Boolean = brokerStatus?.ready == true && brokerStatus.publishAllowed",
++    "brokerStatus?.ready == true && brokerStatus.publishAllowed",
++    "val canStop: Boolean = brokerStatus?.ready == true && brokerStatus.active",
++    "RecoveryState.NOT_STARTED",
++    "RecoveryState.INDEXING",
++    "RecoveryState.READY",
++    "RecoveryState.FAILED",
++    "val capabilityMask = controlRepository.capabilityMask().getOrNull()",
++    "if (!state.canPublish) return showError",
++    "enabled = canPublish",
++    "enabled = state.canStop && !updating",
++    "if (!state.canStop) return showError",
++    "if (isOperationBusy() || !_uiState.value.canPublish) return",
++):
++    if required not in manager_source:
++        errors.append(f"Capability fail-closed contract missing: {required}")
++if "capabilityMask != null && capabilityMask != 0L" in view_model:
++    errors.append("Optional capability mask must not gate basic passive publishing")
++for required in (
++    "R0dumpCapabilities.CAP_PRIVATE_STORE_CONTROL_V1",
++    "(capabilityMask and CAP_PRIVATE_STORE_CONTROL_V1) != 0L",
++    "RecoveryState.READY",
++):
++    if required not in reader_models:
++        errors.append(f"Private reader exact-capability gate missing: {required}")
++if "capabilityMask != 0L" in reader_models:
++    errors.append("Private reader must not enable from a nonzero capability mask")
++for required in (
++    "IR0dumpControlService",
++    "fun listRuns(",
++    "fun listSessions(",
++    "fun listObservations(",
++    "fun beginExportRun(",
++    "fun deleteRun(",
++    "PrivateStoreUnavailableException",
++    "DeadObjectException",
++):
++    if required not in reader_repository:
++        errors.append(f"Typed private-store Repository contract missing: {required}")
++for required in (
++    "class PrivateExportCompletion",
++    "IBinder.DeathRecipient",
++    "PENDING_ACCEPT",
++    "LINKING",
++    "ARMED",
++    "ABANDONED",
++    "class PrivateExportStarter",
++    "val acceptedTicket = ticket.toPrivateTicketValidated(",
++    "completion.arm(deathMonitor)",
++    "completion.abandon()",
++    "acceptTerminal(Result.failure(PrivateStoreUnavailableException()))",
++    "acceptTerminal(runCatching",
++    "dispatcher {",
++):
++    if required not in reader_repository:
++        errors.append(f"Export exactly-once terminal contract missing: {required}")
++ticket_model = reader_repository.find("val acceptedTicket = ticket.toPrivateTicketValidated(")
++ticket_arm = reader_repository.find("completion.arm(deathMonitor)")
++if ticket_model < 0 or ticket_arm < 0 or ticket_model > ticket_arm:
++    errors.append("Validated private export ticket must be fully constructed before completion arm")
++for required in (
++    "fun unavailableServiceMapsToPrivateStoreUnavailable()",
++    "R0dumpPrivateStoreRepository { null }",
++    "fun nonOkExportCallbackCompletesExactlyOnce()",
++    "fun exportBinderDeathCompletesExactlyOnce()",
++    "fun earlyCallbackIsDeliveredOnlyAfterAcceptedTicket()",
++    "fun earlyCallbackIsAbandonedWhenTicketIsRejected()",
++    "fun malformedAcceptedTicketAbandonsEarlyCallback()",
++    "fun deathLinkFailureCompletesAsUnavailable()",
++    "fun exportCallbackAndDeathRaceCompletesExactlyOnce()",
++    "fun exportConsumerFailureDoesNotEscapeCompletionDispatcher()",
++    "fun exportDispatcherFailureDoesNotEscapeBinderCallback()",
++    "assertEquals(1, results.size)",
++):
++    if required not in reader_tests:
++        errors.append(f"Private-store instrumentation regression missing: {required}")
++if "PrivateReaderGate.state(" not in view_model or "indexGeneration" not in reader_models:
++    errors.append("ViewModel must clear private reader state through the exact capability gate")
++if "getOrElse { result.getOrThrow() }" in view_model:
++    errors.append("ViewModel must not use operation results as a getStatus fallback")
++for required in (
++    "fun verifyStatus(expected: BrokerStatus): Result<BrokerStatus>",
++    "actual.runId == expected.runId",
++    "actual.generation == expected.generation",
++    "actual.active == expected.active",
++    "actual.packageName == expected.packageName",
++    "actual.ready == expected.ready",
++    "actual.publishAllowed == expected.publishAllowed",
++):
++    if required not in control:
++        errors.append(f"Broker status confirmation missing: {required}")
++for tool_name, tool in (("validate_post_flash.sh", post_flash), ("final_acceptance.sh", final_acceptance)):
++    for forbidden in ("getprop", "setprop", "adb shell setprop"):
++        if forbidden in tool:
++            errors.append(f"{tool_name} retains obsolete property assumption: {forbidden}")
++for required in (
++    '-H "$ADB_HOST" -P "$ADB_PORT"',
++    "service check r0dump",
++    "cmd r0dump status",
++    "broker_status_before.txt",
++    "broker_status_after.txt",
++    "ready publish_allowed recovery_state",
++):
++    if required not in post_flash:
++        errors.append(f"post-flash Binder/5038 contract missing: {required}")
++
++manifest = ET.parse(app / "AndroidManifest.xml").getroot()
++uses = {node.attrib.get("{http://schemas.android.com/apk/res/android}name", "") for node in manifest.findall("uses-permission")}
++if "android.permission.MANAGE_R0DUMP" not in uses:
++    errors.append("MANAGE_R0DUMP missing from manifest")
++if "android.permission.MANAGE_R0DUMP" not in read("privapp-permissions-com.android.r0dumpmanager.xml"):
++    errors.append("MANAGE_R0DUMP missing from privapp permissions")
++if "android.permission.MANAGE_EXTERNAL_STORAGE" in uses:
++    errors.append("Manager must not retain external storage access before Broker reader rollout")
++if "platform_apis: true" not in read("Android.bp"):
++    errors.append("Manager must retain platform APIs for hidden broker AIDL")
++
++test_manifest = ET.parse(app / "tests/AndroidManifest.xml").getroot()
++test_application = test_manifest.find("application")
++if test_application is not None and (
++    "{http://schemas.android.com/apk/res/android}label" in test_application.attrib
++):
++    errors.append("R0dumpManagerTests must not override the production application label")
++instrumentation = test_manifest.find("instrumentation")
++if instrumentation is None:
++    errors.append("R0dumpManagerTests manifest must register instrumentation")
++else:
++    android_name = instrumentation.attrib.get("{http://schemas.android.com/apk/res/android}name", "")
++    target_package = instrumentation.attrib.get(
++        "{http://schemas.android.com/apk/res/android}targetPackage", ""
++    )
++    if android_name != "androidx.test.runner.AndroidJUnitRunner":
++        errors.append("R0dumpManagerTests must use AndroidJUnitRunner")
++    if target_package != "com.android.r0dumpmanager":
++        errors.append("R0dumpManagerTests must target the production Manager package")
++
++if errors:
++    print("FAIL: R0dumpManager source contract validation failed", file=sys.stderr)
++    for error in errors:
++        print(f" - {error}", file=sys.stderr)
++    raise SystemExit(1)
++print("PASS: R0dumpManager broker source contracts validated")
++PY
+-- 
+2.43.0
+

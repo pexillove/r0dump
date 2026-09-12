@@ -1,0 +1,51 @@
+From a542dfad63d40a6a2cda9ca5d742c76b995f2475 Mon Sep 17 00:00:00 2001
+From: Ivory <contact@ivory.cafe>
+Date: Fri, 11 Sep 2026 00:36:50 +0800
+Subject: [PATCH 26/32] helper: seed dex adler32 with 1, not 0, so repaired
+ checksums verify
+
+The device repair wrote adler32(0L, ptr, len), i.e. a zero seed, for every
+dexfixed/codeitem checksum. zlib's adler32 seed must be 1 (the value of
+adler32(0L, Z_NULL, 0)); a zero seed makes the low word 1 short and the high
+word N short (N = byte count), so every repaired dex failed dexdump with
+'Bad checksum'. checksum_valid_after compared the wrong value against itself
+and reported success, masking the defect. Verified against 34 on-device
+dexfixed outputs: all matched the seed-0 value, none the correct seed-1.
+---
+ helper/r0dump_export_core.cpp | 9 ++++++---
+ 1 file changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/helper/r0dump_export_core.cpp b/helper/r0dump_export_core.cpp
+index 0611440..09004ac 100644
+--- a/helper/r0dump_export_core.cpp
++++ b/helper/r0dump_export_core.cpp
+@@ -391,12 +391,14 @@ RepairDexFixed(const std::vector<uint8_t> &data) {
+   }();
+   const uint32_t old_checksum = ReadU32(repaired, 8u);
+   const uint32_t expected_checksum_before =
+-      adler32(0L, repaired.data() + 12u, repaired.size() - 12u);
++      adler32(adler32(0L, Z_NULL, 0), repaired.data() + 12u,
++              repaired.size() - 12u);
+   std::array<uint8_t, SHA_DIGEST_LENGTH> signature{};
+   SHA1(repaired.data() + 32u, repaired.size() - 32u, signature.data());
+   std::copy(signature.begin(), signature.end(), repaired.begin() + 12u);
+   const uint32_t expected_checksum_after =
+-      adler32(0L, repaired.data() + 12u, repaired.size() - 12u);
++      adler32(adler32(0L, Z_NULL, 0), repaired.data() + 12u,
++              repaired.size() - 12u);
+   WriteU32(&repaired, 8u, expected_checksum_after);
+   Json::Value modified(Json::arrayValue);
+   if (old_signature != signature) {
+@@ -1156,7 +1158,8 @@ ProcessSummary RepairProcess(const fs::path &process, const fs::path &output) {
+       SHA1(repaired.data() + 32u, repaired.size() - 32u, signature.data());
+       std::copy(signature.begin(), signature.end(), repaired.begin() + 12u);
+       WriteU32(&repaired, 8u,
+-               adler32(0L, repaired.data() + 12u, repaired.size() - 12u));
++               adler32(adler32(0L, Z_NULL, 0), repaired.data() + 12u,
++              repaired.size() - 12u));
+       output_path = output / "repaired" / (candidate_digest + ".codeitem.dex");
+       if (WriteFile(*output_path, repaired)) {
+         output_digest = Sha256(repaired);
+-- 
+2.43.0
+

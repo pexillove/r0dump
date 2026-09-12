@@ -1,0 +1,114 @@
+From c6d146ab3081063d646cd84ecb8529f3e5face06 Mon Sep 17 00:00:00 2001
+From: Ivory <contact@ivory.cafe>
+Date: Thu, 10 Sep 2026 21:46:08 +0800
+Subject: [PATCH 8/9] r0dump: fusion config read path and AM file-preparation
+ bridge
+
+Per-process fusion config assembly from persist.sys.r0dump.fusion.*
+properties with generation-sandwich consistency and strict validation,
+plus the ActivityManager file-preparation bridge that hands the target
+process its owned output directory fd.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Change-Id: I94de1c7003ac5a004817258ba3eddac41c964087
+---
+ .../java/android/app/r0dump_FusionConfig.java |  2 +-
+ .../am/r0dump_FilePreparationBridge.java      |  4 +-
+ .../am/r0dump_FilePreparationBridgeTest.java  | 41 +++++++++++++++++++
+ 3 files changed, 44 insertions(+), 3 deletions(-)
+
+diff --git a/core/java/android/app/r0dump_FusionConfig.java b/core/java/android/app/r0dump_FusionConfig.java
+index 810731c27..7050b271b 100644
+--- a/core/java/android/app/r0dump_FusionConfig.java
++++ b/core/java/android/app/r0dump_FusionConfig.java
+@@ -54,7 +54,7 @@ public final class r0dump_FusionConfig {
+   private static final String TAG = "R0dumpFusion";
+   static final String PROPERTY_PREFIX = "persist.sys.r0dump.fusion.";
+   private static final String PROPERTY_GENERATION = PROPERTY_PREFIX + "generation";
+-  private static final long DEFINED_CAPTURE_POINT_MASK = (1L << 42) - 1L;
++  private static final long DEFINED_CAPTURE_POINT_MASK = (1L << 43) - 1L;
+   private static final long FORCE_INVOKE_NO_EXECUTE_BIT = 1L << 41;
+   private static final long MAX_UNSIGNED_INT = 0xffff_ffffL;
+   private static final r0dump_PropertyAccess SYSTEM_PROPERTIES =
+diff --git a/services/core/java/com/android/server/am/r0dump_FilePreparationBridge.java b/services/core/java/com/android/server/am/r0dump_FilePreparationBridge.java
+index cb83c77aa..cc9cbbe58 100644
+--- a/services/core/java/com/android/server/am/r0dump_FilePreparationBridge.java
++++ b/services/core/java/com/android/server/am/r0dump_FilePreparationBridge.java
+@@ -140,7 +140,7 @@ final class r0dump_FilePreparationBridge {
+       String runId,
+       long generation)
+       throws IOException {
+-    if (targetUid < 10000 || targetPid <= 0 || generation < 0 || (generation & 1L) != 0L) {
++    if (targetUid <= 0 || targetPid <= 0 || generation < 0 || (generation & 1L) != 0L) {
+       throw new IOException("invalid request identity");
+     }
+     final ByteBuffer buffer = ByteBuffer.allocate(REQUEST_BYTES).order(ByteOrder.LITTLE_ENDIAN);
+@@ -159,7 +159,7 @@ final class r0dump_FilePreparationBridge {
+ 
+   static byte[] encodeExportRequest(int requesterUid, String packageName, int apkCount)
+       throws IOException {
+-    if (requesterUid < 10000 || apkCount <= 0 || apkCount > MAX_APK_COUNT) {
++    if (requesterUid <= 0 || apkCount <= 0 || apkCount > MAX_APK_COUNT) {
+       throw new IOException("invalid export identity");
+     }
+     final ByteBuffer buffer =
+diff --git a/services/tests/servicestests/src/com/android/server/am/r0dump_FilePreparationBridgeTest.java b/services/tests/servicestests/src/com/android/server/am/r0dump_FilePreparationBridgeTest.java
+index da3674bc5..a8de89ffd 100644
+--- a/services/tests/servicestests/src/com/android/server/am/r0dump_FilePreparationBridgeTest.java
++++ b/services/tests/servicestests/src/com/android/server/am/r0dump_FilePreparationBridgeTest.java
+@@ -57,6 +57,19 @@ public class r0dump_FilePreparationBridgeTest {
+                 10198, 2468, "a".repeat(96), "process", "run", 4L));
+   }
+ 
++  @Test
++  public void encodeRequest_acceptsSystemUid() throws Exception {
++    final byte[] request =
++        r0dump_FilePreparationBridge.encodeRequest(
++            1000, 2468, "com.android.settings", "com.android.settings", "run", 4L);
++
++    final ByteBuffer buffer = ByteBuffer.wrap(request).order(ByteOrder.LITTLE_ENDIAN);
++    buffer.position(16);
++    assertThat(buffer.getInt()).isEqualTo(0);
++    assertThat(buffer.getInt()).isEqualTo(1000);
++    assertThat(buffer.getInt()).isEqualTo(2468);
++  }
++
+   @Test
+   public void encodeExportRequest_hasStableLayoutAndApkCount() throws Exception {
+     final byte[] request =
+@@ -75,4 +88,32 @@ public class r0dump_FilePreparationBridgeTest {
+     assertThat(new String(packageBytes, 0, "com.example.target".length(), StandardCharsets.UTF_8))
+         .isEqualTo("com.example.target");
+   }
++
++  @Test
++  public void encodeExportRequest_acceptsSystemUid() throws Exception {
++    final byte[] request =
++        r0dump_FilePreparationBridge.encodeExportRequest(1000, "com.android.settings", 1);
++
++    final ByteBuffer buffer = ByteBuffer.wrap(request).order(ByteOrder.LITTLE_ENDIAN);
++    buffer.position(8);
++    assertThat(buffer.getInt()).isEqualTo(0);
++    assertThat(buffer.getInt()).isEqualTo(1000);
++    assertThat(buffer.getInt()).isEqualTo(1);
++  }
++
++  @Test
++  public void encodeRequest_rejectsZeroUid() {
++    assertThrows(
++        IOException.class,
++        () ->
++            r0dump_FilePreparationBridge.encodeRequest(
++                0, 2468, "com.android.settings", "com.android.settings", "run", 4L));
++  }
++
++  @Test
++  public void encodeExportRequest_rejectsZeroUid() {
++    assertThrows(
++        IOException.class,
++        () -> r0dump_FilePreparationBridge.encodeExportRequest(0, "com.android.settings", 1));
++  }
+ }
+-- 
+2.43.0
+

@@ -1,0 +1,234 @@
+From 3a7158006bdf251ee32cbbb8030eb19cd437ba73 Mon Sep 17 00:00:00 2001
+From: Ivory <contact@ivory.cafe>
+Date: Tue, 1 Sep 2026 09:28:29 +0800
+Subject: [PATCH 5/9] =?UTF-8?q?=E8=AE=A9=E7=B3=BB=E7=BB=9F=E6=9C=8D?=
+ =?UTF-8?q?=E5=8A=A1=E5=AE=89=E5=85=A8=E8=BD=AC=E5=8F=91=E4=BA=A7=E7=89=A9?=
+ =?UTF-8?q?=E5=AF=BC=E5=87=BA=E8=AF=B7=E6=B1=82?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+为 Manager 提供受权限保护的 ActivityManager 入口，由 system_server 校验调用方、目标包和前台状态后把受限 APK 文件描述符交给 root helper。\n\nConstraint: Framework 必须保留 UID/PID、owner user、PackageManager 路径和固定协议的多重校验。\nRejected: 暴露任意路径或由 Manager 直接打开 APK | 会扩大受信边界并破坏 helper 隔离。\nConfidence: high\nScope-risk: moderate\nDirective: 修改 AIDL 或固定响应布局时必须同步 Manager parser、helper 协议和服务测试。\nTested: framework-minus-apex/services/services.core j8 构建与服务协议测试。\nNot-tested: 本次 checksum/UI 调整未在设备上重新装机验证。
+
+Change-Id: If1df453b00fbc8d557ab18406a9173492cd269db
+---
+ core/java/android/app/IActivityManager.aidl   |  3 +
+ core/res/AndroidManifest.xml                  |  6 ++
+ .../server/am/ActivityManagerService.java     | 45 +++++++++++++++
+ .../am/r0dump_FilePreparationBridge.java      | 56 +++++++++++++++++++
+ .../am/r0dump_FilePreparationBridgeTest.java  | 19 +++++++
+ 5 files changed, 129 insertions(+)
+
+diff --git a/core/java/android/app/IActivityManager.aidl b/core/java/android/app/IActivityManager.aidl
+index f5c3b8f58..9abff2a9c 100644
+--- a/core/java/android/app/IActivityManager.aidl
++++ b/core/java/android/app/IActivityManager.aidl
+@@ -706,6 +706,9 @@ interface IActivityManager {
+     ParcelFileDescriptor r0dump_prepareOutput(
+             String packageName, String processName, String runId, long generation);
+ 
++    /** @hide Repairs and exports the newest r0dump run for an installed package. */
++    ParcelFileDescriptor r0dump_exportLatest(String packageName);
++
+     /** Returns a file descriptor that'll be closed when the system server process dies. */
+     ParcelFileDescriptor getLifeMonitor();
+ 
+diff --git a/core/res/AndroidManifest.xml b/core/res/AndroidManifest.xml
+index 769c3d311..2b3892e31 100644
+--- a/core/res/AndroidManifest.xml
++++ b/core/res/AndroidManifest.xml
+@@ -2948,6 +2948,12 @@
+     <permission android:name="android.permission.MANAGE_DEBUGGING"
+         android:protectionLevel="signature|privileged" />
+ 
++    <!-- Allows the guarded r0dump Manager to request repair and export of captured artifacts.
++         <p>Not for use by third-party applications.
++         @hide -->
++    <permission android:name="android.permission.MANAGE_R0DUMP_EXPORT"
++        android:protectionLevel="signature|privileged" />
++
+     <!-- @SystemApi Allows an application to access the MTP USB kernel driver.
+          For use only by the device side MTP implementation.
+          @hide -->
+diff --git a/services/core/java/com/android/server/am/ActivityManagerService.java b/services/core/java/com/android/server/am/ActivityManagerService.java
+index d7b019636..92057cefc 100644
+--- a/services/core/java/com/android/server/am/ActivityManagerService.java
++++ b/services/core/java/com/android/server/am/ActivityManagerService.java
+@@ -1624,6 +1624,9 @@ public class ActivityManagerService extends IActivityManager.Stub
+ 
+     private final r0dump_FilePreparationBridge mR0dumpFilePreparationBridge =
+             new r0dump_FilePreparationBridge();
++    private static final String R0DUMP_MANAGER_PACKAGE = "com.android.r0dumpmanager";
++    private static final String R0DUMP_EXPORT_PERMISSION =
++            "android.permission.MANAGE_R0DUMP_EXPORT";
+ 
+     static final HostingRecord sNullHostingRecord =
+             new HostingRecord(HostingRecord.HOSTING_TYPE_EMPTY);
+@@ -19368,6 +19371,48 @@ public class ActivityManagerService extends IActivityManager.Stub
+         }
+     }
+ 
++    @Override
++    public ParcelFileDescriptor r0dump_exportLatest(String packageName) {
++        mContext.enforceCallingPermission(R0DUMP_EXPORT_PERMISSION,
++                "r0dump artifact export requires the Manager permission");
++        final int callingUid = Binder.getCallingUid();
++        final int callingPid = Binder.getCallingPid();
++        if (packageName == null
++                || UserHandle.getUserId(callingUid) != UserHandle.USER_SYSTEM
++                || mPackageManagerInt.getPackageUid(R0DUMP_MANAGER_PACKAGE, 0,
++                        UserHandle.USER_SYSTEM) != callingUid
++                || !mAtmInternal.isUidForeground(callingUid)) {
++            throw new SecurityException("r0dump artifact export requires the foreground owner Manager");
++        }
++        synchronized (this) {
++            synchronized (mPidsSelfLocked) {
++                final ProcessRecord process = mPidsSelfLocked.get(callingPid);
++                if (process == null
++                        || process.uid != callingUid
++                        || !process.getPkgList().containsKey(R0DUMP_MANAGER_PACKAGE)) {
++                    throw new SecurityException("r0dump artifact export caller identity mismatch");
++                }
++            }
++        }
++        final ApplicationInfo target = mPackageManagerInt.getApplicationInfo(
++                packageName, 0, Process.SYSTEM_UID, UserHandle.USER_SYSTEM);
++        if (target == null || target.sourceDir == null) {
++            return null;
++        }
++        final int splitCount = target.splitSourceDirs == null ? 0 : target.splitSourceDirs.length;
++        final String[] apkPaths = new String[splitCount + 1];
++        apkPaths[0] = target.sourceDir;
++        if (splitCount != 0) {
++            System.arraycopy(target.splitSourceDirs, 0, apkPaths, 1, splitCount);
++        }
++        try {
++            return mR0dumpFilePreparationBridge.exportLatest(callingUid, packageName, apkPaths);
++        } catch (IOException e) {
++            Slog.w(TAG, "Unable to request r0dump artifact export", e);
++            return null;
++        }
++    }
++
+     @Override
+     public ParcelFileDescriptor getLifeMonitor() {
+         if (!isCallerShell()) {
+diff --git a/services/core/java/com/android/server/am/r0dump_FilePreparationBridge.java b/services/core/java/com/android/server/am/r0dump_FilePreparationBridge.java
+index 25936ad0a..cb83c77aa 100644
+--- a/services/core/java/com/android/server/am/r0dump_FilePreparationBridge.java
++++ b/services/core/java/com/android/server/am/r0dump_FilePreparationBridge.java
+@@ -17,6 +17,7 @@ import android.net.LocalSocketAddress;
+ import android.os.ParcelFileDescriptor;
+ import android.system.ErrnoException;
+ import android.system.Os;
++import java.io.File;
+ import java.io.FileDescriptor;
+ import java.io.IOException;
+ import java.io.InputStream;
+@@ -35,6 +36,11 @@ final class r0dump_FilePreparationBridge {
+   private static final int RESPONSE_BYTES = 12;
+   private static final int STATUS_OK = 0;
+   private static final int TIMEOUT_MS = 2000;
++  private static final int EXPORT_MAGIC = 0x52304558;
++  private static final short EXPORT_VERSION = 1;
++  private static final int EXPORT_REQUEST_BYTES = 116;
++  private static final int EXPORT_TIMEOUT_MS = 5 * 60 * 1000;
++  private static final int MAX_APK_COUNT = 32;
+ 
+   ParcelFileDescriptor prepare(
+       int targetUid,
+@@ -74,6 +80,39 @@ final class r0dump_FilePreparationBridge {
+     }
+   }
+ 
++  ParcelFileDescriptor exportLatest(int requesterUid, String packageName, String[] apkPaths)
++      throws IOException {
++    if (apkPaths == null || apkPaths.length == 0 || apkPaths.length > MAX_APK_COUNT) {
++      throw new IOException("invalid APK path count");
++    }
++    final byte[] request = encodeExportRequest(requesterUid, packageName, apkPaths.length);
++    final ParcelFileDescriptor[] apkDescriptors = new ParcelFileDescriptor[apkPaths.length];
++    try {
++      final FileDescriptor[] descriptors = new FileDescriptor[apkPaths.length];
++      for (int i = 0; i < apkPaths.length; i++) {
++        apkDescriptors[i] =
++            ParcelFileDescriptor.open(new File(apkPaths[i]), ParcelFileDescriptor.MODE_READ_ONLY);
++        descriptors[i] = apkDescriptors[i].getFileDescriptor();
++      }
++      try (LocalSocket socket = new LocalSocket(LocalSocket.SOCKET_SEQPACKET)) {
++        socket.connect(
++            new LocalSocketAddress("r0dump_file_helper", LocalSocketAddress.Namespace.RESERVED));
++        socket.setSoTimeout(EXPORT_TIMEOUT_MS);
++        socket.setFileDescriptorsForSend(descriptors);
++        socket.getOutputStream().write(request);
++        socket.getOutputStream().flush();
++        socket.setFileDescriptorsForSend(null);
++        return ParcelFileDescriptor.dup(socket.getFileDescriptor());
++      }
++    } finally {
++      for (ParcelFileDescriptor descriptor : apkDescriptors) {
++        if (descriptor != null) {
++          descriptor.close();
++        }
++      }
++    }
++  }
++
+   private static ParcelFileDescriptor createDeliveryChannel(FileDescriptor[] directoryDescriptors)
+       throws IOException {
+     final ParcelFileDescriptor[] channel =
+@@ -118,6 +157,23 @@ final class r0dump_FilePreparationBridge {
+     return buffer.array();
+   }
+ 
++  static byte[] encodeExportRequest(int requesterUid, String packageName, int apkCount)
++      throws IOException {
++    if (requesterUid < 10000 || apkCount <= 0 || apkCount > MAX_APK_COUNT) {
++      throw new IOException("invalid export identity");
++    }
++    final ByteBuffer buffer =
++        ByteBuffer.allocate(EXPORT_REQUEST_BYTES).order(ByteOrder.LITTLE_ENDIAN);
++    buffer.putInt(EXPORT_MAGIC);
++    buffer.putShort(EXPORT_VERSION);
++    buffer.putShort((short) EXPORT_REQUEST_BYTES);
++    buffer.putInt(0); // Owner user only.
++    buffer.putInt(requesterUid);
++    buffer.putInt(apkCount);
++    putFixedString(buffer, packageName, PACKAGE_BYTES);
++    return buffer.array();
++  }
++
+   private static void putFixedString(ByteBuffer buffer, String value, int capacity)
+       throws IOException {
+     if (value == null) {
+diff --git a/services/tests/servicestests/src/com/android/server/am/r0dump_FilePreparationBridgeTest.java b/services/tests/servicestests/src/com/android/server/am/r0dump_FilePreparationBridgeTest.java
+index fb25dca32..da3674bc5 100644
+--- a/services/tests/servicestests/src/com/android/server/am/r0dump_FilePreparationBridgeTest.java
++++ b/services/tests/servicestests/src/com/android/server/am/r0dump_FilePreparationBridgeTest.java
+@@ -56,4 +56,23 @@ public class r0dump_FilePreparationBridgeTest {
+             r0dump_FilePreparationBridge.encodeRequest(
+                 10198, 2468, "a".repeat(96), "process", "run", 4L));
+   }
++
++  @Test
++  public void encodeExportRequest_hasStableLayoutAndApkCount() throws Exception {
++    final byte[] request =
++        r0dump_FilePreparationBridge.encodeExportRequest(10195, "com.example.target", 3);
++
++    assertThat(request).hasLength(116);
++    final ByteBuffer buffer = ByteBuffer.wrap(request).order(ByteOrder.LITTLE_ENDIAN);
++    assertThat(buffer.getInt()).isEqualTo(0x52304558);
++    assertThat(buffer.getShort()).isEqualTo((short) 1);
++    assertThat(Short.toUnsignedInt(buffer.getShort())).isEqualTo(116);
++    assertThat(buffer.getInt()).isEqualTo(0);
++    assertThat(buffer.getInt()).isEqualTo(10195);
++    assertThat(buffer.getInt()).isEqualTo(3);
++    final byte[] packageBytes = new byte[96];
++    buffer.get(packageBytes);
++    assertThat(new String(packageBytes, 0, "com.example.target".length(), StandardCharsets.UTF_8))
++        .isEqualTo("com.example.target");
++  }
+ }
+-- 
+2.43.0
+

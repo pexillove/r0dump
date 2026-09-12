@@ -1,0 +1,213 @@
+From 513cfb7df58ace89560fd198959dbbc74eeaf0a9 Mon Sep 17 00:00:00 2001
+From: Ivory <contact@ivory.cafe>
+Date: Tue, 1 Sep 2026 19:27:22 +0800
+Subject: [PATCH 6/9] Route configured walks through DexCache discovery
+
+Add the Fusion namespace selector and feed DexCache class definitions into the existing bounded ClassLoaderWalk and capture flow, allowing targeted namespaces to be recovered without legacy global traversal.
+
+Constraint: Keep discovery in the framework-to-ART bridge and preserve the existing worker and capture budgets.
+Rejected: Direct legacy DexFile dumping from Framework | It would bypass ART capture and output ownership.
+Confidence: high
+Scope-risk: moderate
+Directive: Keep new walk sources read-only, bounded, and filtered before reflection.
+Tested: r0dump_f7_class_loader_walk_source_test.py; git diff --check.
+Not-tested: Full framework build; lunch release configuration is unavailable in this checkout.
+Change-Id: Ia5c5af1f16eda8556ddde662dfc30e14f2b8d2a6
+---
+ .../android/app/r0dump_ClassLoaderWalk.java   | 50 ++++++++++++++++---
+ .../java/android/app/r0dump_FusionConfig.java | 26 ++++++++++
+ 2 files changed, 70 insertions(+), 6 deletions(-)
+
+diff --git a/core/java/android/app/r0dump_ClassLoaderWalk.java b/core/java/android/app/r0dump_ClassLoaderWalk.java
+index db13e1e16..71a1513ab 100644
+--- a/core/java/android/app/r0dump_ClassLoaderWalk.java
++++ b/core/java/android/app/r0dump_ClassLoaderWalk.java
+@@ -36,6 +36,7 @@ final class r0dump_ClassLoaderWalk {
+   private static final int r0dump_SOURCE_COOKIE = 0;
+   private static final int r0dump_SOURCE_LOADED_TABLE = 1;
+   private static final int r0dump_SOURCE_MANIFEST = 2;
++  private static final int r0dump_SOURCE_DEX_CACHE = 3;
+ 
+   private static final AtomicReference<r0dump_Request> r0dump_REQUEST = new AtomicReference<>();
+ 
+@@ -193,6 +194,10 @@ final class r0dump_ClassLoaderWalk {
+           if (!state.r0dump_hasClassBudget()) {
+             break;
+           }
++          r0dump_walkDexCacheNames(request.config, loader, state);
++          if (!state.r0dump_hasClassBudget()) {
++            break;
++          }
+           try {
+             r0dump_walkNames(
+                 request.config,
+@@ -306,6 +311,23 @@ final class r0dump_ClassLoaderWalk {
+     }
+   }
+ 
++  private static void r0dump_walkDexCacheNames(
++      r0dump_FusionConfig config, ClassLoader loader, r0dump_State state) {
++    if (loader == null || !state.r0dump_hasClassBudget()) {
++      return;
++    }
++    try {
++      r0dump_walkNames(
++          config,
++          loader,
++          r0dump_Runtime.r0dump_GetDexCacheClassNames(loader),
++          null,
++          r0dump_SOURCE_DEX_CACHE,
++          state);
++    } catch (RuntimeException | LinkageError ignored) {
++    }
++  }
++
+   private static void r0dump_walkManifestNames(
+       r0dump_ManifestHelper.r0dump_Snapshot snapshot,
+       r0dump_FusionConfig config,
+@@ -335,7 +357,10 @@ final class r0dump_ClassLoaderWalk {
+       if (!state.r0dump_hasClassBudget()) {
+         return;
+       }
+-      if (className == null || className.isEmpty() || !state.r0dump_markClass(loader, className)) {
++      if (className == null
++          || className.isEmpty()
++          || !r0dump_matchesConfiguredNamespace(config, className)
++          || !state.r0dump_markClass(loader, className)) {
+         continue;
+       }
+       try {
+@@ -351,6 +376,12 @@ final class r0dump_ClassLoaderWalk {
+     }
+   }
+ 
++  private static boolean r0dump_matchesConfiguredNamespace(
++      r0dump_FusionConfig config, String className) {
++    return config.walkNamespacePrefix.isEmpty()
++        || (className != null && className.startsWith(config.walkNamespacePrefix));
++  }
++
+   private static void r0dump_captureExecutables(
+       Class<?> klass, Object cookie, String className, int sourceId, r0dump_State state) {
+     final Method[] methods;
+@@ -415,16 +446,23 @@ final class r0dump_ClassLoaderWalk {
+       ClassLoader applicationLoader,
+       ArrayList<ClassLoader> loaders,
+       int priorAttempts) {
+-    final List<String> prefixes = r0dump_manifestNamespacePrefixes(snapshot);
++    final LinkedHashSet<String> prefixSet = new LinkedHashSet<>();
++    if (!config.walkNamespacePrefix.isEmpty()) {
++      prefixSet.add(config.walkNamespacePrefix);
++    }
++    prefixSet.addAll(r0dump_manifestNamespacePrefixes(snapshot));
++    final List<String> prefixes = new ArrayList<>(prefixSet);
+     if (!config.forceInvokeEnabled || prefixes.isEmpty() || priorAttempts >= config.forceMaxCalls) {
+       return;
+     }
+     final r0dump_ForceState state = new r0dump_ForceState(config, prefixes, priorAttempts);
+-    final String[] seedNames = new String[snapshot.seeds.size()];
+-    for (int i = 0; i < snapshot.seeds.size(); i++) {
+-      seedNames[i] = snapshot.seeds.get(i).className;
++    if (snapshot != null) {
++      final String[] seedNames = new String[snapshot.seeds.size()];
++      for (int i = 0; i < snapshot.seeds.size(); i++) {
++        seedNames[i] = snapshot.seeds.get(i).className;
++      }
++      r0dump_forceNames(applicationLoader, seedNames, state);
+     }
+-    r0dump_forceNames(applicationLoader, seedNames, state);
+     for (ClassLoader loader : loaders) {
+       if (!state.r0dump_hasBudget()) {
+         return;
+diff --git a/core/java/android/app/r0dump_FusionConfig.java b/core/java/android/app/r0dump_FusionConfig.java
+index 94fae46a5..810731c27 100644
+--- a/core/java/android/app/r0dump_FusionConfig.java
++++ b/core/java/android/app/r0dump_FusionConfig.java
+@@ -97,6 +97,7 @@ public final class r0dump_FusionConfig {
+           "walk_enabled",
+           "walk_start",
+           "walk_mode",
++          "walk_namespace_prefix",
+           "walk_delay_ms",
+           "walk_max_classes",
+           "walk_max_methods",
+@@ -132,6 +133,7 @@ public final class r0dump_FusionConfig {
+   final boolean walkEnabled;
+   final int walkStart;
+   final int walkMode;
++  final String walkNamespacePrefix;
+   final long walkDelayMs;
+   final long walkMaxClasses;
+   final long walkMaxMethods;
+@@ -169,6 +171,7 @@ public final class r0dump_FusionConfig {
+     walkEnabled = r0dump_requireBoolean(json, "walk_enabled");
+     walkStart = r0dump_parseWalkStart(r0dump_requireString(json, "walk_start"));
+     walkMode = r0dump_parseWalkMode(r0dump_requireString(json, "walk_mode"));
++    walkNamespacePrefix = r0dump_requireString(json, "walk_namespace_prefix");
+     walkDelayMs = r0dump_requireUnsignedInt(json, "walk_delay_ms");
+     walkMaxClasses = r0dump_requireUnsignedInt(json, "walk_max_classes");
+     walkMaxMethods = r0dump_requireUnsignedInt(json, "walk_max_methods");
+@@ -322,6 +325,9 @@ public final class r0dump_FusionConfig {
+           "walk_start",
+           properties.r0dump_get(PROPERTY_PREFIX + "walk_start", "after_application_on_create"));
+       json.put("walk_mode", properties.r0dump_get(PROPERTY_PREFIX + "walk_mode", "loaded_only"));
++      json.put(
++          "walk_namespace_prefix",
++          properties.r0dump_get(PROPERTY_PREFIX + "walk_namespace_prefix", ""));
+       json.put("walk_delay_ms", r0dump_readPropertyLong(properties, "walk_delay_ms", "5000"));
+       json.put(
+           "walk_max_classes", r0dump_readPropertyLong(properties, "walk_max_classes", "16384"));
+@@ -690,6 +696,7 @@ public final class r0dump_FusionConfig {
+         config.walkEnabled,
+         config.walkStart,
+         config.walkMode,
++        config.walkNamespacePrefix,
+         config.walkDelayMs,
+         config.walkMaxClasses,
+         config.walkMaxMethods,
+@@ -718,9 +725,13 @@ public final class r0dump_FusionConfig {
+     if (!r0dump_isTargetProcess(targetPackage, targetProcess)) {
+       throw r0dump_invalid("target_process");
+     }
++    if (!walkNamespacePrefix.isEmpty() && !r0dump_isNamespacePrefix(walkNamespacePrefix)) {
++      throw r0dump_invalid("walk_namespace_prefix");
++    }
+     if (!r0dump_fitsPropertyValue(runId)
+         || !r0dump_fitsPropertyValue(targetPackage)
+         || !r0dump_fitsPropertyValue(targetProcess)
++        || !r0dump_fitsPropertyValue(walkNamespacePrefix)
+         || !r0dump_fitsPropertyValue(forceClass)
+         || !r0dump_fitsPropertyValue(forceMethod)
+         || !r0dump_fitsPropertyValue(forceMethodDescriptor)) {
+@@ -965,6 +976,19 @@ public final class r0dump_FusionConfig {
+     return true;
+   }
+ 
++  private static boolean r0dump_isNamespacePrefix(String value) {
++    if (value.isEmpty() || value.length() > 91 || !value.endsWith(".")) {
++      return false;
++    }
++    final String body = value.substring(0, value.length() - 1);
++    for (String segment : body.split("\\.", -1)) {
++      if (!r0dump_isJavaIdentifierSegment(segment, true)) {
++        return false;
++      }
++    }
++    return true;
++  }
++
+   private static boolean r0dump_isMethodName(String value) {
+     return "<init>".equals(value)
+         || "<clinit>".equals(value)
+@@ -1123,6 +1147,8 @@ public final class r0dump_FusionConfig {
+             : "after_first_activity_on_create";
+       case "walk_mode":
+         return walkMode == WALK_MODE_LOADED_ONLY ? "loaded_only" : "dex_names";
++      case "walk_namespace_prefix":
++        return walkNamespacePrefix;
+       case "walk_delay_ms":
+         return Long.toString(walkDelayMs);
+       case "walk_max_classes":
+-- 
+2.43.0
+

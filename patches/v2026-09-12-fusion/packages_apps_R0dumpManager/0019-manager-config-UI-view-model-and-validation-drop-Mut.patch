@@ -1,0 +1,859 @@
+From 8c77731d000e2945961626e93cc297fb68b0c927 Mon Sep 17 00:00:00 2001
+From: Ivory <contact@ivory.cafe>
+Date: Thu, 10 Sep 2026 21:46:41 +0800
+Subject: [PATCH 19/32] manager: config UI, view-model, and validation; drop
+ MutationAuthenticator
+
+Compose config screen, R0dumpManagerViewModel state model, capture-point
+registry, and the domain FusionConfigValidator/Schema. Remove the
+MutationAuthenticator gate and its test in favor of owner-user +
+foreground checks in the view-model.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ src/com/android/r0dumpmanager/MainActivity.kt | 91 -------------------
+ .../app/R0dumpManagerViewModel.kt             | 42 ++-------
+ .../domain/CapturePointRegistry.kt            |  3 +-
+ .../security/MutationAuthenticator.kt         | 18 ----
+ .../r0dumpmanager/ui/R0dumpManagerScreen.kt   | 43 ++++-----
+ .../app/R0dumpManagerViewModelTest.kt         | 35 ++++---
+ .../domain/FusionConfigContractTest.kt        | 12 ++-
+ .../security/MutationAuthenticatorTest.kt     | 25 -----
+ .../r0dumpmanager/ui/CapturePointGroupTest.kt |  7 ++
+ .../ui/FusionActionToolbarTest.kt             | 52 +++--------
+ 10 files changed, 70 insertions(+), 258 deletions(-)
+ delete mode 100644 src/com/android/r0dumpmanager/security/MutationAuthenticator.kt
+ delete mode 100644 tests/src/com/android/r0dumpmanager/security/MutationAuthenticatorTest.kt
+
+diff --git a/src/com/android/r0dumpmanager/MainActivity.kt b/src/com/android/r0dumpmanager/MainActivity.kt
+index 4690468..3b101e1 100644
+--- a/src/com/android/r0dumpmanager/MainActivity.kt
++++ b/src/com/android/r0dumpmanager/MainActivity.kt
+@@ -1,19 +1,8 @@
+ package com.android.r0dumpmanager
+ 
+ import android.Manifest
+-import android.app.KeyguardManager
+ import android.app.NotificationManager
+-import android.content.BroadcastReceiver
+-import android.content.Context
+-import android.content.Intent
+-import android.content.IntentFilter
+-import android.hardware.biometrics.BiometricManager.Authenticators.BIOMETRIC_STRONG
+-import android.hardware.biometrics.BiometricManager.Authenticators.DEVICE_CREDENTIAL
+-import android.hardware.biometrics.BiometricPrompt
+ import android.os.Bundle
+-import android.os.CancellationSignal
+-import android.os.SystemClock
+-import android.provider.Settings
+ import androidx.activity.ComponentActivity
+ import androidx.activity.compose.setContent
+ import androidx.activity.enableEdgeToEdge
+@@ -22,7 +11,6 @@ import androidx.compose.material3.windowsizeclass.calculateWindowSizeClass
+ import androidx.compose.material3.windowsizeclass.ExperimentalMaterial3WindowSizeClassApi
+ import androidx.compose.runtime.getValue
+ import androidx.compose.runtime.mutableIntStateOf
+-import androidx.compose.runtime.mutableStateOf
+ import androidx.compose.runtime.setValue
+ import androidx.lifecycle.ViewModelProvider
+ import androidx.lifecycle.AbstractSavedStateViewModelFactory
+@@ -34,23 +22,12 @@ import com.android.r0dumpmanager.ui.theme.R0dumpManagerTheme
+ 
+ class MainActivity : ComponentActivity() {
+     private lateinit var viewModel: R0dumpManagerViewModel
+-    private var backgroundSince = 0L
+-    private var authenticationInProgress = false
+-    private var postAuthenticationAction: (() -> Unit)? = null
+-    private var deviceSecure by mutableStateOf(false)
+     private var notificationPermissionEpoch by mutableIntStateOf(0)
+     private val notificationPermission = registerForActivityResult(
+         ActivityResultContracts.RequestPermission(),
+     ) {
+         notificationPermissionEpoch++
+     }
+-    private val securityReceiver = object : BroadcastReceiver() {
+-        override fun onReceive(context: Context?, intent: Intent?) {
+-            if (intent?.action == Intent.ACTION_SCREEN_OFF || intent?.action == Intent.ACTION_USER_SWITCHED) {
+-                viewModel.clearAuthentication()
+-            }
+-        }
+-    }
+ 
+     @OptIn(ExperimentalMaterial3WindowSizeClassApi::class)
+     override fun onCreate(savedInstanceState: Bundle?) {
+@@ -66,22 +43,12 @@ class MainActivity : ComponentActivity() {
+             }
+         }
+         viewModel = ViewModelProvider(this, factory)[R0dumpManagerViewModel::class.java]
+-        registerReceiver(
+-            securityReceiver,
+-            IntentFilter().apply {
+-                addAction(Intent.ACTION_SCREEN_OFF)
+-                addAction(Intent.ACTION_USER_SWITCHED)
+-            },
+-            Context.RECEIVER_NOT_EXPORTED,
+-        )
+         setContent {
+             notificationPermissionEpoch
+             R0dumpManagerTheme {
+                 R0dumpManagerScreen(
+                     viewModel = viewModel,
+                     windowSizeClass = calculateWindowSizeClass(this),
+-                    onAuthenticate = ::authenticateForMutation,
+-                    isDeviceSecure = deviceSecure,
+                     notificationsEnabled = getSystemService(NotificationManager::class.java)
+                         .areNotificationsEnabled(),
+                     onRequestNotifications = {
+@@ -96,68 +63,10 @@ class MainActivity : ComponentActivity() {
+     override fun onStart() {
+         super.onStart()
+         viewModel.setForeground(true)
+-        if (!authenticationInProgress && backgroundSince != 0L && SystemClock.elapsedRealtime() - backgroundSince >= AUTH_BACKGROUND_TIMEOUT_MS) {
+-            viewModel.clearAuthentication()
+-        }
+-        backgroundSince = 0L
+-    }
+-
+-    override fun onResume() {
+-        super.onResume()
+-        deviceSecure = getSystemService(KeyguardManager::class.java).isDeviceSecure
+-        viewModel.setDeviceSecure(deviceSecure)
+     }
+ 
+     override fun onStop() {
+         viewModel.setForeground(false)
+-        if (!authenticationInProgress) {
+-            backgroundSince = SystemClock.elapsedRealtime()
+-        }
+         super.onStop()
+     }
+-
+-    override fun onDestroy() {
+-        unregisterReceiver(securityReceiver)
+-        super.onDestroy()
+-    }
+-
+-    private fun authenticateForMutation(onAuthenticated: () -> Unit) {
+-        if (!getSystemService(KeyguardManager::class.java).isDeviceSecure) {
+-            startActivity(Intent(Settings.ACTION_SECURITY_SETTINGS))
+-            return
+-        }
+-        postAuthenticationAction = onAuthenticated
+-        authenticationInProgress = true
+-        BiometricPrompt.Builder(this)
+-            .setTitle(getString(R.string.authentication_title))
+-            .setSubtitle(getString(R.string.authentication_subtitle))
+-            .setAllowedAuthenticators(BIOMETRIC_STRONG or DEVICE_CREDENTIAL)
+-            .setConfirmationRequired(true)
+-            .build()
+-            .authenticate(
+-                CancellationSignal(),
+-                mainExecutor,
+-                object : BiometricPrompt.AuthenticationCallback() {
+-                    override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult?) {
+-                        authenticationInProgress = false
+-                        backgroundSince = 0L
+-                        viewModel.authenticationSucceeded()
+-                        postAuthenticationAction?.let { action ->
+-                            postAuthenticationAction = null
+-                            action()
+-                        }
+-                    }
+-
+-                    override fun onAuthenticationError(errorCode: Int, errString: CharSequence?) {
+-                        authenticationInProgress = false
+-                        backgroundSince = 0L
+-                        postAuthenticationAction = null
+-                    }
+-                },
+-            )
+-    }
+-
+-    private companion object {
+-        const val AUTH_BACKGROUND_TIMEOUT_MS = 30_000L
+-    }
+ }
+diff --git a/src/com/android/r0dumpmanager/app/R0dumpManagerViewModel.kt b/src/com/android/r0dumpmanager/app/R0dumpManagerViewModel.kt
+index fcf34ee..ca231f6 100644
+--- a/src/com/android/r0dumpmanager/app/R0dumpManagerViewModel.kt
++++ b/src/com/android/r0dumpmanager/app/R0dumpManagerViewModel.kt
+@@ -1,7 +1,6 @@
+ package com.android.r0dumpmanager.app
+ 
+ import android.app.Application
+-import android.app.KeyguardManager
+ import android.os.UserHandle
+ import androidx.lifecycle.AndroidViewModel
+ import androidx.lifecycle.SavedStateHandle
+@@ -26,8 +25,6 @@ import com.android.r0dumpmanager.domain.FusionValidationResult
+ import com.android.r0dumpmanager.domain.ProfileId
+ import com.android.r0dumpmanager.domain.ProfileRegistry
+ import com.android.r0dumpmanager.notification.ActiveSessionNotifier
+-import com.android.r0dumpmanager.security.AuthenticationState
+-import com.android.r0dumpmanager.security.MutationAuthenticator
+ import kotlinx.coroutines.CoroutineDispatcher
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.flow.MutableStateFlow
+@@ -48,18 +45,17 @@ data class R0dumpUiState(
+     val draft: FusionConfigDraft = FusionConfigSchema.defaults(), val deviceSnapshot: FusionDeviceSnapshot = FusionDeviceSnapshot.Unconfigured,
+     val applications: List<TargetApplication> = emptyList(), val selectedProfile: ProfileId = ProfileId.DEFAULTS,
+     val validation: FusionValidationResult = validateForUi(FusionConfigSchema.defaults()),
+-    val isOwnerUser: Boolean = UserHandle.myUserId() == UserHandle.USER_SYSTEM, val authentication: AuthenticationState = AuthenticationState.Required,
+-    val isForeground: Boolean = false, val isDeviceSecure: Boolean = false, val operation: MutationOperation = MutationOperation.Idle,
++    val isOwnerUser: Boolean = UserHandle.myUserId() == UserHandle.USER_SYSTEM,
++    val isForeground: Boolean = false, val operation: MutationOperation = MutationOperation.Idle,
+     val message: String? = null, val messageSerial: Long = 0,
+     val draftNoticeSerial: Long = 0, val draftNoticeShown: Boolean = false,
+     val lastExport: ArtifactExportResult? = null,
+ ) {
+     val isInterrupted get() = deviceSnapshot is FusionDeviceSnapshot.Interrupted
+-    val canEdit get() = isOwnerUser && isDeviceSecure && deviceSnapshot !is FusionDeviceSnapshot.Interrupted &&
++    val canEdit get() = isOwnerUser && deviceSnapshot !is FusionDeviceSnapshot.Interrupted &&
+         deviceSnapshot !is FusionDeviceSnapshot.ConcurrentChange && deviceSnapshot !is FusionDeviceSnapshot.Invalid &&
+         operation is MutationOperation.Idle
+-    val canMutate get() = isOwnerUser && isDeviceSecure && isForeground &&
+-        authentication is AuthenticationState.ValidUntil && operation is MutationOperation.Idle
++    val canMutate get() = isOwnerUser && isForeground && operation is MutationOperation.Idle
+     val isDirty get() = draft != deviceSnapshot.draftOrNull()
+     val maskText get() = FusionConfigSchema.maskText(draft.capturePointMask)
+ }
+@@ -94,7 +90,6 @@ interface R0dumpManagerDependencies {
+     fun appendAudit(entry: MutationAuditEntry)
+     fun showActiveSession(targetPackage: String, runId: String)
+     fun cancelActiveSession()
+-    fun isDeviceSecure(): Boolean
+ }
+ 
+ private class AndroidR0dumpManagerDependencies(application: Application) : R0dumpManagerDependencies {
+@@ -104,7 +99,6 @@ private class AndroidR0dumpManagerDependencies(application: Application) : R0dum
+     private val audit = MutationAuditLog(application)
+     private val notifier = ActiveSessionNotifier(application)
+     private val exports = ArtifactExportRepository()
+-    private val keyguard = application.getSystemService(KeyguardManager::class.java)
+ 
+     override suspend fun readSnapshot() = properties.read()
+     override suspend fun publish(draft: FusionConfigDraft, expectedGeneration: Long) = properties.publish(draft, expectedGeneration)
+@@ -120,14 +114,12 @@ private class AndroidR0dumpManagerDependencies(application: Application) : R0dum
+     override fun appendAudit(entry: MutationAuditEntry) = audit.append(entry)
+     override fun showActiveSession(targetPackage: String, runId: String) = notifier.show(targetPackage, runId)
+     override fun cancelActiveSession() = notifier.cancel()
+-    override fun isDeviceSecure() = keyguard.isDeviceSecure
+ }
+ 
+ class R0dumpManagerViewModel(
+     application: Application,
+     private val savedStateHandle: SavedStateHandle,
+     private val dependencies: R0dumpManagerDependencies = AndroidR0dumpManagerDependencies(application),
+-    private val authenticator: MutationAuthenticator = MutationAuthenticator(),
+     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
+ ) : AndroidViewModel(application) {
+     constructor(application: Application) : this(application, SavedStateHandle())
+@@ -144,7 +136,7 @@ class R0dumpManagerViewModel(
+         val profile = if (restored != null) restoredProfile(generation) else if (snapshot.draftOrNull() != null) ProfileId.CUSTOM else ProfileId.DEFAULTS
+         val draft = ensureManagedRunId(loadedDraft, profile)
+         if (draft != loadedDraft || restored == null && snapshot.draftOrNull() != null) saveDraft(draft, generation, profile)
+-        _uiState.update { state -> state.copy(applications = applications, deviceSnapshot = snapshot, draft = draft, selectedProfile = profile, validation = validateForUi(draft), authentication = authenticator.state(), isDeviceSecure = dependencies.isDeviceSecure(), operation = MutationOperation.Idle, draftNoticeShown = state.draftNoticeShown && draft != snapshot.draftOrNull()) }
++        _uiState.update { state -> state.copy(applications = applications, deviceSnapshot = snapshot, draft = draft, selectedProfile = profile, validation = validateForUi(draft), operation = MutationOperation.Idle, draftNoticeShown = state.draftNoticeShown && draft != snapshot.draftOrNull()) }
+     }
+     fun selectTarget(target: TargetApplication) {
+         if (!_uiState.value.canEdit) return
+@@ -184,15 +176,6 @@ class R0dumpManagerViewModel(
+     fun restoreDefaultBudgets() = updateDraft(FusionConfigSchema::restoreDefaultBudgets)
+     fun toggleCapturePoint(bit: Int) = updateDraft { it.copy(capturePointMask = CapturePointRegistry.toggle(it.capturePointMask, bit)) }
+     fun setForeground(foreground: Boolean) { _uiState.update { it.copy(isForeground = foreground) } }
+-    fun setDeviceSecure(secure: Boolean) {
+-        if (!secure) authenticator.clear()
+-        _uiState.update { it.copy(isDeviceSecure = secure, authentication = authenticator.state()) }
+-    }
+-    fun authenticationSucceeded() {
+-        if (dependencies.isDeviceSecure()) authenticator.grant() else authenticator.clear()
+-        _uiState.update { it.copy(isDeviceSecure = dependencies.isDeviceSecure(), authentication = authenticator.state()) }
+-    }
+-    fun clearAuthentication() { authenticator.clear(); _uiState.update { it.copy(authentication = authenticator.state()) } }
+     fun consumeMessage(serial: Long) { _uiState.update { if (it.messageSerial == serial) it.copy(message = null) else it } }
+     fun discardDraft() {
+         savedStateHandle.remove<String>(DRAFT_KEY)
+@@ -215,12 +198,7 @@ class R0dumpManagerViewModel(
+         val packageName = state.draft.targetPackage
+         if (packageName.isBlank()) return failure(text(R.string.export_select_package))
+         if (!_uiState.value.isOwnerUser) return failure(text(R.string.error_owner_only))
+-        if (!dependencies.isDeviceSecure()) {
+-            setDeviceSecure(false)
+-            return failure(text(R.string.error_device_credential_required))
+-        }
+         if (!_uiState.value.isForeground) return failure(text(R.string.error_foreground_required))
+-        if (!authenticator.isAuthenticated()) return failure(text(R.string.error_authentication_required))
+         if (!inFlight.compareAndSet(false, true)) return
+         _uiState.update { it.copy(operation = MutationOperation.Exporting, lastExport = null) }
+         viewModelScope.launch(ioDispatcher) {
+@@ -237,7 +215,6 @@ class R0dumpManagerViewModel(
+                 _uiState.update {
+                     it.copy(
+                         operation = MutationOperation.Idle,
+-                        authentication = authenticator.state(),
+                         lastExport = result,
+                     ).message(text(R.string.export_completed, result.archivePath))
+                 }
+@@ -282,21 +259,16 @@ class R0dumpManagerViewModel(
+     }
+     private fun execute(action: MutationAction, work: suspend () -> FusionDeviceSnapshot) {
+         if (!_uiState.value.isOwnerUser) return failure(text(R.string.error_owner_only))
+-        if (!dependencies.isDeviceSecure()) {
+-            setDeviceSecure(false)
+-            return failure(text(R.string.error_device_credential_required))
+-        }
+         if (!_uiState.value.isForeground) return failure(text(R.string.error_foreground_required))
+-        if (!authenticator.isAuthenticated()) return failure(text(R.string.error_authentication_required))
+         if (!inFlight.compareAndSet(false, true)) return
+         _uiState.update { it.copy(operation = MutationOperation.Publishing) }
+         viewModelScope.launch(ioDispatcher) { runCatching { work() }.onSuccess { snapshot ->
+             dependencies.appendAudit(MutationAuditEntry(System.currentTimeMillis(), action, snapshot.draftOrNull()?.targetPackage, snapshot.generationOrNull(), true))
+             snapshot.draftOrNull()?.let { saveDraft(it, snapshot.generationOrNull() ?: 0L, _uiState.value.selectedProfile) }
+-            _uiState.update { it.copy(deviceSnapshot = snapshot, draft = snapshot.draftOrNull() ?: it.draft, operation = MutationOperation.Idle, authentication = authenticator.state(), draftNoticeShown = false).message(text(R.string.operation_completed)) }
++            _uiState.update { it.copy(deviceSnapshot = snapshot, draft = snapshot.draftOrNull() ?: it.draft, operation = MutationOperation.Idle, draftNoticeShown = false).message(text(R.string.operation_completed)) }
+         }.onFailure { error -> dependencies.appendAudit(MutationAuditEntry(System.currentTimeMillis(), action, _uiState.value.draft.targetPackage.ifBlank { null }, _uiState.value.deviceSnapshot.generationOrNull(), false)); failure(text(R.string.operation_failed, error.message ?: error.javaClass.simpleName)) }; inFlight.set(false) }
+     }
+-    private fun failure(text: String) { _uiState.update { it.copy(operation = MutationOperation.Idle, authentication = authenticator.state()).message(text) } }
++    private fun failure(text: String) { _uiState.update { it.copy(operation = MutationOperation.Idle).message(text) } }
+ 
+     private fun saveDraft(draft: FusionConfigDraft, generation: Long, profile: ProfileId) {
+         savedStateHandle[DRAFT_KEY] = FusionConfigSchema.toJson(draft)
+diff --git a/src/com/android/r0dumpmanager/domain/CapturePointRegistry.kt b/src/com/android/r0dumpmanager/domain/CapturePointRegistry.kt
+index c5d774d..049d3d6 100644
+--- a/src/com/android/r0dumpmanager/domain/CapturePointRegistry.kt
++++ b/src/com/android/r0dumpmanager/domain/CapturePointRegistry.kt
+@@ -8,7 +8,7 @@ data class CapturePoint(
+ )
+ 
+ object CapturePointRegistry {
+-    const val pointCount = 42
++    const val pointCount = 43
+     val definedMask: ULong = (1uL shl pointCount) - 1uL
+     val undefinedMask: ULong = definedMask.inv()
+     val forceNoExecuteMask: ULong = 1uL shl 41
+@@ -56,6 +56,7 @@ object CapturePointRegistry {
+         CapturePoint(39, "Walk.cookie.dex", "r0dump_Runtime_r0dump_CaptureCookie", "active DEX snapshot"),
+         CapturePoint(40, "Walk.executable.method", "r0dump_Runtime_r0dump_CaptureExecutable", "active method evidence"),
+         CapturePoint(41, "ForceInvoke.no_execute", "ArtMethod::Invoke", "active CodeItem"),
++        CapturePoint(42, "Nterp.method.entry", "ExecuteNterpImpl", "Nterp method evidence"),
+     )
+     init { check(points.map { it.bit } == (0 until pointCount).toList()) }
+     fun contains(mask: ULong, bit: Int) = bit in 0 until pointCount && (mask and (1uL shl bit)) != 0uL
+diff --git a/src/com/android/r0dumpmanager/security/MutationAuthenticator.kt b/src/com/android/r0dumpmanager/security/MutationAuthenticator.kt
+deleted file mode 100644
+index 211cef3..0000000
+--- a/src/com/android/r0dumpmanager/security/MutationAuthenticator.kt
++++ /dev/null
+@@ -1,18 +0,0 @@
+-package com.android.r0dumpmanager.security
+-
+-import android.os.SystemClock
+-
+-sealed interface AuthenticationState {
+-    data object Required : AuthenticationState
+-    data class ValidUntil(val elapsedRealtime: Long) : AuthenticationState
+-}
+-
+-/** In-memory only device-credential grant; it is lost on process death by design. */
+-class MutationAuthenticator(private val clock: () -> Long = SystemClock::elapsedRealtime) {
+-    private var expiry = 0L
+-    fun grant() { expiry = clock() + AUTH_WINDOW_MS }
+-    fun clear() { expiry = 0L }
+-    fun isAuthenticated() = clock() < expiry
+-    fun state(): AuthenticationState = if (isAuthenticated()) AuthenticationState.ValidUntil(expiry) else AuthenticationState.Required
+-    companion object { const val AUTH_WINDOW_MS = 5 * 60 * 1000L }
+-}
+diff --git a/src/com/android/r0dumpmanager/ui/R0dumpManagerScreen.kt b/src/com/android/r0dumpmanager/ui/R0dumpManagerScreen.kt
+index cbb5c78..cfef4d0 100644
+--- a/src/com/android/r0dumpmanager/ui/R0dumpManagerScreen.kt
++++ b/src/com/android/r0dumpmanager/ui/R0dumpManagerScreen.kt
+@@ -161,8 +161,6 @@ fun processModeOf(draft: FusionConfigDraft): ProcessMode = when {
+ fun R0dumpManagerScreen(
+     viewModel: R0dumpManagerViewModel,
+     windowSizeClass: WindowSizeClass,
+-    onAuthenticate: ((() -> Unit) -> Unit) = { continuation -> continuation() },
+-    isDeviceSecure: Boolean = true,
+     notificationsEnabled: Boolean = true,
+     onRequestNotifications: () -> Unit = {},
+     onExit: () -> Unit = {},
+@@ -217,11 +215,9 @@ fun R0dumpManagerScreen(
+                 }
+                 CaptureStateToggle(
+                     state = state,
+-                    onAuthenticate = onAuthenticate,
+                     onPublishAndLaunch = viewModel::publishAndLaunch,
+                     onEndSession = viewModel::endSession,
+                     onRecoverInterrupted = viewModel::recoverInterrupted,
+-                    isDeviceSecure = isDeviceSecure,
+                     notificationsEnabled = notificationsEnabled,
+                     onRequestNotifications = onRequestNotifications,
+                 )
+@@ -266,14 +262,12 @@ fun R0dumpManagerScreen(
+                             state,
+                             viewModel,
+                             Modifier.fillMaxHeight().widthIn(max = 720.dp),
+-                            isDeviceSecure,
+                             compact,
+                             uiStateStore,
+-                            onAuthenticate,
+                         )
+                     }
+                 } else {
+-                    DestinationContent(destination, state, viewModel, Modifier.weight(1f), isDeviceSecure, compact, uiStateStore, onAuthenticate)
++                    DestinationContent(destination, state, viewModel, Modifier.weight(1f), compact, uiStateStore)
+                 }
+                 if (!compact && shouldShowActionToolbar(state)) {
+                     FusionActionToolbar(
+@@ -468,13 +462,11 @@ private fun DestinationContent(
+     state: R0dumpUiState,
+     viewModel: R0dumpManagerViewModel,
+     modifier: Modifier,
+-    isDeviceSecure: Boolean,
+     compact: Boolean,
+     uiStateStore: UiStateStore,
+-    onAuthenticate: ((() -> Unit) -> Unit),
+ ) {
+     when (destination) {
+-        Destination.APPLICATION -> ApplicationScreen(state, viewModel, modifier, isDeviceSecure, compact, onAuthenticate)
++        Destination.APPLICATION -> ApplicationScreen(state, viewModel, modifier, compact)
+         Destination.CAPTURE -> CaptureScreen(state, viewModel, modifier, uiStateStore)
+         Destination.LIMITS -> LimitsScreen(state, viewModel, modifier, uiStateStore)
+         Destination.ADVANCED -> AdvancedScreen(state, viewModel, modifier, uiStateStore)
+@@ -496,11 +488,9 @@ private fun rememberPersistedUiString(
+ @Composable
+ fun CaptureStateToggle(
+     state: R0dumpUiState,
+-    onAuthenticate: ((() -> Unit) -> Unit),
+     onPublishAndLaunch: () -> Unit,
+     onEndSession: () -> Unit,
+     onRecoverInterrupted: () -> Unit,
+-    isDeviceSecure: Boolean,
+     notificationsEnabled: Boolean,
+     onRequestNotifications: () -> Unit,
+ ) {
+@@ -508,14 +498,14 @@ fun CaptureStateToggle(
+     val publishing = state.operation is MutationOperation.Publishing
+     val active = state.deviceSnapshot is FusionDeviceSnapshot.Enabled
+     val enabled = when {
+-        publishing || !state.isOwnerUser || !isDeviceSecure -> false
++        publishing || !state.isOwnerUser -> false
+         !state.canMutate -> true
+         state.isInterrupted || active -> true
+         else -> state.validation.isValid
+     }
+     val description = stringResource(
+         when {
+-            !state.canMutate -> R.string.capture_toggle_authenticate
++            !state.canMutate -> R.string.capture_toggle_enable
+             state.isInterrupted -> R.string.recover_disabled_state
+             active -> R.string.capture_toggle_disable
+             else -> R.string.capture_toggle_enable
+@@ -544,7 +534,7 @@ fun CaptureStateToggle(
+                     enabled = enabled,
+                     role = Role.Switch,
+                     onValueChange = {
+-                        if (state.canMutate) continueTransition() else onAuthenticate(continueTransition)
++                        continueTransition()
+                     },
+                 )
+                 .semantics { contentDescription = description },
+@@ -600,9 +590,7 @@ private fun ApplicationScreen(
+     state: R0dumpUiState,
+     viewModel: R0dumpManagerViewModel,
+     modifier: Modifier,
+-    isDeviceSecure: Boolean,
+     compact: Boolean,
+-    onAuthenticate: ((() -> Unit) -> Unit),
+ ) {
+     var query by rememberSaveable { mutableStateOf("") }
+     var searchExpanded by rememberSaveable { mutableStateOf(false) }
+@@ -618,7 +606,6 @@ private fun ApplicationScreen(
+     Box(modifier) {
+         Page(Modifier.fillMaxSize()) {
+             if (!state.isOwnerUser) StatusSurface(stringResource(R.string.owner_user_only), stringResource(R.string.owner_user_only_detail), true)
+-            if (!isDeviceSecure) StatusSurface(stringResource(R.string.device_credential_required), stringResource(R.string.device_credential_required_detail), true)
+             Text(stringResource(R.string.select_application), style = MaterialTheme.typography.titleLarge)
+             ApplicationSearchBar(
+                 query = query,
+@@ -663,7 +650,7 @@ private fun ApplicationScreen(
+                     }
+                 }
+             }
+-            ArtifactExportSection(state, viewModel, onAuthenticate)
++            ArtifactExportSection(state, viewModel)
+         }
+         if (searchExpanded) {
+             ApplicationSearchBar(
+@@ -697,7 +684,6 @@ private fun ApplicationScreen(
+ private fun ArtifactExportSection(
+     state: R0dumpUiState,
+     viewModel: R0dumpManagerViewModel,
+-    onAuthenticate: ((() -> Unit) -> Unit),
+ ) {
+     val exporting = state.operation is MutationOperation.Exporting
+     val startExport = { viewModel.exportLatest() }
+@@ -710,10 +696,10 @@ private fun ArtifactExportSection(
+     )
+     Button(
+         onClick = {
+-            if (state.canMutate) startExport() else onAuthenticate(startExport)
++            startExport()
+         },
+         modifier = Modifier.fillMaxWidth(),
+-        enabled = state.isOwnerUser && state.isDeviceSecure &&
++        enabled = state.isOwnerUser &&
+             state.draft.targetPackage.isNotBlank() && state.operation is MutationOperation.Idle,
+     ) {
+         if (exporting) {
+@@ -732,6 +718,7 @@ private fun ArtifactExportSection(
+                 result.repaired,
+                 result.partial,
+                 result.codeItemsBackfilled,
++                result.usableOutputs,
+             ),
+             style = MaterialTheme.typography.bodyMedium,
+         )
+@@ -741,7 +728,13 @@ private fun ArtifactExportSection(
+             color = MaterialTheme.colorScheme.onSurfaceVariant,
+         )
+         Text(
+-            stringResource(R.string.artifact_export_includes),
++            stringResource(
++                if (result.usableOutputs > 0) {
++                    R.string.artifact_export_jadx_ready
++                } else {
++                    R.string.artifact_export_jadx_unavailable
++                },
++            ),
+             style = MaterialTheme.typography.bodySmall,
+             color = MaterialTheme.colorScheme.onSurfaceVariant,
+         )
+@@ -968,13 +961,13 @@ private fun CaptureScreen(
+     }
+ }
+ 
+-private val pointGroups = listOf(
++internal val pointGroups = listOf(
+     R.string.group_dex_establishment to CapturePointRegistry.points.filter { it.bit in 0..7 },
+     R.string.group_class_linker to CapturePointRegistry.points.filter { it.bit in 8..15 },
+     R.string.group_oat_vdex to CapturePointRegistry.points.filter { it.bit in 16..21 },
+     R.string.group_execution_jit to CapturePointRegistry.points.filter { it.bit in 22..31 },
+     R.string.group_java_route to CapturePointRegistry.points.filter { it.bit in 32..38 },
+-    R.string.group_active_observation to CapturePointRegistry.points.filter { it.bit in 39..41 },
++    R.string.group_active_observation to CapturePointRegistry.points.filter { it.bit in 39..42 },
+ )
+ 
+ fun defaultExpandedCaptureGroupIndexes(): Set<Int> = emptySet()
+diff --git a/tests/src/com/android/r0dumpmanager/app/R0dumpManagerViewModelTest.kt b/tests/src/com/android/r0dumpmanager/app/R0dumpManagerViewModelTest.kt
+index 9eacabe..857b352 100644
+--- a/tests/src/com/android/r0dumpmanager/app/R0dumpManagerViewModelTest.kt
++++ b/tests/src/com/android/r0dumpmanager/app/R0dumpManagerViewModelTest.kt
+@@ -16,7 +16,6 @@ import kotlinx.coroutines.CompletableDeferred
+ import kotlinx.coroutines.Dispatchers
+ import org.junit.Assert.assertEquals
+ import org.junit.Assert.assertFalse
+-import org.junit.Assert.assertNull
+ import org.junit.Assert.assertTrue
+ import org.junit.Test
+ 
+@@ -89,17 +88,22 @@ class R0dumpManagerViewModelTest {
+     }
+ 
+     @Test
+-    fun mutationRechecksDeviceSecurityAtExecutionBoundary() {
++    fun mutationRunsWithoutAuthenticationSetup() {
+         val dependencies = FakeDependencies()
+-        val viewModel = configuredViewModel(dependencies)
+-        dependencies.secure = false
++        val viewModel = R0dumpManagerViewModel(
++            application = application,
++            savedStateHandle = SavedStateHandle(),
++            dependencies = dependencies,
++            ioDispatcher = Dispatchers.Unconfined,
++        )
++        viewModel.setForeground(true)
++        viewModel.setDraft(validDraft())
+ 
+         viewModel.publish()
+ 
+-        assertEquals(0, dependencies.publishCalls)
+-        assertNull(dependencies.publishedDraft)
+-        assertFalse(viewModel.uiState.value.isDeviceSecure)
+-        assertFalse(viewModel.uiState.value.canMutate)
++        assertEquals(1, dependencies.publishCalls)
++        assertTrue(dependencies.publishedDraft != null)
++        assertTrue(viewModel.uiState.value.canMutate)
+     }
+ 
+     @Test
+@@ -167,13 +171,12 @@ class R0dumpManagerViewModelTest {
+     }
+ 
+     @Test
+-    fun insecureAndConcurrentStatesAreReadOnly() {
+-        val secureState = R0dumpUiState(isOwnerUser = true, isDeviceSecure = true)
++    fun concurrentAndInvalidStatesAreReadOnly() {
++        val editableState = R0dumpUiState(isOwnerUser = true)
+ 
+-        assertFalse(secureState.copy(isDeviceSecure = false).canEdit)
+-        assertFalse(secureState.copy(deviceSnapshot = FusionDeviceSnapshot.ConcurrentChange).canEdit)
+-        assertFalse(secureState.copy(deviceSnapshot = FusionDeviceSnapshot.Invalid("schema")).canEdit)
+-        assertTrue(secureState.copy(deviceSnapshot = FusionDeviceSnapshot.Unconfigured).canEdit)
++        assertFalse(editableState.copy(deviceSnapshot = FusionDeviceSnapshot.ConcurrentChange).canEdit)
++        assertFalse(editableState.copy(deviceSnapshot = FusionDeviceSnapshot.Invalid("schema")).canEdit)
++        assertTrue(editableState.copy(deviceSnapshot = FusionDeviceSnapshot.Unconfigured).canEdit)
+     }
+ 
+     @Test
+@@ -234,8 +237,6 @@ class R0dumpManagerViewModelTest {
+             ioDispatcher = Dispatchers.Unconfined,
+         )
+         viewModel.setForeground(true)
+-        viewModel.setDeviceSecure(true)
+-        viewModel.authenticationSucceeded()
+         viewModel.setDraft(validDraft())
+         return viewModel
+     }
+@@ -251,7 +252,6 @@ class R0dumpManagerViewModelTest {
+ }
+ 
+ private class FakeDependencies : R0dumpManagerDependencies {
+-    var secure = true
+     var snapshot: FusionDeviceSnapshot = FusionDeviceSnapshot.Unconfigured
+     var publishedDraft: FusionConfigDraft? = null
+     var publishCalls = 0
+@@ -337,5 +337,4 @@ private class FakeDependencies : R0dumpManagerDependencies {
+         cancelNotificationCalls++
+         events += "cancel-notification"
+     }
+-    override fun isDeviceSecure() = secure
+ }
+diff --git a/tests/src/com/android/r0dumpmanager/domain/FusionConfigContractTest.kt b/tests/src/com/android/r0dumpmanager/domain/FusionConfigContractTest.kt
+index 26636a6..ae08b1d 100644
+--- a/tests/src/com/android/r0dumpmanager/domain/FusionConfigContractTest.kt
++++ b/tests/src/com/android/r0dumpmanager/domain/FusionConfigContractTest.kt
+@@ -55,12 +55,14 @@ class FusionConfigContractTest {
+             FusionConfigValidator.validate(base.copy(walkNamespacePrefix = "com.example.ui")).errors["walk_namespace_prefix"]?.code,
+         )
+     }
+-    @Test fun captureRegistryIsTheFortyTwoBitArtContract() {
+-        assertEquals(42, CapturePointRegistry.points.size)
+-        assertEquals((0..41).toList(), CapturePointRegistry.points.map { it.bit })
++    @Test fun captureRegistryIsTheFortyThreeBitArtContract() {
++        assertEquals(43, CapturePointRegistry.points.size)
++        assertEquals((0..42).toList(), CapturePointRegistry.points.map { it.bit })
+         assertEquals("DexFileLoader::OpenCommon", CapturePointRegistry.points[3].sourceLocation)
+-        assertEquals("ForceInvoke.no_execute", CapturePointRegistry.points.last().name)
+-        assertTrue(FusionConfigValidator.validate(FusionConfigSchema.defaults().copy(enabled = true, runId = "x", targetPackage = "com.example.app", targetProcess = "com.example.app", capturePointMask = 1uL shl 42)).errors.containsKey("capture_point_mask"))
++        assertEquals("ForceInvoke.no_execute", CapturePointRegistry.points[41].name)
++        assertEquals("Nterp.method.entry", CapturePointRegistry.points.last().name)
++        assertFalse(FusionConfigValidator.validate(FusionConfigSchema.defaults().copy(enabled = true, runId = "x", targetPackage = "com.example.app", targetProcess = "com.example.app", capturePointMask = 1uL shl 42, forceInvokeEnabled = false)).errors.containsKey("capture_point_mask"))
++        assertTrue(FusionConfigValidator.validate(FusionConfigSchema.defaults().copy(enabled = true, runId = "x", targetPackage = "com.example.app", targetProcess = "com.example.app", capturePointMask = 1uL shl 43)).errors.containsKey("capture_point_mask"))
+     }
+     @Test fun forceInvokeRequiresNoExecuteAndStrictDescriptor() {
+         val base = FusionConfigSchema.defaults().copy(enabled = true, runId = "run-1", targetPackage = "com.example.app", targetProcess = "com.example.app", capturePointMask = 0uL, forceInvokeEnabled = true, forceClass = "com.example.Target", forceMethod = "run", forceMethodDescriptor = "(Ljava/lang/String;I)V")
+diff --git a/tests/src/com/android/r0dumpmanager/security/MutationAuthenticatorTest.kt b/tests/src/com/android/r0dumpmanager/security/MutationAuthenticatorTest.kt
+deleted file mode 100644
+index 4bfc432..0000000
+--- a/tests/src/com/android/r0dumpmanager/security/MutationAuthenticatorTest.kt
++++ /dev/null
+@@ -1,25 +0,0 @@
+-package com.android.r0dumpmanager.security
+-
+-import org.junit.Assert.assertFalse
+-import org.junit.Assert.assertTrue
+-import org.junit.Test
+-
+-class MutationAuthenticatorTest {
+-    @Test
+-    fun grantExpiresOnMonotonicDeadlineAndClearIsImmediate() {
+-        var now = 1_000L
+-        val authenticator = MutationAuthenticator { now }
+-        assertFalse(authenticator.isAuthenticated())
+-
+-        authenticator.grant()
+-        assertTrue(authenticator.isAuthenticated())
+-        now += MutationAuthenticator.AUTH_WINDOW_MS - 1L
+-        assertTrue(authenticator.isAuthenticated())
+-        now += 1L
+-        assertFalse(authenticator.isAuthenticated())
+-
+-        authenticator.grant()
+-        authenticator.clear()
+-        assertFalse(authenticator.isAuthenticated())
+-    }
+-}
+diff --git a/tests/src/com/android/r0dumpmanager/ui/CapturePointGroupTest.kt b/tests/src/com/android/r0dumpmanager/ui/CapturePointGroupTest.kt
+index 6ce18eb..6c80b13 100644
+--- a/tests/src/com/android/r0dumpmanager/ui/CapturePointGroupTest.kt
++++ b/tests/src/com/android/r0dumpmanager/ui/CapturePointGroupTest.kt
+@@ -7,6 +7,7 @@ import androidx.compose.ui.test.onNodeWithText
+ import androidx.compose.ui.test.performClick
+ import androidx.test.platform.app.InstrumentationRegistry
+ import com.android.r0dumpmanager.R
++import com.android.r0dumpmanager.domain.CapturePointRegistry
+ import com.android.r0dumpmanager.ui.theme.R0dumpManagerTheme
+ import org.junit.Assert.assertEquals
+ import org.junit.Rule
+@@ -23,6 +24,12 @@ class CapturePointGroupTest {
+         assertEquals(emptySet<Int>(), defaultExpandedCaptureGroupIndexes())
+     }
+ 
++    @Test
++    fun activeObservationGroupIncludesNterpEntryPoint() {
++        val activeGroup = CapturePointRegistry.points.filter { it.bit in 39..42 }
++        assertEquals(listOf(39, 40, 41, 42), activeGroup.map { it.bit })
++    }
++
+     @Test
+     fun collapsedHeaderShowsSelectionSummaryAndExpansionAction() {
+         var toggleCalls = 0
+diff --git a/tests/src/com/android/r0dumpmanager/ui/FusionActionToolbarTest.kt b/tests/src/com/android/r0dumpmanager/ui/FusionActionToolbarTest.kt
+index 5659f42..d04f1ad 100644
+--- a/tests/src/com/android/r0dumpmanager/ui/FusionActionToolbarTest.kt
++++ b/tests/src/com/android/r0dumpmanager/ui/FusionActionToolbarTest.kt
+@@ -18,7 +18,6 @@ import com.android.r0dumpmanager.domain.FusionConfigSchema
+ import com.android.r0dumpmanager.domain.FusionConfigValidator
+ import com.android.r0dumpmanager.domain.ProfileId
+ import com.android.r0dumpmanager.domain.ProfileRegistry
+-import com.android.r0dumpmanager.security.AuthenticationState
+ import com.android.r0dumpmanager.ui.theme.R0dumpManagerTheme
+ import org.junit.Assert.assertEquals
+ import org.junit.Rule
+@@ -30,29 +29,11 @@ class FusionActionToolbarTest {
+ 
+     private val context get() = InstrumentationRegistry.getInstrumentation().targetContext
+ 
+-    @Test
+-    fun unauthenticatedToggleAuthenticatesThenContinuesEnableFlow() {
+-        var authenticationCalls = 0
+-        var publishAndLaunchCalls = 0
+-        setToggle(
+-            state = state(snapshot = disabledSnapshot(), authenticated = false),
+-            onAuthenticate = { continuation -> authenticationCalls++; continuation() },
+-            onPublishAndLaunch = { publishAndLaunchCalls++ },
+-        )
+-
+-        composeTestRule
+-            .onNodeWithContentDescription(text(R.string.capture_toggle_authenticate))
+-            .performClick()
+-
+-        assertEquals(1, authenticationCalls)
+-        assertEquals(1, publishAndLaunchCalls)
+-    }
+-
+     @Test
+     fun disabledStateEnablesFromTopBarToggle() {
+         var publishAndLaunchCalls = 0
+         setToggle(
+-            state = state(snapshot = disabledSnapshot(), authenticated = true),
++            state = state(snapshot = disabledSnapshot()),
+             onPublishAndLaunch = { publishAndLaunchCalls++ },
+         )
+ 
+@@ -68,7 +49,7 @@ class FusionActionToolbarTest {
+         var endSessionCalls = 0
+         val draft = validDraft().copy(enabled = true)
+         setToggle(
+-            state = state(FusionDeviceSnapshot.Enabled(draft, 42), authenticated = true),
++            state = state(FusionDeviceSnapshot.Enabled(draft, 42)),
+             onEndSession = { endSessionCalls++ },
+         )
+ 
+@@ -83,7 +64,7 @@ class FusionActionToolbarTest {
+     fun interruptedStateRecoversFromTopBarToggle() {
+         var recoveryCalls = 0
+         setToggle(
+-            state = state(FusionDeviceSnapshot.Interrupted(43), authenticated = true),
++            state = state(FusionDeviceSnapshot.Interrupted(43)),
+             onRecoverInterrupted = { recoveryCalls++ },
+         )
+ 
+@@ -96,7 +77,7 @@ class FusionActionToolbarTest {
+ 
+     @Test
+     fun validationToolbarNamesTheFieldAndExplainsHowToCorrectIt() {
+-        setToolbar(state = invalidTargetProcessState(authenticated = true))
++        setToolbar(state = invalidTargetProcessState())
+ 
+         composeTestRule.onNodeWithText(
+             text(
+@@ -110,9 +91,9 @@ class FusionActionToolbarTest {
+ 
+     @Test
+     fun validDirtyDraftUsesToastAndTopBarPublishInsteadOfPersistentToolbar() {
+-        assertEquals(false, shouldShowActionToolbar(state(snapshot = disabledSnapshot(), authenticated = true)))
+-        assertEquals(false, shouldShowActionToolbar(dirtyState(authenticated = true)))
+-        assertEquals(true, shouldShowDraftPublishAction(dirtyState(authenticated = true)))
++        assertEquals(false, shouldShowActionToolbar(state(snapshot = disabledSnapshot())))
++        assertEquals(false, shouldShowActionToolbar(dirtyState()))
++        assertEquals(true, shouldShowDraftPublishAction(dirtyState()))
+ 
+         assertEquals(false, shouldShowDraftChangedToast(consumedSerial = 0, currentSerial = 0))
+         assertEquals(true, shouldShowDraftChangedToast(consumedSerial = 0, currentSerial = 1))
+@@ -144,8 +125,8 @@ class FusionActionToolbarTest {
+         }
+     }
+ 
+-    private fun dirtyState(authenticated: Boolean): R0dumpUiState {
+-        val state = state(snapshot = disabledSnapshot(), authenticated = authenticated)
++    private fun dirtyState(): R0dumpUiState {
++        val state = state(snapshot = disabledSnapshot())
+         val dirtyDraft = state.draft.copy(maxRecords = state.draft.maxRecords - 1)
+         return state.copy(
+             draft = dirtyDraft,
+@@ -153,8 +134,8 @@ class FusionActionToolbarTest {
+         )
+     }
+ 
+-    private fun invalidTargetProcessState(authenticated: Boolean): R0dumpUiState {
+-        val state = state(snapshot = disabledSnapshot(), authenticated = authenticated)
++    private fun invalidTargetProcessState(): R0dumpUiState {
++        val state = state(snapshot = disabledSnapshot())
+         val invalidDraft = state.draft.copy(targetProcess = "${state.draft.targetPackage}:")
+         return state.copy(
+             draft = invalidDraft,
+@@ -164,7 +145,6 @@ class FusionActionToolbarTest {
+ 
+     private fun setToggle(
+         state: R0dumpUiState,
+-        onAuthenticate: ((() -> Unit) -> Unit) = { continuation -> continuation() },
+         onPublishAndLaunch: () -> Unit = {},
+         onEndSession: () -> Unit = {},
+         onRecoverInterrupted: () -> Unit = {},
+@@ -173,11 +153,9 @@ class FusionActionToolbarTest {
+             R0dumpManagerTheme {
+                 CaptureStateToggle(
+                     state = state,
+-                    onAuthenticate = onAuthenticate,
+                     onPublishAndLaunch = onPublishAndLaunch,
+                     onEndSession = onEndSession,
+                     onRecoverInterrupted = onRecoverInterrupted,
+-                    isDeviceSecure = true,
+                     notificationsEnabled = true,
+                     onRequestNotifications = {},
+                 )
+@@ -185,19 +163,13 @@ class FusionActionToolbarTest {
+         }
+     }
+ 
+-    private fun state(snapshot: FusionDeviceSnapshot, authenticated: Boolean): R0dumpUiState {
++    private fun state(snapshot: FusionDeviceSnapshot): R0dumpUiState {
+         val draft = snapshot.draftOrNull() ?: validDraft()
+         return R0dumpUiState(
+             draft = draft,
+             deviceSnapshot = snapshot,
+             validation = FusionConfigValidator.validate(draft, true),
+-            authentication = if (authenticated) {
+-                AuthenticationState.ValidUntil(Long.MAX_VALUE)
+-            } else {
+-                AuthenticationState.Required
+-            },
+             isForeground = true,
+-            isDeviceSecure = true,
+         )
+     }
+ 
+-- 
+2.43.0
+

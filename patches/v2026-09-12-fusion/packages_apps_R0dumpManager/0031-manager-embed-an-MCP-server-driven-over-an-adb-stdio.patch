@@ -1,0 +1,852 @@
+From 7f7ec9ee03595c4edce61bd8078c4e3e933d6f42 Mon Sep 17 00:00:00 2001
+From: Ivory <contact@ivory.cafe>
+Date: Fri, 11 Sep 2026 21:32:49 +0800
+Subject: [PATCH 31/32] manager: embed an MCP server driven over an adb stdio
+ bridge
+
+UI automation to drive the pipeline (select/configure/enable/export) is fragile.
+Add an in-app MCP (JSON-RPC 2.0) server so a host MCP client can drive it over
+adb with no UI: config write and export must run in the app process (they need
+r0dump_FusionConfig and MANAGE_R0DUMP_EXPORT), so the server lives in a
+foreground service (McpBridgeService) hosting an abstract LocalServerSocket
+'r0dump_mcp'; the r0dump_mcp_bridge native binary relays a client's stdio to it
+(launch with 'adb shell r0dump_mcp_bridge' -- exec-out does not forward stdin on
+all adb builds). Tools: read_status, list_apps, set_config, enable, disable,
+repair_export, reusing FusionPropertyRepository/PackageRepository/
+ArtifactExportRepository so behaviour matches the UI. A per-app MCP toggle
+(Advanced tab, SharedPreferences-backed) starts/stops the service. Verified on
+device: initialize/tools.list/read_status/list_apps and a set_config(defaults,
+all)+enable round-trip published mask 0x2800000002d for com.icbc.elife with no
+UI.
+---
+ AndroidManifest.xml                           |  11 +
+ helper/Android.bp                             |   6 +
+ helper/r0dump_mcp_bridge.cpp                  | 153 +++++++++
+ res/values-zh-rCN/strings.xml                 |   6 +
+ res/values/strings.xml                        |   6 +
+ .../app/R0dumpManagerViewModel.kt             |  18 +-
+ .../r0dumpmanager/mcp/McpBridgeService.kt     | 144 +++++++++
+ .../android/r0dumpmanager/mcp/McpServer.kt    | 302 ++++++++++++++++++
+ .../r0dumpmanager/ui/R0dumpManagerScreen.kt   |  25 ++
+ tools/deploy_userdebug.sh                     |   4 +
+ 10 files changed, 674 insertions(+), 1 deletion(-)
+ create mode 100644 helper/r0dump_mcp_bridge.cpp
+ create mode 100644 src/com/android/r0dumpmanager/mcp/McpBridgeService.kt
+ create mode 100644 src/com/android/r0dumpmanager/mcp/McpServer.kt
+
+diff --git a/AndroidManifest.xml b/AndroidManifest.xml
+index 25e37ba..ec03ff1 100644
+--- a/AndroidManifest.xml
++++ b/AndroidManifest.xml
+@@ -7,6 +7,8 @@
+     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+     <uses-permission android:name="android.permission.MANAGE_R0DUMP_EXPORT" />
++    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
++    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+ 
+     <application
+         android:allowBackup="false"
+@@ -27,6 +29,15 @@
+             </intent-filter>
+         </activity>
+ 
++        <service
++            android:name=".mcp.McpBridgeService"
++            android:exported="false"
++            android:foregroundServiceType="specialUse">
++            <property
++                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
++                android:value="r0dump MCP bridge socket for adb-driven automation (userdebug)" />
++        </service>
++
+         <receiver
+             android:name=".receiver.BootCompletedReceiver"
+             android:directBootAware="true"
+diff --git a/helper/Android.bp b/helper/Android.bp
+index 3212efd..e76454c 100644
+--- a/helper/Android.bp
++++ b/helper/Android.bp
+@@ -37,6 +37,12 @@ cc_binary {
+     cflags: ["-Wall", "-Wextra", "-Werror"],
+ }
+ 
++cc_binary {
++    name: "r0dump_mcp_bridge",
++    srcs: ["r0dump_mcp_bridge.cpp"],
++    cflags: ["-Wall", "-Wextra", "-Werror"],
++}
++
+ cc_test {
+     name: "r0dump_file_helper_tests",
+     host_supported: true,
+diff --git a/helper/r0dump_mcp_bridge.cpp b/helper/r0dump_mcp_bridge.cpp
+new file mode 100644
+index 0000000..21d8efc
+--- /dev/null
++++ b/helper/r0dump_mcp_bridge.cpp
+@@ -0,0 +1,153 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++// Thin stdio<->socket relay for the R0dumpManager MCP server.
++//
++// The manager app hosts an MCP (JSON-RPC 2.0) server on an abstract-namespace
++// AF_UNIX socket named "r0dump_mcp" (created by android.net.LocalServerSocket,
++// which prefixes the sun_path with a NUL byte). An MCP client on the host drives
++// it over adb with:
++//
++//     adb -s <serial> shell r0dump_mcp_bridge
++//
++// With a piped (non-tty) stdin, adb shell gives this process the client's
++// stdin/stdout as a raw byte channel (adb exec-out does not forward stdin on all
++// host/adb builds, so shell is preferred). This binary forwards those bytes to
++// and from the app socket unchanged. The framing (newline-delimited JSON-RPC) is
++// the app's concern -- the bridge is deliberately protocol-agnostic.
++
++#include <errno.h>
++#include <poll.h>
++#include <stdio.h>
++#include <string.h>
++#include <sys/socket.h>
++#include <sys/un.h>
++#include <unistd.h>
++
++namespace {
++
++constexpr char kSocketName[] = "r0dump_mcp";
++constexpr size_t kBufferSize = 65536;
++
++int ConnectAbstractSocket(const char* name) {
++  const int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
++  if (fd < 0) {
++    fprintf(stderr, "r0dump_mcp_bridge: socket: %s\n", strerror(errno));
++    return -1;
++  }
++  sockaddr_un address{};
++  address.sun_family = AF_UNIX;
++  // Abstract namespace: leading NUL, then the name (no trailing NUL counted).
++  const size_t name_length = strlen(name);
++  if (name_length + 1 > sizeof(address.sun_path)) {
++    fprintf(stderr, "r0dump_mcp_bridge: socket name too long\n");
++    close(fd);
++    return -1;
++  }
++  address.sun_path[0] = '\0';
++  memcpy(address.sun_path + 1, name, name_length);
++  const socklen_t length =
++      static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + 1 + name_length);
++  if (TEMP_FAILURE_RETRY(connect(fd, reinterpret_cast<sockaddr*>(&address),
++                                 length)) != 0) {
++    fprintf(stderr,
++            "r0dump_mcp_bridge: connect(@%s): %s (is the MCP switch on in "
++            "R0dumpManager?)\n",
++            name, strerror(errno));
++    close(fd);
++    return -1;
++  }
++  return fd;
++}
++
++// Copy everything available on src into dst. Returns false when the stream is
++// closed (EOF) or a fatal error occurs, so the caller can tear the relay down.
++bool Pump(int src, int dst) {
++  char buffer[kBufferSize];
++  const ssize_t count = TEMP_FAILURE_RETRY(read(src, buffer, sizeof(buffer)));
++  if (count == 0) {
++    return false;
++  }
++  if (count < 0) {
++    fprintf(stderr, "r0dump_mcp_bridge: read: %s\n", strerror(errno));
++    return false;
++  }
++  size_t written = 0;
++  while (written < static_cast<size_t>(count)) {
++    const ssize_t bytes = TEMP_FAILURE_RETRY(
++        write(dst, buffer + written, static_cast<size_t>(count) - written));
++    if (bytes <= 0) {
++      fprintf(stderr, "r0dump_mcp_bridge: write: %s\n", strerror(errno));
++      return false;
++    }
++    written += static_cast<size_t>(bytes);
++  }
++  return true;
++}
++
++}  // namespace
++
++int main() {
++  const int socket_fd = ConnectAbstractSocket(kSocketName);
++  if (socket_fd < 0) {
++    return 1;
++  }
++
++  pollfd fds[2];
++  fds[0] = {.fd = STDIN_FILENO, .events = POLLIN, .revents = 0};
++  fds[1] = {.fd = socket_fd, .events = POLLIN, .revents = 0};
++
++  // Once stdin closes we stop watching it but keep relaying the socket for a
++  // short idle window, so a request piped in without a persistent stdin (e.g.
++  // a one-shot probe) still receives its reply before we exit.
++  constexpr int kDrainIdleMs = 2000;
++  int status = 0;
++  bool stdin_open = true;
++  while (true) {
++    const int timeout = stdin_open ? -1 : kDrainIdleMs;
++    const int ready = TEMP_FAILURE_RETRY(poll(fds, 2, timeout));
++    if (ready < 0) {
++      fprintf(stderr, "r0dump_mcp_bridge: poll: %s\n", strerror(errno));
++      status = 1;
++      break;
++    }
++    if (ready == 0) {
++      break;  // Idle after stdin closed: assume the exchange is done.
++    }
++    if ((fds[1].revents & POLLIN) != 0 && !Pump(socket_fd, STDOUT_FILENO)) {
++      break;  // App closed the socket.
++    }
++    if (stdin_open && (fds[0].revents & POLLIN) != 0 &&
++        !Pump(STDIN_FILENO, socket_fd)) {
++      stdin_open = false;  // Client closed stdin; drain the socket, then exit.
++      fds[0].fd = -1;
++      fds[0].events = 0;
++    }
++    if ((fds[1].revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
++      while (Pump(socket_fd, STDOUT_FILENO)) {
++      }
++      break;  // Socket gone.
++    }
++    if (stdin_open && (fds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
++      stdin_open = false;
++      fds[0].fd = -1;
++      fds[0].events = 0;
++    }
++  }
++
++  close(socket_fd);
++  return status;
++}
+diff --git a/res/values-zh-rCN/strings.xml b/res/values-zh-rCN/strings.xml
+index 3b2c89e..996debe 100644
+--- a/res/values-zh-rCN/strings.xml
++++ b/res/values-zh-rCN/strings.xml
+@@ -225,6 +225,12 @@
+     <string name="error_no_active_session">当前没有活动会话</string>
+     <string name="operation_failed">操作失败：%1$s</string>
+ 
++    <string name="mcp_title">MCP 桥接</string>
++    <string name="mcp_desc">经 adb stdio 桥把 配置/启用/导出 暴露为 MCP 工具（userdebug 自动化）。</string>
++    <string name="mcp_connect_hint">客户端命令：adb shell r0dump_mcp_bridge</string>
++    <string name="mcp_channel">R0dump MCP 桥接</string>
++    <string name="mcp_notification_title">R0dump MCP 桥接运行中</string>
++    <string name="mcp_notification_text">正在监听 adb 驱动的 MCP 客户端。</string>
+     <string name="notification_channel">R0dump 活动会话</string>
+     <string name="notification_active_title">R0dump 会话已启用</string>
+     <string name="notification_active_text">%1$s - 运行 ID %2$s</string>
+diff --git a/res/values/strings.xml b/res/values/strings.xml
+index 829efb9..9c0d5d6 100644
+--- a/res/values/strings.xml
++++ b/res/values/strings.xml
+@@ -225,6 +225,12 @@
+     <string name="error_no_active_session">No active session</string>
+     <string name="operation_failed">Operation failed: %1$s</string>
+ 
++    <string name="mcp_title">MCP bridge</string>
++    <string name="mcp_desc">Expose config/enable/export as MCP tools over an adb stdio bridge (userdebug automation).</string>
++    <string name="mcp_connect_hint">Client command: adb shell r0dump_mcp_bridge</string>
++    <string name="mcp_channel">R0dump MCP bridge</string>
++    <string name="mcp_notification_title">R0dump MCP bridge active</string>
++    <string name="mcp_notification_text">Listening for adb-driven MCP clients.</string>
+     <string name="notification_channel">R0dump active session</string>
+     <string name="notification_active_title">R0dump session active</string>
+     <string name="notification_active_text">%1$s - run %2$s</string>
+diff --git a/src/com/android/r0dumpmanager/app/R0dumpManagerViewModel.kt b/src/com/android/r0dumpmanager/app/R0dumpManagerViewModel.kt
+index 774942c..5f1cdea 100644
+--- a/src/com/android/r0dumpmanager/app/R0dumpManagerViewModel.kt
++++ b/src/com/android/r0dumpmanager/app/R0dumpManagerViewModel.kt
+@@ -1,7 +1,9 @@
+ package com.android.r0dumpmanager.app
+ 
+ import android.app.Application
++import android.content.Context
+ import android.os.UserHandle
++import com.android.r0dumpmanager.mcp.McpBridgeService
+ import androidx.lifecycle.AndroidViewModel
+ import androidx.lifecycle.SavedStateHandle
+ import androidx.lifecycle.viewModelScope
+@@ -64,6 +66,7 @@ data class R0dumpUiState(
+     val draftNoticeSerial: Long = 0,
+     val draftNoticeShown: Boolean = false,
+     val lastExport: ArtifactExportResult? = null,
++    val mcpEnabled: Boolean = false,
+ ) {
+     val isInterrupted get() = deviceSnapshot is FusionDeviceSnapshot.Interrupted
+     val canEdit get() = isOwnerUser && deviceSnapshot !is FusionDeviceSnapshot.Interrupted &&
+@@ -139,7 +142,20 @@ class R0dumpManagerViewModel(
+     constructor(application: Application) : this(application, SavedStateHandle())
+ 
+     private val inFlight = AtomicBoolean(false); private val _uiState = MutableStateFlow(R0dumpUiState()); val uiState: StateFlow<R0dumpUiState> = _uiState.asStateFlow()
+-    init { refresh() }
++    init { refresh(); restoreMcpState() }
++    private fun mcpPrefs() = getApplication<Application>().getSharedPreferences("r0dump_mcp", Context.MODE_PRIVATE)
++    /** Start/stop the embedded MCP bridge service and remember the choice. */
++    fun setMcpEnabled(enabled: Boolean) {
++        mcpPrefs().edit().putBoolean("enabled", enabled).apply()
++        _uiState.update { it.copy(mcpEnabled = enabled) }
++        val application = getApplication<Application>()
++        if (enabled) McpBridgeService.start(application) else McpBridgeService.stop(application)
++    }
++    private fun restoreMcpState() {
++        val enabled = mcpPrefs().getBoolean("enabled", false)
++        _uiState.update { it.copy(mcpEnabled = enabled) }
++        if (enabled) McpBridgeService.start(getApplication<Application>())
++    }
+     fun refresh() = refreshInternal(preserveDraft = true)
+     /** Reload only the installed-app list (e.g. after installing a new target), leaving the draft untouched. */
+     fun rescanApplications() = viewModelScope.launch(ioDispatcher) {
+diff --git a/src/com/android/r0dumpmanager/mcp/McpBridgeService.kt b/src/com/android/r0dumpmanager/mcp/McpBridgeService.kt
+new file mode 100644
+index 0000000..cffff5c
+--- /dev/null
++++ b/src/com/android/r0dumpmanager/mcp/McpBridgeService.kt
+@@ -0,0 +1,144 @@
++package com.android.r0dumpmanager.mcp
++
++import android.app.Notification
++import android.app.NotificationChannel
++import android.app.NotificationManager
++import android.app.PendingIntent
++import android.app.Service
++import android.content.Context
++import android.content.Intent
++import android.content.pm.ServiceInfo
++import android.net.LocalServerSocket
++import android.net.LocalSocket
++import android.os.IBinder
++import android.util.Log
++import androidx.core.app.NotificationCompat
++import com.android.r0dumpmanager.MainActivity
++import com.android.r0dumpmanager.R
++import com.android.r0dumpmanager.data.export.ArtifactExportRepository
++import com.android.r0dumpmanager.data.packageinfo.PackageRepository
++import com.android.r0dumpmanager.data.property.FusionPropertyRepository
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.SupervisorJob
++import kotlinx.coroutines.cancel
++import kotlinx.coroutines.isActive
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.runInterruptible
++import java.io.BufferedReader
++import java.io.InputStreamReader
++import java.io.OutputStream
++
++/**
++ * Foreground service that hosts the [McpServer] on an abstract-namespace unix
++ * socket ("r0dump_mcp"). The `r0dump_mcp_bridge` native binary connects to it
++ * and relays a host MCP client's stdio, so the pipeline can be driven without
++ * touching the UI. Started/stopped by the MCP toggle; runs only while on.
++ */
++class McpBridgeService : Service() {
++    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
++    private var serverSocket: LocalServerSocket? = null
++
++    override fun onBind(intent: Intent?): IBinder? = null
++
++    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
++        startForeground(
++            NOTIFICATION_ID,
++            buildNotification(),
++            ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
++        )
++        if (serverSocket == null) {
++            scope.launch { serve() }
++        }
++        return START_STICKY
++    }
++
++    private suspend fun serve() {
++        val server = try {
++            LocalServerSocket(SOCKET_NAME)
++        } catch (e: Exception) {
++            Log.e(TAG, "failed to bind @$SOCKET_NAME", e)
++            stopSelf()
++            return
++        }
++        serverSocket = server
++        val mcp = McpServer(FusionPropertyRepository(), PackageRepository(this), ArtifactExportRepository())
++        while (scope.isActive) {
++            val client = try {
++                runInterruptible { server.accept() }
++            } catch (e: Exception) {
++                if (scope.isActive) Log.w(TAG, "accept ended", e)
++                break
++            }
++            Log.i(TAG, "client connected")
++            try {
++                handleClient(client, mcp)
++            } catch (e: Exception) {
++                Log.w(TAG, "client session error", e)
++            } finally {
++                runCatching { client.close() }
++            }
++        }
++    }
++
++    private suspend fun handleClient(client: LocalSocket, mcp: McpServer) {
++        val reader = BufferedReader(InputStreamReader(client.inputStream, Charsets.UTF_8))
++        val output: OutputStream = client.outputStream
++        while (scope.isActive) {
++            val line = runInterruptible { reader.readLine() } ?: break
++            if (line.isBlank()) continue
++            Log.i(TAG, "recv ${line.length} bytes")
++            val response = mcp.handle(line)
++            Log.i(TAG, "handled -> ${response?.length ?: -1} bytes")
++            if (response != null) {
++                runInterruptible {
++                    output.write(response.toByteArray(Charsets.UTF_8))
++                    output.write('\n'.code)
++                    output.flush()
++                }
++            }
++        }
++    }
++
++    override fun onDestroy() {
++        runCatching { serverSocket?.close() }
++        serverSocket = null
++        scope.cancel()
++        super.onDestroy()
++    }
++
++    private fun buildNotification(): Notification {
++        val manager = getSystemService(NotificationManager::class.java)
++        manager.createNotificationChannel(
++            NotificationChannel(CHANNEL_ID, getString(R.string.mcp_channel), NotificationManager.IMPORTANCE_LOW),
++        )
++        val contentIntent = PendingIntent.getActivity(
++            this, 0, Intent(this, MainActivity::class.java),
++            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
++        )
++        return NotificationCompat.Builder(this, CHANNEL_ID)
++            .setSmallIcon(R.drawable.ic_r0dump_manager)
++            .setContentTitle(getString(R.string.mcp_notification_title))
++            .setContentText(getString(R.string.mcp_notification_text))
++            .setContentIntent(contentIntent)
++            .setOngoing(true)
++            .setOnlyAlertOnce(true)
++            .setSilent(true)
++            .build()
++    }
++
++    companion object {
++        private const val TAG = "R0dumpMcp"
++        private const val SOCKET_NAME = "r0dump_mcp"
++        private const val CHANNEL_ID = "r0dump_mcp_bridge"
++        private const val NOTIFICATION_ID = 4200
++
++        fun start(context: Context) {
++            context.startForegroundService(Intent(context, McpBridgeService::class.java))
++        }
++
++        fun stop(context: Context) {
++            context.stopService(Intent(context, McpBridgeService::class.java))
++        }
++    }
++}
+diff --git a/src/com/android/r0dumpmanager/mcp/McpServer.kt b/src/com/android/r0dumpmanager/mcp/McpServer.kt
+new file mode 100644
+index 0000000..0b4cc8b
+--- /dev/null
++++ b/src/com/android/r0dumpmanager/mcp/McpServer.kt
+@@ -0,0 +1,302 @@
++package com.android.r0dumpmanager.mcp
++
++import com.android.r0dumpmanager.data.export.ArtifactExportException
++import com.android.r0dumpmanager.data.export.ArtifactExportRepository
++import com.android.r0dumpmanager.data.export.ArtifactExportResult
++import com.android.r0dumpmanager.data.packageinfo.PackageRepository
++import com.android.r0dumpmanager.data.property.FusionDeviceSnapshot
++import com.android.r0dumpmanager.data.property.FusionPropertyRepository
++import com.android.r0dumpmanager.domain.FusionConfigDraft
++import com.android.r0dumpmanager.domain.FusionConfigSchema
++import com.android.r0dumpmanager.domain.FusionConfigValidator
++import com.android.r0dumpmanager.domain.ProfileId
++import com.android.r0dumpmanager.domain.ProfileRegistry
++import org.json.JSONArray
++import org.json.JSONObject
++import java.time.Instant
++import java.time.ZoneOffset
++import java.time.format.DateTimeFormatter
++
++/**
++ * Minimal MCP (JSON-RPC 2.0) server exposing the r0dump pipeline as tools.
++ *
++ * Transport is newline-delimited JSON handled by [McpBridgeService]; this class
++ * is transport-agnostic and turns one request message into one response string
++ * (or null for notifications). It reuses the very repositories the UI uses, so a
++ * config published over MCP goes through the same validation, generation-sandwich
++ * write and run-id management as the on-screen flow.
++ */
++class McpServer(
++    private val properties: FusionPropertyRepository,
++    private val packages: PackageRepository,
++    private val exports: ArtifactExportRepository,
++) {
++    /** Handle one JSON-RPC message. Returns the response JSON, or null for a notification. */
++    suspend fun handle(message: String): String? {
++        val request =
++            try {
++                JSONObject(message)
++            } catch (_: Exception) {
++                return error(JSONObject.NULL, PARSE_ERROR, "parse error").toString()
++            }
++        if (!request.has("id") || request.isNull("id")) {
++            return null // Notification (e.g. notifications/initialized): no reply.
++        }
++        val id = request.get("id")
++        val method = request.optString("method")
++        return try {
++            when (method) {
++                "initialize" -> success(id, initializeResult())
++                "ping" -> success(id, JSONObject())
++                "tools/list" -> success(id, JSONObject().put("tools", toolsList()))
++                "tools/call" -> success(id, callTool(request.optJSONObject("params") ?: JSONObject()))
++                else -> error(id, METHOD_NOT_FOUND, "method not found: $method")
++            }.toString()
++        } catch (e: Exception) {
++            error(id, INTERNAL_ERROR, e.message ?: "internal error").toString()
++        }
++    }
++
++    private fun initializeResult(): JSONObject = JSONObject()
++        .put("protocolVersion", PROTOCOL_VERSION)
++        .put("capabilities", JSONObject().put("tools", JSONObject()))
++        .put("serverInfo", JSONObject().put("name", "r0dump-manager").put("version", "1"))
++
++    private fun toolsList(): JSONArray {
++        fun tool(name: String, description: String, properties: JSONObject, required: JSONArray) =
++            JSONObject()
++                .put("name", name)
++                .put("description", description)
++                .put(
++                    "inputSchema",
++                    JSONObject().put("type", "object").put("properties", properties)
++                        .put("required", required),
++                )
++        val none = JSONObject()
++        val empty = JSONArray()
++        return JSONArray()
++            .put(tool("read_status", "Read the device fusion config, generation, enabled state and validation.", none, empty))
++            .put(
++                tool(
++                    "list_apps",
++                    "List installed applications (rescans package manager each call). Optional case-insensitive 'query' filters by label or package.",
++                    JSONObject().put("query", strProp("substring to filter apps by label or package")),
++                    empty,
++                ),
++            )
++            .put(
++                tool(
++                    "set_config",
++                    "Build and publish a fusion config. 'profile' (defaults|coolapk|custom) seeds the draft; other fields override it.",
++                    JSONObject()
++                        .put("package", strProp("target package name"))
++                        .put("process", strProp("'main', 'all', or an explicit process name"))
++                        .put("profile", strProp("defaults | coolapk | custom (default: custom, keep current)"))
++                        .put("capture_mask", strProp("capture_point_mask as 0x-hex or decimal"))
++                        .put("max_records", intProp("record budget"))
++                        .put("max_artifacts", intProp("artifact budget"))
++                        .put("enabled", boolProp("publish enabled (default: keep current)")),
++                    JSONArray().put("package"),
++                ),
++            )
++            .put(tool("enable", "Publish the current draft with capture enabled.", none, empty))
++            .put(tool("disable", "Disable capture on the device.", none, empty))
++            .put(
++                tool(
++                    "repair_export",
++                    "Repair and export the configured run; returns verified/usable counts and the archive path.",
++                    JSONObject().put("package", strProp("package to export (default: current target)")),
++                    empty,
++                ),
++            )
++    }
++
++    private suspend fun callTool(params: JSONObject): JSONObject {
++        val name = params.optString("name")
++        val args = params.optJSONObject("arguments") ?: JSONObject()
++        return try {
++            val payload = when (name) {
++                "read_status" -> readStatus()
++                "list_apps", "rescan_apps" -> listApps(args.optString("query"))
++                "set_config" -> setConfig(args)
++                "enable" -> enable()
++                "disable" -> disable()
++                "repair_export" -> repairExport(args)
++                else -> return toolError("unknown tool: $name")
++            }
++            toolResult(payload, isError = false)
++        } catch (e: ArtifactExportException) {
++            toolError("export failed: status=${e.status} detail=${e.detail}")
++        } catch (e: Exception) {
++            toolError(e.message ?: "tool error")
++        }
++    }
++
++    private suspend fun readStatus(): JSONObject = snapshotJson(properties.read())
++
++    private fun listApps(query: String?): JSONObject {
++        val needle = query?.trim().orEmpty()
++        val apps = packages.loadInstalledApplications()
++            .filter {
++                needle.isEmpty() || it.label.contains(needle, true) || it.packageName.contains(needle, true)
++            }
++        val array = JSONArray()
++        for (app in apps) {
++            array.put(
++                JSONObject()
++                    .put("package", app.packageName)
++                    .put("label", app.label)
++                    .put("launchable", app.launchable)
++                    .put("system", app.isSystem),
++            )
++        }
++        return JSONObject().put("count", array.length()).put("apps", array)
++    }
++
++    private suspend fun setConfig(args: JSONObject): JSONObject {
++        if (!args.has("package")) throw IllegalArgumentException("package is required")
++        val snapshot = properties.read()
++        val generation = snapshot.generationOrNull() ?: 0L
++        val current = snapshot.draftOrNull() ?: FusionConfigSchema.defaults()
++        val profile = when (args.optString("profile", "custom").lowercase()) {
++            "defaults", "default" -> ProfileId.DEFAULTS
++            "coolapk", "coolapk_cookie_walk", "cookie" -> ProfileId.COOLAPK_COOKIE_WALK
++            else -> ProfileId.CUSTOM
++        }
++        val seeded = if (profile == ProfileId.CUSTOM) current else ProfileRegistry.apply(profile, current)
++        val pkg = args.getString("package")
++        val process = when (val requested = args.optString("process", "main").lowercase()) {
++            "all" -> ""
++            "main", "" -> pkg
++            else -> if (requested == args.optString("process")) args.getString("process") else requested
++        }
++        var draft = seeded.copy(
++            targetPackage = pkg,
++            targetProcess = process,
++            maxRecords = args.optLong("max_records", seeded.maxRecords),
++            maxArtifacts = args.optLong("max_artifacts", seeded.maxArtifacts),
++            enabled = args.optBoolean("enabled", seeded.enabled),
++        )
++        if (args.has("capture_mask")) {
++            draft = draft.copy(capturePointMask = parseMask(args.getString("capture_mask")))
++        }
++        if (!FusionConfigValidator.isValidRunId(draft.runId)) {
++            draft = draft.copy(runId = createRunId(pkg, profile))
++        }
++        val validation = FusionConfigValidator.validate(draft, requireEnabled = draft.enabled)
++        if (!validation.isValid) {
++            return JSONObject()
++                .put("ok", false)
++                .put("reason", "validation")
++                .put("errors", JSONArray(validation.errors.keys.sorted()))
++        }
++        return snapshotJson(properties.publish(draft, generation)).put("ok", true)
++    }
++
++    private suspend fun enable(): JSONObject {
++        val snapshot = properties.read()
++        val draft = snapshot.draftOrNull()
++            ?: throw IllegalStateException("no config to enable; call set_config first")
++        val generation = snapshot.generationOrNull() ?: 0L
++        return snapshotJson(properties.publish(draft.copy(enabled = true), generation)).put("ok", true)
++    }
++
++    private suspend fun disable(): JSONObject {
++        val generation = properties.read().generationOrNull() ?: 0L
++        return snapshotJson(properties.disable(generation)).put("ok", true)
++    }
++
++    private suspend fun repairExport(args: JSONObject): JSONObject {
++        val pkg = args.optString("package").ifBlank {
++            properties.read().draftOrNull()?.targetPackage.orEmpty()
++        }
++        if (pkg.isBlank()) throw IllegalArgumentException("package is required (no current target)")
++        return exportJson(exports.exportLatest(pkg))
++    }
++
++    private fun snapshotJson(snapshot: FusionDeviceSnapshot): JSONObject {
++        val json = JSONObject()
++        when (snapshot) {
++            is FusionDeviceSnapshot.Enabled ->
++                json.put("state", "enabled").put("generation", snapshot.generation)
++                    .put("enabled", true).put("config", JSONObject(FusionConfigSchema.toJson(snapshot.draft)))
++            is FusionDeviceSnapshot.Disabled ->
++                json.put("state", "disabled").put("generation", snapshot.generation)
++                    .put("enabled", false).put("config", JSONObject(FusionConfigSchema.toJson(snapshot.draft)))
++            is FusionDeviceSnapshot.Interrupted ->
++                json.put("state", "interrupted").put("generation", snapshot.generation)
++            is FusionDeviceSnapshot.Invalid -> json.put("state", "invalid").put("reason", snapshot.reason)
++            FusionDeviceSnapshot.Unconfigured -> json.put("state", "unconfigured")
++            FusionDeviceSnapshot.ConcurrentChange -> json.put("state", "concurrent_change")
++        }
++        return json
++    }
++
++    private fun exportJson(result: ArtifactExportResult): JSONObject = JSONObject()
++        .put("ok", true)
++        .put("runId", result.runId)
++        .put("archivePath", result.archivePath)
++        .put("sha256", result.sha256)
++        .put("remoteArtifactCount", result.remoteArtifactCount)
++        .put("recordCount", result.recordCount)
++        .put("verified", result.verified)
++        .put("repaired", result.repaired)
++        .put("partial", result.partial)
++        .put("usableOutputs", result.usableOutputs)
++        .put("codeItemsBackfilled", result.codeItemsBackfilled)
++
++    private fun parseMask(raw: String): ULong {
++        val text = raw.trim()
++        return if (text.startsWith("0x") || text.startsWith("0X")) {
++            text.substring(2).toULong(16)
++        } else {
++            text.toULong()
++        }
++    }
++
++    private fun createRunId(packageName: String, profile: ProfileId): String {
++        val timestamp = DateTimeFormatter.ofPattern("yyyyMMdd'T'HHmmss'Z'").withZone(ZoneOffset.UTC).format(Instant.now())
++        val tail = packageName.substringAfterLast('.').filter { it.isLetterOrDigit() }.take(20).ifBlank { "target" }
++        val slug = profile.name.lowercase().replace('_', '-')
++        return "$timestamp-$tail-$slug".take(64)
++    }
++
++    private fun toolResult(payload: JSONObject, isError: Boolean): JSONObject =
++        JSONObject()
++            .put("content", JSONArray().put(JSONObject().put("type", "text").put("text", payload.toString())))
++            .put("isError", isError)
++
++    private fun toolError(message: String): JSONObject =
++        toolResult(JSONObject().put("ok", false).put("error", message), isError = true)
++
++    private fun success(id: Any?, result: JSONObject): JSONObject =
++        JSONObject().put("jsonrpc", "2.0").put("id", id ?: JSONObject.NULL).put("result", result)
++
++    private fun error(id: Any?, code: Int, message: String): JSONObject =
++        JSONObject().put("jsonrpc", "2.0").put("id", id ?: JSONObject.NULL)
++            .put("error", JSONObject().put("code", code).put("message", message))
++
++    private fun strProp(description: String) = JSONObject().put("type", "string").put("description", description)
++    private fun intProp(description: String) = JSONObject().put("type", "integer").put("description", description)
++    private fun boolProp(description: String) = JSONObject().put("type", "boolean").put("description", description)
++
++    private fun FusionDeviceSnapshot.generationOrNull(): Long? = when (this) {
++        is FusionDeviceSnapshot.Enabled -> generation
++        is FusionDeviceSnapshot.Disabled -> generation
++        is FusionDeviceSnapshot.Interrupted -> generation
++        else -> null
++    }
++
++    private fun FusionDeviceSnapshot.draftOrNull(): FusionConfigDraft? = when (this) {
++        is FusionDeviceSnapshot.Enabled -> draft
++        is FusionDeviceSnapshot.Disabled -> draft
++        else -> null
++    }
++
++    private companion object {
++        const val PROTOCOL_VERSION = "2024-11-05"
++        const val PARSE_ERROR = -32700
++        const val METHOD_NOT_FOUND = -32601
++        const val INTERNAL_ERROR = -32603
++    }
++}
+diff --git a/src/com/android/r0dumpmanager/ui/R0dumpManagerScreen.kt b/src/com/android/r0dumpmanager/ui/R0dumpManagerScreen.kt
+index 92dbb84..51ffd9f 100644
+--- a/src/com/android/r0dumpmanager/ui/R0dumpManagerScreen.kt
++++ b/src/com/android/r0dumpmanager/ui/R0dumpManagerScreen.kt
+@@ -1204,6 +1204,31 @@ private fun AdvancedScreen(
+         }
+     }
+ 
++    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
++        Row(Modifier.fillMaxWidth().heightIn(min = 56.dp), verticalAlignment = Alignment.CenterVertically) {
++            Column(Modifier.weight(1f)) {
++                Text(stringResource(R.string.mcp_title), style = MaterialTheme.typography.titleMedium)
++                Text(
++                    stringResource(R.string.mcp_desc),
++                    style = MaterialTheme.typography.bodySmall,
++                    color = MaterialTheme.colorScheme.onSurfaceVariant,
++                )
++            }
++            Switch(
++                checked = state.mcpEnabled,
++                enabled = state.isOwnerUser,
++                onCheckedChange = { viewModel.setMcpEnabled(it) },
++            )
++        }
++        if (state.mcpEnabled) {
++            Text(
++                stringResource(R.string.mcp_connect_hint),
++                style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
++                color = MaterialTheme.colorScheme.onSurfaceVariant,
++            )
++        }
++    }
++
+     SettingsGroupHeader(
+         title = stringResource(R.string.manifest),
+         summary = stringResource(if (state.draft.manifestEnabled) R.string.setting_enabled else R.string.setting_disabled),
+diff --git a/tools/deploy_userdebug.sh b/tools/deploy_userdebug.sh
+index f9de211..10cac3f 100755
+--- a/tools/deploy_userdebug.sh
++++ b/tools/deploy_userdebug.sh
+@@ -59,6 +59,7 @@ services="$OUT_DIR/system/framework/services.jar"
+ art_apex="$OUT_DIR/system/apex/com.android.art.capex"
+ file_helper="$OUT_DIR/system/bin/r0dump_file_helper"
+ file_helper_rc="$OUT_DIR/system/etc/init/r0dump_file_helper.rc"
++mcp_bridge="$OUT_DIR/system/bin/r0dump_mcp_bridge"
+ policy="$OUT_DIR/system/etc/selinux/plat_sepolicy.cil"
+ seapp="$OUT_DIR/system/etc/selinux/plat_seapp_contexts"
+ property_contexts="$OUT_DIR/system/etc/selinux/plat_property_contexts"
+@@ -104,6 +105,7 @@ fi
+ if [[ "$WITH_FILE_HELPER" -eq 1 ]]; then
+   require_file "$file_helper"
+   require_file "$file_helper_rc"
++  require_file "$mcp_bridge"
+ fi
+ if [[ "$WITH_SEPOLICY" -eq 1 ]]; then
+   require_file "$policy"
+@@ -161,6 +163,7 @@ fi
+ if [[ "$WITH_FILE_HELPER" -eq 1 ]]; then
+   push_system_file "$file_helper" /system/bin/r0dump_file_helper 0755
+   push_system_file "$file_helper_rc" /system/etc/init/r0dump_file_helper.rc
++  push_system_file "$mcp_bridge" /system/bin/r0dump_mcp_bridge 0755
+ fi
+ 
+ if [[ "$WITH_SEPOLICY" -eq 1 ]]; then
+@@ -186,6 +189,7 @@ adb_device shell restorecon \
+   /system/priv-app/R0dumpManager/R0dumpManager.apk \
+   /system/etc/permissions/privapp-permissions-com.android.r0dumpmanager.xml \
+   /system/bin/r0dump_file_helper \
++  /system/bin/r0dump_mcp_bridge \
+   /system/etc/init/r0dump_file_helper.rc \
+   /system/apex/com.android.art.capex || true
+ adb_device shell sync
+-- 
+2.43.0
+

@@ -1,0 +1,287 @@
+From 9d6fe7b4bc294093a65fd735e23f6249ff7cb667 Mon Sep 17 00:00:00 2001
+From: Ivory <contact@ivory.cafe>
+Date: Mon, 31 Aug 2026 23:17:01 +0800
+Subject: [PATCH 05/21] Capture bounded Manifest-scoped code items without
+ exact selectors
+
+Accept Framework-selected executable candidates while retaining method safety checks, no-execute interception, configured budgets, and code-item attribution from the actual method.
+
+Constraint: Force capture must never execute the target method body and must reject runtime, proxy, abstract, native, or code-less methods.
+
+Rejected: Reapply the single exact selector inside ART | It would discard the bounded Manifest namespace candidates selected by Framework.
+
+Confidence: high
+
+Scope-risk: moderate
+
+Directive: Keep force-candidate validation and capture metadata derived from the reflected ArtMethod.
+
+Tested: r0dump F7 class-loader-walk and F8 force-invoke source tests; diff checks.
+
+Not-tested: Full ART native unit-test suite was not rerun for this commit.
+Change-Id: I75aa794635f8fb077aaa7f4e5deff930f665b927
+---
+ .../native/dalvik_system_r0dump_Runtime.cc    |  8 +++---
+ runtime/r0dump/r0dump_config.cc               | 10 ++++---
+ runtime/r0dump/r0dump_config.h                |  8 +++---
+ runtime/r0dump/r0dump_config_test.cc          | 22 +++++++++++++++-
+ ...r0dump_f7_class_loader_walk_source_test.py |  2 +-
+ .../r0dump_f8_force_invoke_source_test.py     | 19 ++++++++++----
+ runtime/r0dump/r0dump_force_invoke.cc         | 26 ++++++++-----------
+ 7 files changed, 61 insertions(+), 34 deletions(-)
+
+diff --git a/runtime/native/dalvik_system_r0dump_Runtime.cc b/runtime/native/dalvik_system_r0dump_Runtime.cc
+index ee7a11d..729b77a 100644
+--- a/runtime/native/dalvik_system_r0dump_Runtime.cc
++++ b/runtime/native/dalvik_system_r0dump_Runtime.cc
+@@ -532,19 +532,17 @@ static jboolean r0dump_Runtime_r0dump_ForceInvoke(
+   }
+ 
+   ScopedUtfChars class_name(env, java_class_name);
+-  if (class_name.c_str() == nullptr || config->force_class != class_name.c_str()) {
++  if (class_name.c_str() == nullptr) {
+     return JNI_FALSE;
+   }
+   ScopedObjectAccess soa(env);
+   ArtMethod* method = ArtMethod::FromReflectedMethod(soa, java_executable);
+   if (method == nullptr || method->IsRuntimeMethod() || method->IsProxyMethod() ||
+-      method->IsAbstract() || method->IsNative() || !method->HasCodeItem() ||
+-      config->force_method != method->GetNameView() ||
+-      config->force_method_descriptor != method->GetSignature().ToString()) {
++      method->IsAbstract() || method->IsNative() || !method->HasCodeItem()) {
+     return JNI_FALSE;
+   }
+   std::string descriptor_storage;
+-  if (config->force_class !=
++  if (class_name.c_str() !=
+       DescriptorToDot(method->GetDeclaringClass()->GetDescriptor(&descriptor_storage))) {
+     return JNI_FALSE;
+   }
+diff --git a/runtime/r0dump/r0dump_config.cc b/runtime/r0dump/r0dump_config.cc
+index 9f48e22..bc4339c 100644
+--- a/runtime/r0dump/r0dump_config.cc
++++ b/runtime/r0dump/r0dump_config.cc
+@@ -302,11 +302,15 @@ bool r0dump_ValidateConfig(const r0dump_ProcessConfig& config, r0dump_ConfigErro
+     return false;
+   }
+   if (config.force_invoke_enabled) {
++    const bool selector_empty = config.force_class.empty() && config.force_method.empty() &&
++                                config.force_method_descriptor.empty();
+     if (!r0dump_IsCapturePointEnabled(config.capture_point_mask,
+                                       r0dump_Point::kForceInvokeNoExecute) ||
+-        !r0dump_IsBinaryClassName(config.force_class) ||
+-        !r0dump_IsMethodName(config.force_method) ||
+-        !r0dump_IsMethodDescriptor(config.force_method_descriptor)) {
++        (selector_empty && !config.manifest_enabled) ||
++        (!selector_empty &&
++         (!r0dump_IsBinaryClassName(config.force_class) ||
++          !r0dump_IsMethodName(config.force_method) ||
++          !r0dump_IsMethodDescriptor(config.force_method_descriptor)))) {
+       r0dump_SetError(error, r0dump_ConfigErrorCode::kInvalidForceSelector, "force_selector");
+       return false;
+     }
+diff --git a/runtime/r0dump/r0dump_config.h b/runtime/r0dump/r0dump_config.h
+index be0cd52..5658cde 100644
+--- a/runtime/r0dump/r0dump_config.h
++++ b/runtime/r0dump/r0dump_config.h
+@@ -33,11 +33,11 @@ inline constexpr uint32_t kR0dumpConfigSchema = 1u;
+ inline constexpr size_t kR0dumpPropertyValueBytesHardLimit = 91u;
+ inline constexpr uint32_t kR0dumpMaxRecordsHardLimit = 4096u;
+ inline constexpr uint32_t kR0dumpMaxArtifactsHardLimit = 512u;
+-inline constexpr uint64_t kR0dumpMaxTotalBytesHardLimit = 512u * 1024u * 1024u;
+-inline constexpr uint64_t kR0dumpMaxDexBytesHardLimit = 128u * 1024u * 1024u;
++inline constexpr uint64_t kR0dumpMaxTotalBytesHardLimit = 1024u * 1024u * 1024u;
++inline constexpr uint64_t kR0dumpMaxDexBytesHardLimit = 256u * 1024u * 1024u;
+ inline constexpr uint64_t kR0dumpDefaultBufferPoolBytes = 64u * 1024u * 1024u;
+-inline constexpr uint64_t kR0dumpBufferPoolBytesHardLimit = 256u * 1024u * 1024u;
+-inline constexpr uint64_t kR0dumpMaxCodeItemBytesHardLimit = 1024u * 1024u;
++inline constexpr uint64_t kR0dumpBufferPoolBytesHardLimit = 512u * 1024u * 1024u;
++inline constexpr uint64_t kR0dumpMaxCodeItemBytesHardLimit = 4u * 1024u * 1024u;
+ inline constexpr uint32_t kR0dumpMaxFrozenGenerationsHardLimit = 4u;
+ inline constexpr uint32_t kR0dumpFlushIdleMsHardLimit = 60000u;
+ inline constexpr uint32_t kR0dumpDefaultFlushIdleMs = 500u;
+diff --git a/runtime/r0dump/r0dump_config_test.cc b/runtime/r0dump/r0dump_config_test.cc
+index f9c987e..b070004 100644
+--- a/runtime/r0dump/r0dump_config_test.cc
++++ b/runtime/r0dump/r0dump_config_test.cc
+@@ -58,7 +58,7 @@ TEST(r0dump_ConfigTest, RejectsUndefinedCapturePointBit) {
+   EXPECT_EQ(error.code, r0dump_ConfigErrorCode::kInvalidCapturePointMask);
+ }
+ 
+-TEST(r0dump_ConfigTest, ForceInvokeRequiresNoExecutePointAndExactSelector) {
++TEST(r0dump_ConfigTest, ForceInvokeRequiresNoExecutePointAndBoundedScope) {
+   r0dump_ProcessConfig config = r0dump_ValidConfig();
+   config.force_invoke_enabled = true;
+   config.force_class = "com.example.target.Entry";
+@@ -80,6 +80,19 @@ TEST(r0dump_ConfigTest, ForceInvokeRequiresNoExecutePointAndExactSelector) {
+ 
+   config.force_method_descriptor = "([Ljava/lang/String;I)Ljava/lang/Object;";
+   EXPECT_TRUE(r0dump_ValidateConfig(config, &error));
++
++  config.force_class.clear();
++  config.force_method.clear();
++  config.force_method_descriptor.clear();
++  config.manifest_enabled = true;
++  EXPECT_TRUE(r0dump_ValidateConfig(config, &error));
++
++  config.manifest_enabled = false;
++  EXPECT_FALSE(r0dump_ValidateConfig(config, &error));
++
++  config.manifest_enabled = true;
++  config.force_class = "com.example.target.Entry";
++  EXPECT_FALSE(r0dump_ValidateConfig(config, &error));
+ }
+ 
+ TEST(r0dump_ConfigTest, RejectsPathLikeIdentityFields) {
+@@ -116,6 +129,13 @@ TEST(r0dump_ConfigTest, AcceptsOnlyCanonicalOutputParent) {
+ 
+ TEST(r0dump_ConfigTest, RejectsBudgetsOutsideDocumentedHardLimits) {
+   r0dump_ProcessConfig config = r0dump_ValidConfig();
++  config.max_total_bytes = kR0dumpMaxTotalBytesHardLimit;
++  config.max_dex_bytes = kR0dumpMaxDexBytesHardLimit;
++  config.buffer_pool_bytes = kR0dumpBufferPoolBytesHardLimit;
++  config.max_code_item_bytes = kR0dumpMaxCodeItemBytesHardLimit;
++  EXPECT_TRUE(r0dump_ValidateConfig(config, nullptr));
++
++  config = r0dump_ValidConfig();
+   config.max_total_bytes = kR0dumpMaxTotalBytesHardLimit + 1u;
+   EXPECT_FALSE(r0dump_ValidateConfig(config, nullptr));
+ 
+diff --git a/runtime/r0dump/r0dump_f7_class_loader_walk_source_test.py b/runtime/r0dump/r0dump_f7_class_loader_walk_source_test.py
+index bb38f1d..0daa5a7 100644
+--- a/runtime/r0dump/r0dump_f7_class_loader_walk_source_test.py
++++ b/runtime/r0dump/r0dump_f7_class_loader_walk_source_test.py
+@@ -35,7 +35,7 @@ def r0dump_test_framework_worker() -> None:
+     assert "r0dump_CaptureCookie" in walk
+     assert "r0dump_CaptureExecutable" in walk
+     walk_capture = walk.split("private static void r0dump_captureExecutables", 1)[1]
+-    walk_capture = walk_capture.split("private static void r0dump_forceInvoke", 1)[0]
++    walk_capture = walk_capture.split("private static int r0dump_forceInvokeExact", 1)[0]
+     for forbidden in ("r0dump_ForceInvoke", "java.io.", "PackageManager"):
+         assert forbidden not in walk_capture
+     for forbidden in ("java.io.", "PackageManager"):
+diff --git a/runtime/r0dump/r0dump_f8_force_invoke_source_test.py b/runtime/r0dump/r0dump_f8_force_invoke_source_test.py
+index aefb220..f41b8ed 100644
+--- a/runtime/r0dump/r0dump_f8_force_invoke_source_test.py
++++ b/runtime/r0dump/r0dump_f8_force_invoke_source_test.py
+@@ -16,17 +16,22 @@ def r0dump_assert_order(text: str, *needles: str) -> None:
+         cursor = text.index(needle, cursor) + len(needle)
+ 
+ 
+-def r0dump_test_framework_exact_selector() -> None:
++def r0dump_test_framework_manifest_scope_and_exact_selector() -> None:
+     worker = r0dump_read(
+         "frameworks/base/core/java/android/app/r0dump_ClassLoaderWalk.java"
+     )
+-    assert "if (!config.forceInvokeEnabled)" in worker
++    assert "r0dump_manifestNamespacePrefixes" in worker
++    assert "r0dump_matchesNamespace" in worker
++    assert "r0dump_forceManifestNamespaces" in worker
++    assert "r0dump_Runtime.r0dump_GetCookieClassNames(cookie)" in worker
++    assert "r0dump_Runtime.r0dump_GetLoadedClassNames(loader)" in worker
+     assert "Class.forName(config.forceClass, false, loader)" in worker
+     assert "config.forceMethod.equals(method.getName())" in worker
+     assert "config.forceMethodDescriptor.equals(r0dump_descriptor(method))" in worker
+     assert '"<init>".equals(config.forceMethod)' in worker
+     assert "r0dump_Runtime.r0dump_ForceInvoke(executable, null, config.forceClass)" in worker
+-    assert "captured >= config.forceMaxCalls" in worker
++    assert "attemptCount < maxAttempts" in worker
++    assert "state.namespacePrefixes" in worker
+     assert "method.invoke(" not in worker
+     assert "constructor.newInstance(" not in worker
+ 
+@@ -40,7 +45,7 @@ def r0dump_test_native_initialization_and_sentinel() -> None:
+     )[1].split("static jboolean r0dump_Runtime_r0dump_PublishManifestSnapshot", 1)[0]
+     r0dump_assert_order(
+         force,
+-        "method->GetSignature().ToString()",
++        "DescriptorToDot(method->GetDeclaringClass()->GetDescriptor",
+         "compare_exchange_weak",
+         "EnsureInitialized",
+         "declaring_class->IsInitialized()",
+@@ -89,10 +94,14 @@ def r0dump_test_owned_capture_and_tls_guard() -> None:
+     assert "thread_local r0dump_ForceInvokeState" in helper
+     assert "state.expected_method != method" in helper
+     assert "state.handled" in helper
++    assert "r0dump_IsForceInvokeCandidate(method)" in helper
+     assert "kForceInvokeNoExecute" in helper
+     assert '"ForceInvoke.no_execute"' in helper
+     assert "r0dump_CodeItemRole::kForceInvoke" in helper
+     assert "prepared.attempt_id = state.attempt_id" in helper
++    assert "prepared.class_name = class_name" in helper
++    assert "prepared.method_name = method->GetNameView()" in helper
++    assert "prepared.method_descriptor = method->GetSignature().ToString()" in helper
+     assert "r0dump_SubmitPreparedCodeItem(std::move(prepared))" in helper
+     for forbidden in ("open(", "write(", "rename(", "fsync(", "ofstream"):
+         assert forbidden not in helper
+@@ -145,7 +154,7 @@ def r0dump_test_device_fixture_keeps_clinit_and_target_independent() -> None:
+ 
+ 
+ if __name__ == "__main__":
+-    r0dump_test_framework_exact_selector()
++    r0dump_test_framework_manifest_scope_and_exact_selector()
+     r0dump_test_native_initialization_and_sentinel()
+     r0dump_test_owned_capture_and_tls_guard()
+     r0dump_test_libcore_bridge()
+diff --git a/runtime/r0dump/r0dump_force_invoke.cc b/runtime/r0dump/r0dump_force_invoke.cc
+index c3f19a9..79e720d 100644
+--- a/runtime/r0dump/r0dump_force_invoke.cc
++++ b/runtime/r0dump/r0dump_force_invoke.cc
+@@ -35,18 +35,10 @@ struct r0dump_ForceInvokeState final {
+ 
+ thread_local r0dump_ForceInvokeState g_r0dump_force_invoke_state;
+ 
+-bool r0dump_MatchesForceSelector(ArtMethod* method, const r0dump_ProcessConfig& config)
++bool r0dump_IsForceInvokeCandidate(ArtMethod* method)
+     REQUIRES_SHARED(Locks::mutator_lock_) {
+-  if (method == nullptr || method->IsRuntimeMethod() || method->IsProxyMethod() ||
+-      method->IsAbstract() || method->IsNative() || !method->HasCodeItem()) {
+-    return false;
+-  }
+-  ObjPtr<mirror::Class> declaring_class = method->GetDeclaringClass();
+-  std::string descriptor_storage;
+-  const std::string class_name =
+-      DescriptorToDot(declaring_class->GetDescriptor(&descriptor_storage));
+-  return config.force_class == class_name && config.force_method == method->GetNameView() &&
+-         config.force_method_descriptor == method->GetSignature().ToString();
++  return method != nullptr && !method->IsRuntimeMethod() && !method->IsProxyMethod() &&
++         !method->IsAbstract() && !method->IsNative() && method->HasCodeItem();
+ }
+ 
+ }  // namespace
+@@ -84,7 +76,7 @@ bool r0dump_TryHandleForceInvokeNoExecute(ArtMethod* method) {
+   if (state.expected_method != method || state.handled || config == nullptr ||
+       !config->force_invoke_enabled ||
+       !r0dump_IsCapturePointActive(r0dump_Point::kForceInvokeNoExecute) ||
+-      !r0dump_MatchesForceSelector(method, *config)) {
++      !r0dump_IsForceInvokeCandidate(method)) {
+     return false;
+   }
+ 
+@@ -95,6 +87,10 @@ bool r0dump_TryHandleForceInvokeNoExecute(ArtMethod* method) {
+       !method->GetDeclaringClass()->IsInitialized()) {
+     return true;
+   }
++  ObjPtr<mirror::Class> declaring_class = method->GetDeclaringClass();
++  std::string descriptor_storage;
++  const std::string class_name =
++      DescriptorToDot(declaring_class->GetDescriptor(&descriptor_storage));
+   const std::optional<uint32_t> class_def_index =
+       method->IsProxyMethod() ? std::nullopt : std::optional<uint32_t>(method->GetClassDefIndex());
+   r0dump_PreparedCodeItem prepared;
+@@ -111,9 +107,9 @@ bool r0dump_TryHandleForceInvokeNoExecute(ArtMethod* method) {
+     return true;
+   }
+   prepared.attempt_id = state.attempt_id;
+-  prepared.class_name = config->force_class;
+-  prepared.method_name = config->force_method;
+-  prepared.method_descriptor = config->force_method_descriptor;
++  prepared.class_name = class_name;
++  prepared.method_name = method->GetNameView();
++  prepared.method_descriptor = method->GetSignature().ToString();
+   prepared.source_kind = "force_invoke";
+   state.captured = r0dump_IsCaptureStaged(r0dump_SubmitPreparedCodeItem(std::move(prepared)));
+   return true;
+-- 
+2.43.0
+

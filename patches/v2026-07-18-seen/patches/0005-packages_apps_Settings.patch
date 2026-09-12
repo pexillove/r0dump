@@ -1,0 +1,61 @@
+diff --git a/packages/apps/Settings/src/com/android/settings/deviceinfo/firmwareversion/LineageVersionDetailPreference.kt b/packages/apps/Settings/src/com/android/settings/deviceinfo/firmwareversion/LineageVersionDetailPreference.kt
+index 79e2703dc486035cce87564d9104de50be5e6218..606daca3053cd7bce9d8f74e2475fe535c40b64c 100644
+--- a/packages/apps/Settings/src/com/android/settings/deviceinfo/firmwareversion/LineageVersionDetailPreference.kt
++++ b/packages/apps/Settings/src/com/android/settings/deviceinfo/firmwareversion/LineageVersionDetailPreference.kt
+@@ -64,7 +64,7 @@ class LineageVersionDetailPreference :
+ 
+     override fun getSummary(context: Context): CharSequence {
+         val version = SystemProperties.get(LINEAGE_VERSION_PROPERTY, context.getString(R.string.unknown))
+-        return if (version == "R0DUMP_14") "R0DUMP 14" else version
++        return if (version == "R0DUMP_16") "R0DUMP 16" else version
+     }
+ 
+     // return true swallows the click event, while return false will start the intent
+diff --git a/packages/apps/Settings/src/com/android/settings/deviceinfo/firmwareversion/LineageVersionDetailPreferenceController.java b/packages/apps/Settings/src/com/android/settings/deviceinfo/firmwareversion/LineageVersionDetailPreferenceController.java
+index 555786d80429772ec435fd33ec177a69519db784..4b05679e31ae849a3d638230ebca4936e53aa379 100644
+--- a/packages/apps/Settings/src/com/android/settings/deviceinfo/firmwareversion/LineageVersionDetailPreferenceController.java
++++ b/packages/apps/Settings/src/com/android/settings/deviceinfo/firmwareversion/LineageVersionDetailPreferenceController.java
+@@ -79,8 +79,8 @@ public class LineageVersionDetailPreferenceController extends BasePreferenceCont
+     public CharSequence getSummary() {
+         final String version = SystemProperties.get(KEY_LINEAGE_VERSION_PROP,
+                 mContext.getString(R.string.unknown));
+-        if (TextUtils.equals(version, "R0DUMP_14")) {
+-            return "R0DUMP 14";
++        if (TextUtils.equals(version, "R0DUMP_16")) {
++            return "R0DUMP 16";
+         }
+         return version;
+     }
+diff --git a/packages/apps/Settings/tests/robotests/src/com/android/settings/deviceinfo/firmwareversion/LineageVersionDetailPreferenceControllerTest.java b/packages/apps/Settings/tests/robotests/src/com/android/settings/deviceinfo/firmwareversion/LineageVersionDetailPreferenceControllerTest.java
+index d9cb621e3f71c3bccfd07daf1b0f327d79ba99a0..e487439cad95c0efe8a5e28c3447cbc41b6cf56d 100644
+--- a/packages/apps/Settings/tests/robotests/src/com/android/settings/deviceinfo/firmwareversion/LineageVersionDetailPreferenceControllerTest.java
++++ b/packages/apps/Settings/tests/robotests/src/com/android/settings/deviceinfo/firmwareversion/LineageVersionDetailPreferenceControllerTest.java
+@@ -44,9 +44,9 @@ public class LineageVersionDetailPreferenceControllerTest {
+ 
+     @Test
+     public void getSummary_r0dumpDisplayToken_returnsFriendlyVersion() {
+-        ShadowSystemProperties.override(LINEAGE_VERSION_PROPERTY, "R0DUMP_14");
++        ShadowSystemProperties.override(LINEAGE_VERSION_PROPERTY, "R0DUMP_16");
+ 
+-        assertThat(mController.getSummary()).isEqualTo("R0DUMP 14");
++        assertThat(mController.getSummary()).isEqualTo("R0DUMP 16");
+     }
+ 
+     @Test
+diff --git a/packages/apps/Settings/tests/robotests/src/com/android/settings/deviceinfo/firmwareversion/LineageVersionDetailPreferenceTest.kt b/packages/apps/Settings/tests/robotests/src/com/android/settings/deviceinfo/firmwareversion/LineageVersionDetailPreferenceTest.kt
+index 93865a4767d056e8d77c3a62b45356e3c087c903..74bb7e31742ed9325617a4a395158cc247f468cb 100644
+--- a/packages/apps/Settings/tests/robotests/src/com/android/settings/deviceinfo/firmwareversion/LineageVersionDetailPreferenceTest.kt
++++ b/packages/apps/Settings/tests/robotests/src/com/android/settings/deviceinfo/firmwareversion/LineageVersionDetailPreferenceTest.kt
+@@ -35,10 +35,10 @@ class LineageVersionDetailPreferenceTest {
+     fun getSummary_r0dumpDisplayToken_returnsFriendlyVersion() {
+         ShadowSystemProperties.override(
+             LineageVersionDetailPreference.LINEAGE_VERSION_PROPERTY,
+-            "R0DUMP_14",
++            "R0DUMP_16",
+         )
+ 
+-        assertThat(preference.getSummary(context)).isEqualTo("R0DUMP 14")
++        assertThat(preference.getSummary(context)).isEqualTo("R0DUMP 16")
+     }
+ 
+     @Test

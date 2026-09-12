@@ -1,0 +1,149 @@
+From 2f6787ef4526e30bb16f30996c549eb60cc8f03b Mon Sep 17 00:00:00 2001
+From: Ivory <contact@ivory.cafe>
+Date: Mon, 31 Aug 2026 12:27:32 +0800
+Subject: [PATCH 2/4] Confine synchronous output preparation to minimum storage
+ authority
+
+Define the helper domain, executable label, private property type, and descriptor-transfer permissions needed for fixed owner-user external-storage traversal.
+
+Constraint: system_server must not gain external-storage open, read, write, or create permissions
+Rejected: DAC_OVERRIDE, DAC_READ_SEARCH, or permissive policy | each would broaden the root helper beyond the fixed preparation protocol
+Confidence: high
+Scope-risk: moderate
+Directive: Keep system_server limited to fuse directory ioctl for O_PATH receipt and preserve helper regular-file denial
+Tested: selinux_policy including neverallow, compatibility, freeze, and context tests; enforcing-device run with no feature AVC
+Not-tested: full user image build is outside the agreed acceptance scope
+Change-Id: Id9a7fd2fa074983a6aa9d33351671f5a7c78fc9d
+---
+ contexts/file_contexts_test_data |  2 ++
+ private/file.te                  |  4 +++
+ private/file_contexts            |  2 ++
+ private/property.te              |  1 +
+ private/r0dump_file_helper.te    | 42 ++++++++++++++++++++++++++++++++
+ public/property.te               |  1 -
+ 6 files changed, 51 insertions(+), 1 deletion(-)
+ create mode 100644 private/r0dump_file_helper.te
+
+diff --git a/contexts/file_contexts_test_data b/contexts/file_contexts_test_data
+index 5974570..bd169a0 100644
+--- a/contexts/file_contexts_test_data
++++ b/contexts/file_contexts_test_data
+@@ -217,6 +217,7 @@
+ /dev/socket/property_service                                      property_socket
+ /dev/socket/property_service_for_system                           property_socket
+ /dev/socket/recovery                                              recovery_socket
++/dev/socket/r0dump_file_helper                                   r0dump_file_helper_socket
+ /dev/socket/rild                                                  rild_socket
+ /dev/socket/rild-debug                                            rild_debug_socket
+ /dev/socket/snapuserd                                             snapuserd_socket
+@@ -318,6 +319,7 @@
+ /system/bin/boringssl_self_test64                                 boringssl_self_test_exec
+ /system/bin/boringssl_self_test31                                 system_file
+ /system/bin/prng_seeder                                           prng_seeder_exec
++/system/bin/r0dump_file_helper                                    r0dump_file_helper_exec
+ /system/bin/charger                                               charger_exec
+ /system/bin/e2fsdroid                                             e2fs_exec
+ /system/bin/mke2fs                                                e2fs_exec
+diff --git a/private/file.te b/private/file.te
+index b832da4..5ff2175 100644
+--- a/private/file.te
++++ b/private/file.te
+@@ -180,6 +180,10 @@ type aconfigd_socket, file_type, coredomain_socket, mlstrustedobject;
+ # Type for aconfig mainline daemon socket
+ type aconfigd_mainline_socket, file_type, coredomain_socket,  mlstrustedobject;
+ 
++# Private init socket and executable for synchronous r0dump output preparation.
++type r0dump_file_helper_socket, file_type, coredomain_socket;
++type r0dump_file_helper_exec, system_file_type, exec_type, file_type;
++
+ # Type for /(system|system_ext|product)/etc/aconfig
+ type system_aconfig_storage_file, system_file_type, file_type;
+ 
+diff --git a/private/file_contexts b/private/file_contexts
+index bc79eeb..de8fa39 100644
+--- a/private/file_contexts
++++ b/private/file_contexts
+@@ -288,6 +288,8 @@
+ /system/bin/incident   u:object_r:incident_exec:s0
+ /system/bin/incidentd   u:object_r:incidentd_exec:s0
+ /system/bin/incident_helper  u:object_r:incident_helper_exec:s0
++/system/bin/r0dump_file_helper  u:object_r:r0dump_file_helper_exec:s0
++/dev/socket/r0dump_file_helper  u:object_r:r0dump_file_helper_socket:s0
+ /system/bin/iw                   u:object_r:iw_exec:s0
+ /system/bin/netutils-wrapper-1\.0    u:object_r:netutils_wrapper_exec:s0
+ /system/bin/vold	u:object_r:vold_exec:s0
+diff --git a/private/property.te b/private/property.te
+index a9e13a3..ebb498e 100644
+--- a/private/property.te
++++ b/private/property.te
+@@ -101,6 +101,7 @@ system_restricted_prop(persist_sysui_ranking_update_prop)
+ system_restricted_prop(page_size_prop)
+ system_restricted_prop(pm_16kb_app_compat_prop)
+ system_restricted_prop(remote_prov_prop)
++system_restricted_prop(r0dump_fusion_prop)
+ system_restricted_prop(service_sf_present_timestamp_prop)
+ system_restricted_prop(statsd_atoms_list_version_prop)
+ system_restricted_prop(trusty_coverage_prop)
+diff --git a/private/r0dump_file_helper.te b/private/r0dump_file_helper.te
+new file mode 100644
+index 0000000..a5126ec
+--- /dev/null
++++ b/private/r0dump_file_helper.te
+@@ -0,0 +1,42 @@
++type r0dump_file_helper, domain, coredomain;
++init_daemon_domain(r0dump_file_helper)
++
++get_prop(r0dump_file_helper, r0dump_fusion_prop)
++
++allow r0dump_file_helper self:capability { chown fowner fsetid setuid };
++allow r0dump_file_helper self:unix_stream_socket { accept listen read write getattr getopt setopt };
++
++# Traverse the per-user mount namespace before opening the FUSE-backed root.
++allow r0dump_file_helper mnt_user_file:dir search;
++
++# The emulated-storage FUSE daemon performs checks against the backing
++# media_rw data label while the helper walks and prepares app external files.
++allow r0dump_file_helper media_rw_data_file:dir create_dir_perms;
++
++# The helper performs only fd-relative directory preparation below app external files.
++allow r0dump_file_helper fuse:dir {
++  add_name
++  create
++  getattr
++  open
++  read
++  remove_name
++  rmdir
++  search
++  setattr
++  write
++};
++
++allow system_server r0dump_file_helper_socket:sock_file write;
++allow system_server r0dump_file_helper:unix_stream_socket connectto;
++allow system_server r0dump_file_helper:fd use;
++# SELinux maps receipt of an O_PATH FD to the ioctl permission when no
++# FMODE_READ/FMODE_WRITE bit exists. This permits only FD receipt; the platform
++# neverallow still prevents system_server from opening, reading, or writing
++# external-storage directories.
++allow system_server fuse:dir ioctl;
++
++# The helper owns the directory file description even after system_server
++# duplicates it into a ParcelFileDescriptor. Only AMS can obtain and forward
++# this descriptor; its Binder entry validates the calling app UID/PID first.
++allow appdomain r0dump_file_helper:fd use;
+diff --git a/public/property.te b/public/property.te
+index 30b616d..0bf2bd7 100644
+--- a/public/property.te
++++ b/public/property.te
+@@ -90,7 +90,6 @@ system_restricted_prop(power_debug_prop)
+ system_restricted_prop(profcollectd_etr_prop)
+ system_restricted_prop(property_service_version_prop)
+ system_restricted_prop(provisioned_prop)
+-system_restricted_prop(r0dump_fusion_prop)
+ system_restricted_prop(restorecon_prop)
+ system_restricted_prop(retaildemo_prop)
+ system_restricted_prop(servicemanager_prop)
+-- 
+2.43.0
+

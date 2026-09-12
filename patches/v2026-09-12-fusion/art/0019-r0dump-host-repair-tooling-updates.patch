@@ -1,0 +1,133 @@
+From 21995bee4b32ac15a6e4e9454c56dbc8d7dea759 Mon Sep 17 00:00:00 2001
+From: Ivory <contact@ivory.cafe>
+Date: Thu, 10 Sep 2026 21:44:54 +0800
+Subject: [PATCH 19/21] r0dump: host repair tooling updates
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Change-Id: I7cb9ccd118a40c566b51b339c95b6b3860445d9d
+---
+ tools/r0dump/r0dump_host_repair.py      | 52 ++++++++++++++++++++++++-
+ tools/r0dump/test_r0dump_host_repair.py | 37 ++++++++++++++++++
+ 2 files changed, 88 insertions(+), 1 deletion(-)
+
+diff --git a/tools/r0dump/r0dump_host_repair.py b/tools/r0dump/r0dump_host_repair.py
+index 706f451..5a2e71f 100755
+--- a/tools/r0dump/r0dump_host_repair.py
++++ b/tools/r0dump/r0dump_host_repair.py
+@@ -593,6 +593,55 @@ def r0dump_method_identity(record: dict[str, Any]) -> tuple[Any, ...] | None:
+     return None if dex_identity is None else (dex_identity, method_index)
+ 
+ 
++def r0dump_execution_path_key(record: dict[str, Any]) -> tuple[Any, int, Any] | None:
++    dex_identity = record.get("dex_object_id")
++    method_index = record.get("method_index")
++    if dex_identity is None or not isinstance(method_index, int):
++        return None
++    attempt_id = record.get("active_attempt_id")
++    return (dex_identity, method_index, attempt_id if isinstance(attempt_id, int) else None)
++
++
++def r0dump_method_execution_paths(
++    discovered: list[tuple[Path, dict[str, Any], Path | None, bytes | None, str | None]],
++) -> list[dict[str, Any]]:
++    paths: dict[tuple[Any, int, Any], dict[str, Any]] = {}
++    artifact_hashes: dict[tuple[Any, int, Any], list[str]] = {}
++    for _, record, artifact, data, _ in discovered:
++        phase = record.get("observation_phase")
++        key = r0dump_execution_path_key(record)
++        if key is None or not isinstance(phase, str) or not phase:
++            continue
++        path = paths.setdefault(
++            key,
++            {
++                "dex_object_id": key[0],
++                "method_index": key[1],
++                "active_attempt_id": key[2],
++                "first_entry_kind": record.get("entry_kind") or "unknown",
++                "observed_phases": [],
++                "first_artifact_fast_hash": None,
++                "last_artifact_fast_hash": None,
++                "code_item_changed": "unknown",
++            },
++        )
++        if phase not in path["observed_phases"]:
++            path["observed_phases"].append(phase)
++        fast_hash = record.get("artifact_fast_hash")
++        if (record.get("capture_kind") == "codeitem" and artifact is not None and
++                data is not None and isinstance(fast_hash, str) and fast_hash):
++            artifact_hashes.setdefault(key, []).append(fast_hash)
++
++    for key, path in paths.items():
++        hashes = artifact_hashes.get(key, [])
++        if hashes:
++            path["first_artifact_fast_hash"] = hashes[0]
++            path["last_artifact_fast_hash"] = hashes[-1]
++        if len(hashes) >= 2:
++            path["code_item_changed"] = hashes[0] != hashes[-1]
++    return list(paths.values())
++
++
+ def r0dump_run_tool(command: list[str], timeout: int = 30) -> dict[str, Any]:
+     try:
+         result = subprocess.run(
+@@ -824,7 +873,8 @@ def r0dump_repair_run(run_dir: Path, output_dir: Path, dexdump: str | None = Non
+ 
+     report = {"algorithm_version": R0DUMP_ALGORITHM_VERSION, "input": str(run_dir),
+               "records": records, "record_count": len(records),
+-              "reconstructions": reconstructions}
++              "reconstructions": reconstructions,
++              "method_execution_paths": r0dump_method_execution_paths(discovered)}
+     inputs = {"run": str(run_dir), "blobs": sorted(input_entries.values(), key=lambda item: item["sha256"])}
+     (output_dir / "inputs.json").write_text(json.dumps(inputs, sort_keys=True, indent=2) + "\n",
+                                              encoding="utf-8")
+diff --git a/tools/r0dump/test_r0dump_host_repair.py b/tools/r0dump/test_r0dump_host_repair.py
+index db1b898..bf975e2 100644
+--- a/tools/r0dump/test_r0dump_host_repair.py
++++ b/tools/r0dump/test_r0dump_host_repair.py
+@@ -338,6 +338,43 @@ class r0dump_HostRepairTest(unittest.TestCase):
+             self.assertEqual(len(list((output / "repaired").glob("*.dexfixed.dex"))), 1)
+             self.assertEqual(json.loads((output / "report.json").read_text())["record_count"], 2)
+ 
++    def r0dump_test_report_correlates_method_execution_path(self):
++        with tempfile.TemporaryDirectory() as temp:
++            root = Path(temp)
++            run = root / "run"
++            records = run / "records"
++            artifacts = run / "artifacts"
++            records.mkdir(parents=True)
++            artifacts.mkdir()
++            for sequence, phase, entry_kind, fast_hash, payload in (
++                (1, "before_dispatch", "nterp", "0x0000000000000001", b"first"),
++                (2, "nterp_entry", "nterp", "0x0000000000000002", b"last"),
++            ):
++                artifact_name = f"{sequence:06d}.codeitem.raw"
++                (artifacts / artifact_name).write_bytes(payload)
++                (records / f"{sequence:06d}.json").write_text(json.dumps({
++                    "capture_kind": "codeitem",
++                    "artifact_relative_path": f"artifacts/{artifact_name}",
++                    "artifact_fast_hash": fast_hash,
++                    "dex_object_id": 99,
++                    "method_index": 7,
++                    "active_attempt_id": 3,
++                    "entry_kind": entry_kind,
++                    "observation_phase": phase,
++                }), encoding="utf-8")
++
++            report = r0dump_repair_run(run, root / "output")
++            self.assertEqual(report["method_execution_paths"], [{
++                "dex_object_id": 99,
++                "method_index": 7,
++                "active_attempt_id": 3,
++                "first_entry_kind": "nterp",
++                "observed_phases": ["before_dispatch", "nterp_entry"],
++                "first_artifact_fast_hash": "0x0000000000000001",
++                "last_artifact_fast_hash": "0x0000000000000002",
++                "code_item_changed": True,
++            }])
++
+     def r0dump_test_multidex_keeps_distinct_content_addressed_outputs(self):
+         with tempfile.TemporaryDirectory() as temp:
+             root = Path(temp)
+-- 
+2.43.0
+

@@ -1,0 +1,837 @@
+From 4f1f3db42255da58eca52ef10d874b5882330fcf Mon Sep 17 00:00:00 2001
+From: Ivory <contact@ivory.cafe>
+Date: Mon, 31 Aug 2026 16:36:37 +0800
+Subject: [PATCH 04/21] Make captured methods recoverable without guessing
+
+Correlate codeitem evidence to one complete DEX by method identity, require equal parsed spans, preserve conflicts as partial evidence, and let dexdump failures revoke usability.
+
+Constraint: Codeitem backfill must happen in the Python host repair path without modifying raw captures.
+Rejected: Runtime-side backfill | the requested delivery flow requires post-export Python repair
+Confidence: high
+Scope-risk: moderate
+Directive: Keep future reconstruction unique, boundary-checked, conflict-free, and content-addressed.
+Tested: 15 host repair tests; real Coolapk run backfilled 302 codeitems and passed dexdump on the reconstructed DEX
+Not-tested: JADX validation was not run
+Change-Id: I542aa2fadca9432fb331b3d07663e789d45eec13
+---
+ tools/r0dump/r0dump_host_repair.py      | 430 +++++++++++++++++++++++-
+ tools/r0dump/test_r0dump_host_repair.py | 254 +++++++++++++-
+ 2 files changed, 662 insertions(+), 22 deletions(-)
+
+diff --git a/tools/r0dump/r0dump_host_repair.py b/tools/r0dump/r0dump_host_repair.py
+index 2842c6d..09b670d 100755
+--- a/tools/r0dump/r0dump_host_repair.py
++++ b/tools/r0dump/r0dump_host_repair.py
+@@ -15,7 +15,7 @@ from pathlib import Path
+ from typing import Any, Iterable
+ 
+ 
+-R0DUMP_ALGORITHM_VERSION = "r0dump-host-repair-v1"
++R0DUMP_ALGORITHM_VERSION = "r0dump-host-repair-v2"
+ DEX_HEADER_SIZE = 0x70
+ DEX_MAGIC_PREFIX = b"dex\n"
+ CDEX_MAGIC_PREFIX = b"cdex"
+@@ -169,6 +169,288 @@ def r0dump_repair_dexfixed(data: bytes) -> tuple[bytes | None, dict[str, Any]]:
+     }
+ 
+ 
++def r0dump_read_uleb128(data: bytes, offset: int, limit: int) -> tuple[int, int]:
++    value = 0
++    for index in range(5):
++        if offset >= limit:
++            raise ValueError("truncated_uleb128")
++        byte = data[offset]
++        offset += 1
++        value |= (byte & 0x7F) << (index * 7)
++        if byte & 0x80 == 0:
++            if index == 4 and byte > 0x0F:
++                raise ValueError("uleb128_overflow")
++            return value, offset
++    raise ValueError("uleb128_overflow")
++
++
++def r0dump_read_sleb128(data: bytes, offset: int, limit: int) -> tuple[int, int]:
++    value = 0
++    shift = 0
++    for index in range(5):
++        if offset >= limit:
++            raise ValueError("truncated_sleb128")
++        byte = data[offset]
++        offset += 1
++        value |= (byte & 0x7F) << shift
++        shift += 7
++        if byte & 0x80 == 0:
++            if shift < 32 and byte & 0x40:
++                value -= 1 << shift
++            if not -(1 << 31) <= value < (1 << 31):
++                raise ValueError("sleb128_overflow")
++            return value, offset
++    raise ValueError("sleb128_overflow")
++
++
++def r0dump_method_code_entries(data: bytes, layout: r0dump_DexLayout) -> dict[int, tuple[int, int]]:
++    class_count = r0dump_read_u32(data, 96)
++    class_off = r0dump_read_u32(data, 100)
++    method_count = r0dump_read_u32(data, 88)
++    entries: dict[int, tuple[int, int]] = {}
++    for class_index in range(class_count):
++        class_def = class_off + class_index * 32
++        class_data_off = r0dump_read_u32(data, class_def + 24)
++        if class_data_off == 0:
++            continue
++        if not layout.data_off <= class_data_off < layout.file_size:
++            raise ValueError("class_data_out_of_bounds")
++        cursor = class_data_off
++        counts = []
++        for _ in range(4):
++            value, cursor = r0dump_read_uleb128(data, cursor, layout.file_size)
++            counts.append(value)
++        if any(count > layout.file_size for count in counts):
++            raise ValueError("class_data_count_out_of_bounds")
++        for field_count in counts[:2]:
++            for _ in range(field_count):
++                _, cursor = r0dump_read_uleb128(data, cursor, layout.file_size)
++                _, cursor = r0dump_read_uleb128(data, cursor, layout.file_size)
++        for method_list_count in counts[2:]:
++            method_index = 0
++            for _ in range(method_list_count):
++                method_delta, cursor = r0dump_read_uleb128(data, cursor, layout.file_size)
++                method_index += method_delta
++                _, cursor = r0dump_read_uleb128(data, cursor, layout.file_size)
++                code_off, cursor = r0dump_read_uleb128(data, cursor, layout.file_size)
++                if method_index >= method_count:
++                    raise ValueError("method_index_out_of_bounds")
++                if code_off != 0:
++                    if not layout.data_off <= code_off < layout.file_size:
++                        raise ValueError("code_item_offset_out_of_bounds")
++                    value = (code_off, class_index)
++                    previous = entries.get(method_index)
++                    if previous is not None and previous != value:
++                        raise ValueError("method_code_offset_conflict")
++                    entries[method_index] = value
++    return entries
++
++
++def r0dump_dex_string(data: bytes, layout: r0dump_DexLayout, string_index: int) -> str:
++    string_count = r0dump_read_u32(data, 56)
++    string_off = r0dump_read_u32(data, 60)
++    if not 0 <= string_index < string_count:
++        raise ValueError("string_index_out_of_bounds")
++    data_offset = r0dump_read_u32(data, string_off + string_index * 4)
++    if not layout.data_off <= data_offset < layout.file_size:
++        raise ValueError("string_data_out_of_bounds")
++    _, cursor = r0dump_read_uleb128(data, data_offset, layout.file_size)
++    terminator = data.find(b"\0", cursor, layout.file_size)
++    if terminator < 0:
++        raise ValueError("unterminated_string_data")
++    try:
++        return data[cursor:terminator].decode("utf-8")
++    except UnicodeDecodeError as error:
++        raise ValueError("unsupported_modified_utf8") from error
++
++
++def r0dump_type_descriptor(data: bytes, layout: r0dump_DexLayout, type_index: int) -> str:
++    type_count = r0dump_read_u32(data, 64)
++    type_off = r0dump_read_u32(data, 68)
++    if not 0 <= type_index < type_count:
++        raise ValueError("type_index_out_of_bounds")
++    return r0dump_dex_string(data, layout, r0dump_read_u32(data, type_off + type_index * 4))
++
++
++def r0dump_method_catalog(data: bytes, layout: r0dump_DexLayout) -> dict[int, dict[str, Any]]:
++    method_count = r0dump_read_u32(data, 88)
++    method_off = r0dump_read_u32(data, 92)
++    proto_count = r0dump_read_u32(data, 72)
++    proto_off = r0dump_read_u32(data, 76)
++    code_entries = r0dump_method_code_entries(data, layout)
++    catalog: dict[int, dict[str, Any]] = {}
++    for method_index, (code_off, class_def_index) in code_entries.items():
++        if not 0 <= method_index < method_count:
++            raise ValueError("method_index_out_of_bounds")
++        class_index, proto_index, name_index = struct.unpack_from(
++            "<HHI", data, method_off + method_index * 8)
++        if not 0 <= proto_index < proto_count:
++            raise ValueError("proto_index_out_of_bounds")
++        _, return_type_index, parameters_off = struct.unpack_from(
++            "<III", data, proto_off + proto_index * 12)
++        parameters: list[str] = []
++        if parameters_off != 0:
++            if not r0dump_check_range(parameters_off, 4, layout.file_size):
++                raise ValueError("parameter_list_out_of_bounds")
++            parameter_count = r0dump_read_u32(data, parameters_off)
++            if parameter_count > (layout.file_size - parameters_off - 4) // 2:
++                raise ValueError("parameter_list_out_of_bounds")
++            for index in range(parameter_count):
++                type_index = int.from_bytes(
++                    data[parameters_off + 4 + index * 2:parameters_off + 6 + index * 2],
++                    "little",
++                )
++                parameters.append(r0dump_type_descriptor(data, layout, type_index))
++        catalog[method_index] = {
++            "class_name": r0dump_type_descriptor(data, layout, class_index),
++            "method_name": r0dump_dex_string(data, layout, name_index),
++            "method_descriptor":
++                "(" + "".join(parameters) + ")" +
++                r0dump_type_descriptor(data, layout, return_type_index),
++            "class_def_index": class_def_index,
++            "code_off": code_off,
++        }
++    return catalog
++
++
++def r0dump_normalize_class_name(value: str) -> str:
++    if value.startswith("L") and value.endswith(";"):
++        return "L" + value[1:-1].replace(".", "/") + ";"
++    return "L" + value.replace(".", "/") + ";"
++
++
++def r0dump_match_code_item(record: dict[str, Any], catalog: dict[int, dict[str, Any]]) -> int | None:
++    method_index = record.get("method_index")
++    if not isinstance(method_index, int):
++        return None
++    candidate = catalog.get(method_index)
++    if candidate is None:
++        return None
++    class_name = record.get("class_name")
++    method_name = record.get("method_name")
++    descriptor = record.get("method_descriptor")
++    if not all(isinstance(value, str) and value for value in (class_name, method_name, descriptor)):
++        return None
++    if r0dump_normalize_class_name(class_name) != candidate["class_name"]:
++        return None
++    if method_name != candidate["method_name"] or descriptor != candidate["method_descriptor"]:
++        return None
++    class_def_index = record.get("class_def_index")
++    if isinstance(class_def_index, int) and class_def_index != candidate["class_def_index"]:
++        return None
++    return candidate["code_off"]
++
++
++def r0dump_code_item_size(data: bytes, offset: int, limit: int) -> int:
++    if not r0dump_check_range(offset, 16, limit):
++        raise ValueError("code_item_header_out_of_bounds")
++    tries_size = int.from_bytes(data[offset + 6:offset + 8], "little")
++    insns_size = r0dump_read_u32(data, offset + 12)
++    cursor = offset + 16
++    if insns_size > (limit - cursor) // 2:
++        raise ValueError("code_item_instructions_out_of_bounds")
++    cursor += insns_size * 2
++    if tries_size == 0:
++        return cursor - offset
++    if insns_size & 1:
++        cursor += 2
++    if tries_size > (limit - cursor) // 8:
++        raise ValueError("code_item_tries_out_of_bounds")
++    cursor += tries_size * 8
++    handler_count, cursor = r0dump_read_uleb128(data, cursor, limit)
++    if handler_count > limit - cursor:
++        raise ValueError("code_item_handler_count_out_of_bounds")
++    for _ in range(handler_count):
++        handler_size, cursor = r0dump_read_sleb128(data, cursor, limit)
++        for _ in range(abs(handler_size)):
++            _, cursor = r0dump_read_uleb128(data, cursor, limit)
++            _, cursor = r0dump_read_uleb128(data, cursor, limit)
++        if handler_size <= 0:
++            _, cursor = r0dump_read_uleb128(data, cursor, limit)
++    return cursor - offset
++
++
++def r0dump_backfill_code_items(
++        dex_data: bytes, patches: list[dict[str, Any]]) -> tuple[bytes | None, list[dict[str, Any]]]:
++    validation = r0dump_validate_dex(dex_data)
++    if validation.layout is None:
++        return None, [{"record": patch["record"], "status": "partial",
++                       "reason": validation.reason} for patch in patches]
++    layout = validation.layout
++    try:
++        method_catalog = r0dump_method_catalog(dex_data, layout)
++    except ValueError as error:
++        return None, [{"record": patch["record"], "status": "partial",
++                       "reason": str(error)} for patch in patches]
++
++    outcomes: list[dict[str, Any]] = []
++    accepted: dict[int, tuple[bytes, list[str]]] = {}
++    conflicted_offsets: set[int] = set()
++    for patch in patches:
++        record_name = patch["record"]
++        method_index = patch.get("method_index")
++        target_offset = patch.get("target_offset")
++        code = patch.get("data")
++        if not isinstance(method_index, int) or not isinstance(target_offset, int):
++            outcomes.append({"record": record_name, "status": "partial",
++                             "reason": "code_item_mapping_missing"})
++            continue
++        if not isinstance(code, bytes) or not code:
++            outcomes.append({"record": record_name, "status": "partial",
++                             "reason": "code_item_bytes_missing"})
++            continue
++        if method_catalog.get(method_index, {}).get("code_off") != target_offset:
++            outcomes.append({"record": record_name, "status": "partial",
++                             "reason": "method_code_offset_mismatch"})
++            continue
++        declared_size = patch.get("code_item_size")
++        if isinstance(declared_size, int) and declared_size != len(code):
++            outcomes.append({"record": record_name, "status": "partial",
++                             "reason": "code_item_size_mismatch"})
++            continue
++        try:
++            source_size = r0dump_code_item_size(dex_data, target_offset, layout.file_size)
++            captured_size = r0dump_code_item_size(code, 0, len(code))
++        except ValueError as error:
++            outcomes.append({"record": record_name, "status": "partial", "reason": str(error)})
++            continue
++        if captured_size != len(code) or source_size != len(code):
++            outcomes.append({"record": record_name, "status": "partial",
++                             "reason": "code_item_span_mismatch"})
++            continue
++        if target_offset in conflicted_offsets:
++            outcomes.append({"record": record_name, "status": "partial",
++                             "reason": "code_item_conflict"})
++            continue
++        previous = accepted.get(target_offset)
++        if previous is not None and previous[0] != code:
++            for previous_record in previous[1]:
++                for outcome in outcomes:
++                    if outcome["record"] == previous_record:
++                        outcome.update({"status": "partial", "reason": "code_item_conflict"})
++            outcomes.append({"record": record_name, "status": "partial",
++                             "reason": "code_item_conflict"})
++            accepted.pop(target_offset)
++            conflicted_offsets.add(target_offset)
++            continue
++        if previous is None:
++            accepted[target_offset] = (code, [record_name])
++        else:
++            previous[1].append(record_name)
++        outcomes.append({"record": record_name, "status": "applied",
++                         "method_index": method_index, "offset": target_offset,
++                         "size": len(code)})
++
++    if not accepted:
++        return None, outcomes
++    repaired = bytearray(dex_data[:layout.file_size])
++    for target_offset, (code, _) in sorted(accepted.items()):
++        repaired[target_offset:target_offset + len(code)] = code
++    repaired[12:32] = hashlib.sha1(repaired[32:]).digest()
++    struct.pack_into("<I", repaired, 8, zlib.adler32(repaired[12:]) & 0xFFFFFFFF)
++    return bytes(repaired), outcomes
++
++
+ def r0dump_repair_artifact(record: dict[str, Any], data: bytes) -> tuple[bytes | None, dict[str, Any]]:
+     capture_kind = record.get("capture_kind")
+     if capture_kind == "dexdata":
+@@ -218,14 +500,19 @@ def r0dump_find_artifact(run_dir: Path, record: dict[str, Any]) -> Path | None:
+     return path if path.is_file() else None
+ 
+ 
+-def r0dump_method_identity(record: dict[str, Any]) -> tuple[Any, Any] | None:
++def r0dump_method_identity(record: dict[str, Any]) -> tuple[Any, ...] | None:
+     if record.get("capture_kind") != "codeitem":
+         return None
+-    dex_identity = record.get("dex_object_id")
+     method_index = record.get("method_index")
+-    if dex_identity is None or not isinstance(method_index, int):
++    if not isinstance(method_index, int):
+         return None
+-    return dex_identity, method_index
++    class_name = record.get("class_name")
++    method_name = record.get("method_name")
++    descriptor = record.get("method_descriptor")
++    if all(isinstance(value, str) and value for value in (class_name, method_name, descriptor)):
++        return (r0dump_normalize_class_name(class_name), method_name, descriptor, method_index)
++    dex_identity = record.get("dex_object_id")
++    return None if dex_identity is None else (dex_identity, method_index)
+ 
+ 
+ def r0dump_run_tool(command: list[str], timeout: int = 30) -> dict[str, Any]:
+@@ -255,10 +542,11 @@ def r0dump_repair_run(run_dir: Path, output_dir: Path, dexdump: str | None = Non
+     partial_dir = output_dir / "partial"
+     for directory in (blobs_dir, repaired_dir, partial_dir):
+         directory.mkdir(exist_ok=True)
+-    records = []
++    records: list[dict[str, Any]] = []
++    record_items: dict[str, dict[str, Any]] = {}
+     seen: set[str] = set()
+-    discovered = []
+-    method_hashes: dict[tuple[Any, Any], set[str]] = {}
++    discovered: list[tuple[Path, dict[str, Any], Path | None, bytes | None, str | None]] = []
++    method_hashes: dict[tuple[Any, ...], set[str]] = {}
+     for record_path, record in r0dump_iter_records(run_dir):
+         artifact = r0dump_find_artifact(run_dir, record)
+         if artifact is None:
+@@ -271,13 +559,36 @@ def r0dump_repair_run(run_dir: Path, output_dir: Path, dexdump: str | None = Non
+             method_hashes.setdefault(identity, set()).add(digest)
+         discovered.append((record_path, record, artifact, data, digest))
+ 
++    dex_candidates: dict[str, dict[str, Any]] = {}
++    for _, record, artifact, data, digest in discovered:
++        if artifact is None or data is None or digest is None or record.get("capture_kind") == "codeitem":
++            continue
++        validation = r0dump_validate_dex(data)
++        if validation.layout is None:
++            continue
++        try:
++            catalog = r0dump_method_catalog(data, validation.layout)
++        except ValueError:
++            continue
++        dex_candidates.setdefault(
++            digest,
++            {"data": data, "artifact": str(artifact.relative_to(run_dir)), "catalog": catalog},
++        )
++
+     input_entries: dict[str, dict[str, Any]] = {}
++    code_discovered: list[tuple[Path, dict[str, Any], bytes, str]] = []
+     for record_path, record, artifact, data, digest in discovered:
+         if artifact is None or data is None or digest is None:
+-            records.append({"algorithm_version": R0DUMP_ALGORITHM_VERSION,
+-                            "record": record_path.name, "status": "partial",
+-                            "reason": "missing_artifact", "site": record.get("site"),
+-                            "capture_point": record.get("capture_point_name")})
++            capture_was_dropped = record.get("status") == "dropped"
++            reason = "capture_dropped" if capture_was_dropped else "missing_artifact"
++            drop_reason = record.get("drop_reason") if capture_was_dropped else None
++            item = {"algorithm_version": R0DUMP_ALGORITHM_VERSION,
++                    "record": record_path.name, "status": "partial",
++                    "reason": reason, "drop_reason": drop_reason,
++                    "site": record.get("site"),
++                    "capture_point": record.get("capture_point_name")}
++            records.append(item)
++            record_items[record_path.name] = item
+             continue
+         blob_path = blobs_dir / f"{digest}.bin"
+         if digest not in seen:
+@@ -292,8 +603,7 @@ def r0dump_repair_run(run_dir: Path, output_dir: Path, dexdump: str | None = Non
+         identity = r0dump_method_identity(record)
+         conflicts = []
+         if identity is not None and len(method_hashes[identity]) > 1:
+-            conflicts.append({"type": "code_item_bytes", "dex_object_id": identity[0],
+-                              "method_index": identity[1],
++            conflicts.append({"type": "code_item_bytes", "method_identity": list(identity),
+                               "candidate_sha256": sorted(method_hashes[identity])})
+         item: dict[str, Any] = {"algorithm_version": R0DUMP_ALGORITHM_VERSION,
+                                 "record": record_path.name, "input_sha256": digest,
+@@ -301,9 +611,14 @@ def r0dump_repair_run(run_dir: Path, output_dir: Path, dexdump: str | None = Non
+                                 "site": record.get("site"),
+                                 "capture_point": record.get("capture_point_name"),
+                                 "conflicts": conflicts, **details}
++        records.append(item)
++        record_items[record_path.name] = item
+         if conflicts:
+             repaired = None
+             item.update({"trust": "partial", "reason": "code_item_conflict"})
++        if record.get("capture_kind") == "codeitem":
++            code_discovered.append((record_path, record, data, digest))
++            continue
+         if repaired is None:
+             partial_path = partial_dir / f"{digest}.partial.json"
+             partial_path.write_text(json.dumps(item, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+@@ -314,11 +629,94 @@ def r0dump_repair_run(run_dir: Path, output_dir: Path, dexdump: str | None = Non
+             item["output"] = str(fixed_path.relative_to(output_dir))
+             if dexdump:
+                 item["dexdump"] = r0dump_run_tool([dexdump, "-f", str(fixed_path)])
++                if item["dexdump"]["status"] != "passed":
++                    item.update({"trust": "partial", "reason": "dexdump_failed"})
+             if jadx:
+                 item["jadx"] = r0dump_run_tool([jadx, "-d", str(output_dir / "jadx"), str(fixed_path)])
+-        records.append(item)
++    patch_groups: dict[str, list[dict[str, Any]]] = {}
++    for record_path, record, data, digest in code_discovered:
++        item = record_items[record_path.name]
++        if item.get("reason") == "code_item_conflict":
++            continue
++        matches = []
++        for candidate_digest, candidate in dex_candidates.items():
++            target_offset = r0dump_match_code_item(record, candidate["catalog"])
++            if target_offset is not None:
++                matches.append((candidate_digest, target_offset))
++        if not matches:
++            item.update({"trust": "partial", "reason": "target_dex_not_found"})
++            continue
++        if len(matches) != 1:
++            item.update({"trust": "partial", "reason": "target_dex_ambiguous",
++                         "candidate_dex_sha256": sorted(match[0] for match in matches)})
++            continue
++        candidate_digest, target_offset = matches[0]
++        patch_groups.setdefault(candidate_digest, []).append({
++            "record": record_path.name,
++            "method_index": record.get("method_index"),
++            "target_offset": target_offset,
++            "code_item_size": record.get("code_item_size"),
++            "data": data,
++            "input_sha256": digest,
++        })
++
++    reconstructions: list[dict[str, Any]] = []
++    for candidate_digest, patches in sorted(patch_groups.items()):
++        candidate = dex_candidates[candidate_digest]
++        backfilled, outcomes = r0dump_backfill_code_items(candidate["data"], patches)
++        fixed_path = repaired_dir / f"{candidate_digest}.codeitem.dex"
++        relative_output = str(fixed_path.relative_to(output_dir))
++        reconstruction: dict[str, Any] = {
++            "base_sha256": candidate_digest,
++            "base_artifact": candidate["artifact"],
++            "output": relative_output if backfilled is not None else None,
++            "outcomes": outcomes,
++        }
++        if backfilled is not None:
++            fixed_path.write_bytes(backfilled)
++            reconstruction["output_sha256"] = r0dump_sha256(backfilled)
++            if dexdump:
++                reconstruction["dexdump"] = r0dump_run_tool([dexdump, "-f", str(fixed_path)])
++                if reconstruction["dexdump"]["status"] != "passed":
++                    reconstruction.update({
++                        "output": None,
++                        "partial_output": relative_output,
++                        "reason": "dexdump_failed",
++                    })
++            if jadx:
++                reconstruction["jadx"] = r0dump_run_tool(
++                    [jadx, "-d", str(output_dir / "jadx-codeitem"), str(fixed_path)])
++        reconstructions.append(reconstruction)
++        for outcome in outcomes:
++            item = record_items[outcome["record"]]
++            if (outcome["status"] == "applied" and backfilled is not None
++                    and reconstruction["output"] is not None):
++                item.pop("reason", None)
++                item.update({
++                    "trust": "repaired",
++                    "output_kind": "codeitem_backfill",
++                    "output": relative_output,
++                    "target_dex_sha256": candidate_digest,
++                    "backfill_offset": outcome["offset"],
++                    "backfill_size": outcome["size"],
++                })
++            else:
++                item.update({
++                    "trust": "partial",
++                    "reason": outcome.get("reason", reconstruction.get("reason", "backfill_failed")),
++                })
++
++    for record_path, _, _, digest in code_discovered:
++        item = record_items[record_path.name]
++        if item.get("trust") != "partial":
++            continue
++        partial_path = partial_dir / f"{record_path.stem}-{digest}.partial.json"
++        partial_path.write_text(json.dumps(item, sort_keys=True, indent=2) + "\n", encoding="utf-8")
++        item["output"] = str(partial_path.relative_to(output_dir))
++
+     report = {"algorithm_version": R0DUMP_ALGORITHM_VERSION, "input": str(run_dir),
+-              "records": records, "record_count": len(records)}
++              "records": records, "record_count": len(records),
++              "reconstructions": reconstructions}
+     inputs = {"run": str(run_dir), "blobs": sorted(input_entries.values(), key=lambda item: item["sha256"])}
+     (output_dir / "inputs.json").write_text(json.dumps(inputs, sort_keys=True, indent=2) + "\n",
+                                              encoding="utf-8")
+diff --git a/tools/r0dump/test_r0dump_host_repair.py b/tools/r0dump/test_r0dump_host_repair.py
+index 2fe75ff..837ed53 100644
+--- a/tools/r0dump/test_r0dump_host_repair.py
++++ b/tools/r0dump/test_r0dump_host_repair.py
+@@ -1,9 +1,12 @@
+ #!/usr/bin/env python3
+ 
++import hashlib
+ import json
++import struct
+ import sys
+ import tempfile
+ import unittest
++import zlib
+ from pathlib import Path
+ 
+ from r0dump_host_repair import (
+@@ -37,6 +40,77 @@ def r0dump_golden_dex(signature=b"bad-signature-placeholder"):
+     return bytes(data)
+ 
+ 
++def r0dump_uleb128(value):
++    encoded = []
++    while True:
++        byte = value & 0x7F
++        value >>= 7
++        encoded.append(byte | (0x80 if value else 0))
++        if not value:
++            return bytes(encoded)
++
++
++def r0dump_backfill_dex(instruction=0x000E, padding=0):
++    file_size = 0x180
++    data = bytearray(file_size)
++    data[0:8] = b"dex\n035\0"
++    struct.pack_into("<III", data, 32, file_size, DEX_HEADER_SIZE, 0x12345678)
++    string_ids_off = 0x70
++    type_ids_off = 0x7C
++    proto_ids_off = 0x84
++    method_ids_off = 0x90
++    class_defs_off = 0x98
++    data_off = 0xB8
++    map_off = 0xF4
++    strings = [b"LExample;\0", b"target\0", b"V\0"]
++    cursor = data_off
++    for index, value in enumerate(strings):
++        struct.pack_into("<I", data, string_ids_off + index * 4, cursor)
++        encoded = r0dump_uleb128(len(value) - 1) + value
++        data[cursor:cursor + len(encoded)] = encoded
++        cursor += len(encoded)
++    class_data_off = (cursor + 3) & ~3
++    code_off = (class_data_off + 11) & ~3
++    class_data = (
++        b"\0\0\1\0" + r0dump_uleb128(0) + r0dump_uleb128(1) + r0dump_uleb128(code_off)
++    )
++    data[class_data_off:class_data_off + len(class_data)] = class_data
++    struct.pack_into("<II", data, 56, 3, string_ids_off)
++    struct.pack_into("<II", data, 64, 2, type_ids_off)
++    struct.pack_into("<II", data, 72, 1, proto_ids_off)
++    struct.pack_into("<II", data, 88, 1, method_ids_off)
++    struct.pack_into("<II", data, 96, 1, class_defs_off)
++    struct.pack_into("<II", data, type_ids_off, 0, 2)
++    struct.pack_into("<III", data, proto_ids_off, 2, 1, 0)
++    struct.pack_into("<HHI", data, method_ids_off, 0, 0, 1)
++    struct.pack_into(
++        "<IIIIIIII", data, class_defs_off, 0, 1, 0xFFFFFFFF, 0,
++        0xFFFFFFFF, 0, class_data_off, 0,
++    )
++    struct.pack_into("<HHHHIIH", data, code_off, 1, 0, 0, 0, 0, 1, instruction)
++    entries = [
++        (0x0000, 1, 0),
++        (0x0001, 3, string_ids_off),
++        (0x0002, 2, type_ids_off),
++        (0x0003, 1, proto_ids_off),
++        (0x0005, 1, method_ids_off),
++        (0x0006, 1, class_defs_off),
++        (0x2002, 3, data_off),
++        (0x2000, 1, class_data_off),
++        (0x2001, 1, code_off),
++        (0x1000, 1, map_off),
++    ]
++    struct.pack_into("<I", data, map_off, len(entries))
++    cursor = map_off + 4
++    for item_type, count, offset in entries:
++        struct.pack_into("<HHII", data, cursor, item_type, 0, count, offset)
++        cursor += 12
++    struct.pack_into("<I", data, 52, map_off)
++    struct.pack_into("<II", data, 104, file_size - data_off, data_off)
++    data[-1] = padding
++    return bytes(data), code_off
++
++
+ class r0dump_HostRepairTest(unittest.TestCase):
+     def r0dump_test_tool_output_with_invalid_utf8_is_preserved(self):
+         result = r0dump_run_tool([
+@@ -49,6 +123,25 @@ class r0dump_HostRepairTest(unittest.TestCase):
+         self.assertEqual(result["stdout"], "prefix\ufffdsuffix")
+         self.assertEqual(result["stderr"], "warn\ufffd")
+ 
++    def r0dump_test_failed_dexdump_downgrades_output_to_partial(self):
++        with tempfile.TemporaryDirectory() as temp:
++            root = Path(temp)
++            run = root / "run"
++            (run / "records").mkdir(parents=True)
++            (run / "artifacts").mkdir()
++            (run / "artifacts/base.dex.raw").write_bytes(r0dump_golden_dex())
++            (run / "records/000001.json").write_text(json.dumps({
++                "capture_kind": "dex",
++                "artifact_relative_path": "artifacts/base.dex.raw",
++            }), encoding="utf-8")
++
++            report = r0dump_repair_run(run, root / "output", dexdump=sys.executable)
++
++            item = report["records"][0]
++            self.assertEqual(item["trust"], "partial")
++            self.assertEqual(item["reason"], "dexdump_failed")
++            self.assertEqual(item["dexdump"]["status"], "failed")
++
+     def r0dump_test_valid_layout_repairs_only_integrity_fields(self):
+         original = r0dump_golden_dex()
+         self.assertIsNone(r0dump_validate_dex(original).reason)
+@@ -62,6 +155,116 @@ class r0dump_HostRepairTest(unittest.TestCase):
+         self.assertEqual(second, repaired)
+         self.assertEqual(second_details["trust"], "verified")
+ 
++    def r0dump_test_code_item_is_backfilled_by_unique_method_identity(self):
++        with tempfile.TemporaryDirectory() as temp:
++            root = Path(temp)
++            run = root / "run"
++            (run / "records").mkdir(parents=True)
++            (run / "artifacts").mkdir()
++            dex, code_off = r0dump_backfill_dex()
++            replacement = bytearray(dex[code_off:code_off + 18])
++            struct.pack_into("<H", replacement, 16, 0x0012)
++            (run / "artifacts/base.dex.raw").write_bytes(dex)
++            (run / "artifacts/method.codeitem.raw").write_bytes(replacement)
++            (run / "records/000001.json").write_text(json.dumps({
++                "capture_kind": "dex",
++                "artifact_relative_path": "artifacts/base.dex.raw",
++            }), encoding="utf-8")
++            (run / "records/000002.json").write_text(json.dumps({
++                "capture_kind": "codeitem",
++                "artifact_relative_path": "artifacts/method.codeitem.raw",
++                "method_index": 0,
++                "class_def_index": 0,
++                "class_name": "Example",
++                "method_name": "target",
++                "method_descriptor": "()V",
++                "code_item_size": len(replacement),
++            }), encoding="utf-8")
++
++            output = root / "output"
++            report = r0dump_repair_run(run, output)
++
++            self.assertEqual(len(report["reconstructions"]), 1)
++            item = next(item for item in report["records"] if item["record"] == "000002.json")
++            self.assertEqual(item["trust"], "repaired")
++            self.assertEqual(item["output_kind"], "codeitem_backfill")
++            repaired = (output / item["output"]).read_bytes()
++            self.assertEqual(repaired[code_off:code_off + 18], replacement)
++            self.assertEqual(repaired[12:32], hashlib.sha1(repaired[32:]).digest())
++            self.assertEqual(
++                struct.unpack_from("<I", repaired, 8)[0],
++                zlib.adler32(repaired[12:]) & 0xFFFFFFFF,
++            )
++
++    def r0dump_test_code_item_ambiguous_dex_is_not_backfilled(self):
++        with tempfile.TemporaryDirectory() as temp:
++            root = Path(temp)
++            run = root / "run"
++            (run / "records").mkdir(parents=True)
++            (run / "artifacts").mkdir()
++            first, code_off = r0dump_backfill_dex(padding=1)
++            second, _ = r0dump_backfill_dex(padding=2)
++            replacement = first[code_off:code_off + 18]
++            for sequence, value in ((1, first), (2, second)):
++                name = f"base-{sequence}.dex.raw"
++                (run / "artifacts" / name).write_bytes(value)
++                (run / "records" / f"00000{sequence}.json").write_text(json.dumps({
++                    "capture_kind": "dex",
++                    "artifact_relative_path": f"artifacts/{name}",
++                }), encoding="utf-8")
++            (run / "artifacts/method.codeitem.raw").write_bytes(replacement)
++            (run / "records/000003.json").write_text(json.dumps({
++                "capture_kind": "codeitem",
++                "artifact_relative_path": "artifacts/method.codeitem.raw",
++                "method_index": 0,
++                "class_def_index": 0,
++                "class_name": "LExample;",
++                "method_name": "target",
++                "method_descriptor": "()V",
++                "code_item_size": len(replacement),
++            }), encoding="utf-8")
++
++            report = r0dump_repair_run(run, root / "output")
++
++            item = next(item for item in report["records"] if item["record"] == "000003.json")
++            self.assertEqual(item["trust"], "partial")
++            self.assertEqual(item["reason"], "target_dex_ambiguous")
++            self.assertFalse(report["reconstructions"])
++
++    def r0dump_test_truncated_code_item_is_rejected_without_touching_base_dex(self):
++        with tempfile.TemporaryDirectory() as temp:
++            root = Path(temp)
++            run = root / "run"
++            (run / "records").mkdir(parents=True)
++            (run / "artifacts").mkdir()
++            dex, code_off = r0dump_backfill_dex()
++            truncated = dex[code_off:code_off + 17]
++            (run / "artifacts/base.dex.raw").write_bytes(dex)
++            (run / "artifacts/method.codeitem.raw").write_bytes(truncated)
++            (run / "records/000001.json").write_text(json.dumps({
++                "capture_kind": "dex",
++                "artifact_relative_path": "artifacts/base.dex.raw",
++            }), encoding="utf-8")
++            (run / "records/000002.json").write_text(json.dumps({
++                "capture_kind": "codeitem",
++                "artifact_relative_path": "artifacts/method.codeitem.raw",
++                "method_index": 0,
++                "class_def_index": 0,
++                "class_name": "Example",
++                "method_name": "target",
++                "method_descriptor": "()V",
++                "code_item_size": len(truncated),
++            }), encoding="utf-8")
++
++            output = root / "output"
++            report = r0dump_repair_run(run, output)
++
++            item = next(item for item in report["records"] if item["record"] == "000002.json")
++            self.assertEqual(item["trust"], "partial")
++            self.assertEqual(item["reason"], "code_item_instructions_out_of_bounds")
++            self.assertIsNone(report["reconstructions"][0]["output"])
++            self.assertFalse(list((output / "repaired").glob("*.codeitem.dex")))
++
+     def r0dump_test_headerless_shifted_compact_and_truncated_are_partial(self):
+         for value in (
+             r0dump_golden_dex()[DEX_HEADER_SIZE:],
+@@ -118,19 +321,39 @@ class r0dump_HostRepairTest(unittest.TestCase):
+             run = root / "run"
+             (run / "records").mkdir(parents=True)
+             (run / "artifacts").mkdir()
+-            for sequence, value in ((1, b"one"), (2, b"two")):
++            dex, code_off = r0dump_backfill_dex()
++            (run / "artifacts/base.dex.raw").write_bytes(dex)
++            (run / "records/000001.json").write_text(json.dumps({
++                "capture_kind": "dex",
++                "artifact_relative_path": "artifacts/base.dex.raw",
++            }), encoding="utf-8")
++            first = bytearray(dex[code_off:code_off + 18])
++            second = bytearray(first)
++            struct.pack_into("<H", first, 16, 0x0012)
++            struct.pack_into("<H", second, 16, 0x0013)
++            for sequence, value in ((2, first), (3, second)):
+                 name = f"{sequence:06d}.codeitem.raw"
+                 (run / "artifacts" / name).write_bytes(value)
+-                record = {"artifact_relative_path": f"artifacts/{name}",
+-                          "capture_kind": "codeitem", "dex_object_id": 7, "method_index": 0}
++                record = {
++                    "artifact_relative_path": f"artifacts/{name}",
++                    "capture_kind": "codeitem",
++                    "method_index": 0,
++                    "class_def_index": 0,
++                    "class_name": "Example",
++                    "method_name": "target",
++                    "method_descriptor": "()V",
++                    "code_item_size": len(value),
++                }
+                 (run / "records" / f"{sequence:06d}.json").write_text(
+                     json.dumps(record), encoding="utf-8"
+                 )
+             output = root / "output"
+             report = r0dump_repair_run(run, output)
+-            self.assertEqual({item["reason"] for item in report["records"]}, {"code_item_conflict"})
+-            self.assertEqual(len(list((output / "blobs").glob("*.bin"))), 2)
+-            self.assertFalse(list((output / "repaired").glob("*")))
++            codeitems = [item for item in report["records"] if item["record"] != "000001.json"]
++            self.assertEqual({item["reason"] for item in codeitems}, {"code_item_conflict"})
++            self.assertEqual(len(list((output / "blobs").glob("*.bin"))), 3)
++            self.assertFalse(report["reconstructions"])
++            self.assertFalse(list((output / "repaired").glob("*.codeitem.dex")))
+ 
+     def r0dump_test_dexdata_without_runtime_tables_is_explicitly_partial(self):
+         with tempfile.TemporaryDirectory() as temp:
+@@ -181,6 +404,25 @@ class r0dump_HostRepairTest(unittest.TestCase):
+             self.assertEqual(report["records"][0]["reason"], "missing_artifact")
+             self.assertFalse(list((output / "repaired").glob("*")))
+ 
++    def r0dump_test_dropped_capture_preserves_device_reason(self):
++        with tempfile.TemporaryDirectory() as temp:
++            run = Path(temp) / "run"
++            (run / "records").mkdir(parents=True)
++            (run / "records/000001.json").write_text(
++                json.dumps({
++                    "status": "dropped",
++                    "drop_reason": "pool_unavailable",
++                    "artifact_relative_path": None,
++                }),
++                encoding="utf-8",
++            )
++            output = Path(temp) / "out"
++            report = r0dump_repair_run(run, output)
++            result = report["records"][0]
++            self.assertEqual(result["reason"], "capture_dropped")
++            self.assertEqual(result["drop_reason"], "pool_unavailable")
++            self.assertFalse(list((output / "repaired").glob("*")))
++
+     def r0dump_test_artifact_reference_cannot_escape_run_directory(self):
+         with tempfile.TemporaryDirectory() as temp:
+             root = Path(temp)
+-- 
+2.43.0
+
