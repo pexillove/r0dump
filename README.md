@@ -1,6 +1,6 @@
 # R0DUMP
 
-> 官网:[r0dump.com](https://r0dump.com)
+> 中文 · [English](README.en.md) · 官网:[r0dump.com](https://r0dump.com)
 
 `R0DUMP` 是一个受 [`FART`](https://github.com/hanbinglengyue/FART) 启发、把经典**主动调用脱壳**思想迁移并深度融合进 **Android 16 / LineageOS 23.2** 运行时(ART)的脱壳定制系统,配套一个集配置、监控、修复、导出于一体的 GUI 管理器 **R0dump Manager**。
 
