@@ -1,0 +1,10 @@
+// Central config — production URLs for the r0dump-fusion site.
+const R2 = 'https://dl.r0dump.com/v2026-09-12'
+
+export const CONFIG = {
+  github: 'https://github.com/tiwe0/r0dump',
+  releaseNoGapps: `${R2}/lineage_lemonade-r0dump-fusion-16-nogapps.zip`,
+  releaseGapps: `${R2}/lineage_lemonade-r0dump-fusion-16-gapps.zip`,
+  patches: 'https://github.com/tiwe0/r0dump',
+  version: 'r0dump-fusion-16',
+}

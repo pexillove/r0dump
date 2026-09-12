@@ -1,0 +1,25 @@
+/* Minimal global reset — MUI CssBaseline handles the rest. No gradients. */
+html { scroll-behavior: smooth; scroll-padding-top: 84px; }
+body { margin: 0; }
+* { box-sizing: border-box; }
+
+/* faint, non-gradient grid guide lines (solid lines, subtle) */
+.bg-grid {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background-image:
+    linear-gradient(var(--grid) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+  background-size: 48px 48px;
+  opacity: 0.5;
+}
+
+.term-scroll::-webkit-scrollbar { height: 6px; }
+.term-scroll::-webkit-scrollbar-thumb { background: var(--scroll); border-radius: 3px; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::after, *::before { animation: none !important; transition: none !important; }
+  html { scroll-behavior: auto; }
+}
