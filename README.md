@@ -75,3 +75,7 @@ fusion 版按仓库分目录(`art/`、`frameworks_base/`、`system_sepolicy/`、
   - [FART正餐前甜点:ART下几个通用简单高效的 dump 内存中 dex 方法](https://bbs.kanxue.com/thread-254028.htm)
   - [拨云见日:安卓 App 脱壳的本质以及如何快速发现 ART 下的脱壳点](https://bbs.kanxue.com/thread-254555.htm)
 - 感谢 **看雪社区** 的公开讨论与样本。
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/chart?repos=tiwe0/r0dump&type=date&legend=top-left)](https://www.star-history.com/?repos=tiwe0%2Fr0dump&type=date&legend=top-left)
